@@ -10,11 +10,8 @@ keywords = [
     "bioinformatics",
     "genomics",
     "sequence-alignment",
-    "read-mapping",
     "dna",
-    "sam",
-    "simd",
-    "high-performance"
+    "sam"
 ]
 categories = [
     "science",
