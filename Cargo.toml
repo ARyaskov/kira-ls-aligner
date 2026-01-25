@@ -16,9 +16,9 @@ keywords = [
 categories = [
     "science",
     "science::bioinformatics",
+    "science::bioinformatics::sequence-analysis",
     "command-line-utilities",
-    "algorithms",
-    "performance"
+    "algorithms"
 ]
 
 [dependencies]
