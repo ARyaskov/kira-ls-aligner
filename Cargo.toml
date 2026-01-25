@@ -1,0 +1,21 @@
+[package]
+name = "kira-ls-aligner"
+description = "Unified short- and long-read sequence aligner written in Rust 2024. It combines minimap2-style minimizers and chaining with BWA-MEM2-style exact-match anchoring and output semantics. The goal is drop-in compatibility with bwa-mem pipelines while supporting long reads efficiently."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+memmap2 = "0.9"
+needletail = "0.6"
+rayon = "1.10"
+rustc-hash = "2"
+sysinfo = "0.30"
+thiserror = "2"
+
+[features]
+default = []
+cuda = []
