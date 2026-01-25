@@ -4,6 +4,25 @@ description = "Unified short- and long-read sequence aligner written in Rust 202
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-ls-aligner"
+keywords = [
+    "bioinformatics",
+    "genomics",
+    "sequence-alignment",
+    "read-mapping",
+    "dna",
+    "sam",
+    "simd",
+    "high-performance"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "command-line-utilities",
+    "algorithms",
+    "performance"
+]
 
 [dependencies]
 anyhow = "1"
