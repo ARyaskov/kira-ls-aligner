@@ -5,7 +5,6 @@ pub mod cli;
 pub mod index;
 pub mod io;
 pub mod mapq;
-pub mod perf;
 pub mod pipeline;
 pub mod seeding;
 pub mod seq;

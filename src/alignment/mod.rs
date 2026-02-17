@@ -1,6 +1,5 @@
 pub mod prefilter;
 
-use crate::perf::toggles::EarlyAbortMode;
 use crate::seq::reverse_complement_into;
 use crate::simd::{self, SimdMode};
 use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, ReadRecord, Strand};
@@ -128,15 +127,8 @@ pub fn align_chain_with_meta(
     let is_rev = oriented.is_rev();
     let mut scratch = Vec::new();
     let read_seq = oriented.contiguous(&mut scratch);
-    let (aln, early, _) = align_oriented_chain_with_meta(
-        read_seq,
-        is_rev,
-        ref_seq,
-        chain,
-        cfg,
-        abort_score,
-        EarlyAbortMode::Off,
-    );
+    let (aln, early, _) =
+        align_oriented_chain_with_meta(read_seq, is_rev, ref_seq, chain, cfg, abort_score);
     (aln, early)
 }
 
@@ -147,9 +139,7 @@ pub fn align_oriented_chain_with_meta(
     chain: &AnchorSpan,
     cfg: AlignmentConfig,
     abort_score: i32,
-    early_abort_mode: EarlyAbortMode,
 ) -> (Alignment, bool, usize) {
-    let _ = early_abort_mode;
     let read_len = read_seq.len();
 
     if let Some(aln) = exact_match_alignment(read_len, read_seq, ref_seq, chain, cfg, is_rev) {
