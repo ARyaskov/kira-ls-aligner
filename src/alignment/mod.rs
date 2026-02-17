@@ -1,5 +1,7 @@
 pub mod prefilter;
 
+use crate::perf::toggles::EarlyAbortMode;
+use crate::seq::reverse_complement_into;
 use crate::simd::{self, SimdMode};
 use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, ReadRecord, Strand};
 
@@ -36,13 +38,34 @@ pub struct BatchInput<'a> {
     pub abort_score: i32,
 }
 
-/// Orient a read sequence for a given strand.
-pub fn oriented_read(read: &ReadRecord, strand: Strand) -> Vec<u8> {
-    if strand == Strand::Reverse {
-        reverse_complement(&read.seq)
-    } else {
-        read.seq.clone()
+/// Zero-copy read orientation adapter.
+#[derive(Clone, Copy, Debug)]
+pub struct OrientedRead<'a> {
+    seq: &'a [u8],
+    strand: Strand,
+}
+
+impl<'a> OrientedRead<'a> {
+    pub fn new(seq: &'a [u8], strand: Strand) -> Self {
+        Self { seq, strand }
     }
+
+    pub fn is_rev(self) -> bool {
+        self.strand == Strand::Reverse
+    }
+
+    pub fn contiguous<'b>(&'b self, scratch: &'b mut Vec<u8>) -> &'b [u8] {
+        if self.strand == Strand::Reverse {
+            reverse_complement_into(self.seq, scratch)
+        } else {
+            self.seq
+        }
+    }
+}
+
+/// Orient a read sequence for a given strand.
+pub fn oriented_read(read: &ReadRecord, strand: Strand) -> OrientedRead<'_> {
+    OrientedRead::new(read.seq.as_slice(), strand)
 }
 
 /// Attempt fast exact-match alignment (no DP).
@@ -101,12 +124,36 @@ pub fn align_chain_with_meta(
     cfg: AlignmentConfig,
     abort_score: i32,
 ) -> (Alignment, bool) {
-    let read_len = read.seq.len();
-    let is_rev = chain.strand == Strand::Reverse;
-    let read_seq = oriented_read(read, chain.strand);
+    let oriented = oriented_read(read, chain.strand);
+    let is_rev = oriented.is_rev();
+    let mut scratch = Vec::new();
+    let read_seq = oriented.contiguous(&mut scratch);
+    let (aln, early, _) = align_oriented_chain_with_meta(
+        read_seq,
+        is_rev,
+        ref_seq,
+        chain,
+        cfg,
+        abort_score,
+        EarlyAbortMode::Off,
+    );
+    (aln, early)
+}
 
-    if let Some(aln) = exact_match_alignment(read_len, &read_seq, ref_seq, chain, cfg, is_rev) {
-        return (aln, false);
+pub fn align_oriented_chain_with_meta(
+    read_seq: &[u8],
+    is_rev: bool,
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+    abort_score: i32,
+    early_abort_mode: EarlyAbortMode,
+) -> (Alignment, bool, usize) {
+    let _ = early_abort_mode;
+    let read_len = read_seq.len();
+
+    if let Some(aln) = exact_match_alignment(read_len, read_seq, ref_seq, chain, cfg, is_rev) {
+        return (aln, false, 0);
     }
 
     let (win_start, win_end) =
@@ -114,11 +161,12 @@ pub fn align_chain_with_meta(
     let ref_window = &ref_seq[win_start as usize..win_end as usize];
     let offset = chain.ref_start as i32 - win_start as i32 - chain.read_start as i32;
 
-    let sw = banded_sw(&read_seq, ref_window, offset, cfg, abort_score);
+    let sw = banded_sw(read_seq, ref_window, offset, cfg, abort_score);
     let early = sw.early_abort;
     (
-        build_alignment(&read_seq, ref_window, win_start, chain, is_rev, sw),
+        build_alignment(read_seq, ref_window, win_start, chain, is_rev, sw),
         early,
+        0,
     )
 }
 
@@ -482,19 +530,6 @@ fn clamp_window(ref_len: usize, ref_start: u32, ref_end: u32, bandwidth: i32) ->
     (start, end.max(start + 1))
 }
 
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|b| match *b {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            _ => b'N',
-        })
-        .collect()
-}
-
 fn compute_nm_md(
     read: &[u8],
     reference: &[u8],
@@ -564,6 +599,8 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
 
     let neg_inf = i32::MIN / 4;
     let v_zero = _mm256_set1_epi32(0);
+    let v_go = _mm256_set1_epi32(-cfg.gap_open);
+    let v_ge = _mm256_set1_epi32(-cfg.gap_extend);
 
     let mut prev_h: Vec<__m256i> = vec![v_zero; r_len + 1];
     let mut prev_e: Vec<__m256i> = vec![_mm256_set1_epi32(neg_inf); r_len + 1];
@@ -610,12 +647,12 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             let h_diag = prev_h[j - 1];
             let h_match = _mm256_add_epi32(h_diag, score_vec);
 
-            let e_from_h = _mm256_add_epi32(prev_h[j], _mm256_set1_epi32(-cfg.gap_open));
-            let e_from_e = _mm256_add_epi32(prev_e[j], _mm256_set1_epi32(-cfg.gap_extend));
+            let e_from_h = _mm256_add_epi32(prev_h[j], v_go);
+            let e_from_e = _mm256_add_epi32(prev_e[j], v_ge);
             let e = _mm256_max_epi32(e_from_h, e_from_e);
 
-            let f_from_h = _mm256_add_epi32(cur_h[j - 1], _mm256_set1_epi32(-cfg.gap_open));
-            let f_from_f = _mm256_add_epi32(cur_f, _mm256_set1_epi32(-cfg.gap_extend));
+            let f_from_h = _mm256_add_epi32(cur_h[j - 1], v_go);
+            let f_from_f = _mm256_add_epi32(cur_f, v_ge);
             let f = _mm256_max_epi32(f_from_h, f_from_f);
 
             let mut h = _mm256_max_epi32(h_match, e);

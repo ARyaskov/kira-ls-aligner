@@ -12,7 +12,7 @@ use crate::pipeline::mode::{ModeFeatures, classify};
 use crate::pipeline::stage0_input;
 use crate::pipeline::stage4_alignment::AlignmentBatchStats;
 use crate::pipeline::{Pipeline, PipelineConfig, PipelineStageTimes};
-use crate::simd::{SimdMode, detect};
+use crate::simd::{SimdMode, detect_cached};
 
 /// High-level aligner configuration.
 #[derive(Clone, Debug)]
@@ -153,7 +153,11 @@ impl Aligner {
         let mut mode_selected: Option<(crate::pipeline::mode::ReadMode, usize)> = None;
 
         let output_path_buf = output_path.as_ref().map(|p| p.as_ref().to_path_buf());
-        let simd_mode = if stats_enabled { Some(detect()) } else { None };
+        let simd_mode = if stats_enabled {
+            Some(detect_cached())
+        } else {
+            None
+        };
 
         let mut writer = SamWriter::new(output_path, index.reference.clone())?;
         writer.write_header_with_rg(self.cfg.read_group.as_deref())?;

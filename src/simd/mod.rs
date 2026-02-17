@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 /// SIMD dispatch helpers. Unsafe code is confined to this module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimdMode {
@@ -23,13 +25,19 @@ pub fn detect() -> SimdMode {
     SimdMode::Scalar
 }
 
+#[inline]
+pub fn detect_cached() -> SimdMode {
+    static MODE: OnceLock<SimdMode> = OnceLock::new();
+    *MODE.get_or_init(detect)
+}
+
 /// Count mismatches between two equal-length slices.
 pub fn count_mismatches(a: &[u8], b: &[u8]) -> usize {
     let len = a.len().min(b.len());
     if len == 0 {
         return 0;
     }
-    match detect() {
+    match detect_cached() {
         #[cfg(target_arch = "x86_64")]
         SimdMode::Avx2 => unsafe { avx2::count_mismatches(a, b) },
         #[cfg(target_arch = "aarch64")]
@@ -39,14 +47,7 @@ pub fn count_mismatches(a: &[u8], b: &[u8]) -> usize {
 }
 
 fn scalar_count_mismatches(a: &[u8], b: &[u8]) -> usize {
-    let len = a.len().min(b.len());
-    let mut mismatches = 0usize;
-    for i in 0..len {
-        if a[i] != b[i] {
-            mismatches += 1;
-        }
-    }
-    mismatches
+    a.iter().zip(b.iter()).filter(|(x, y)| x != y).count()
 }
 
 #[cfg(target_arch = "x86_64")]

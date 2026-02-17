@@ -1,10 +1,9 @@
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use kira_fastq::FastqReader as KiraFastqReader;
 use memmap2::Mmap;
 use needletail::parse_fastx_reader;
 
@@ -29,10 +28,11 @@ pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
 
 /// Stream reads in batches of approximate total bases using mmap.
 pub struct ReadStream {
-    readers: Vec<Box<dyn needletail::FastxReader>>,
+    readers: Vec<FastqReaderWithProgress>,
     current: usize,
     batch_bases: usize,
     progress: ReadProgress,
+    completed_bytes: u64,
 }
 
 impl ReadStream {
@@ -46,11 +46,10 @@ impl ReadStream {
         }
         let mut readers = Vec::with_capacity(paths.len());
         let mut total = 0u64;
-        let counter = Arc::new(AtomicU64::new(0));
         for path in paths {
-            let fastx = open_fastx_reader_with_counter(path, counter.clone())?;
-            total = total.saturating_add(fastx.progress.total_bytes);
-            readers.push(fastx.reader);
+            let fastq = open_fastq_reader(path)?;
+            total = total.saturating_add(fastq.total_bytes);
+            readers.push(fastq);
         }
         Ok(Self {
             readers,
@@ -58,8 +57,9 @@ impl ReadStream {
             batch_bases,
             progress: ReadProgress {
                 total_bytes: total,
-                read_bytes: counter,
+                read_bytes: 0,
             },
+            completed_bytes: 0,
         })
     }
 
@@ -67,18 +67,37 @@ impl ReadStream {
         let mut reads = Vec::new();
         let mut bases = 0usize;
         while self.current < self.readers.len() {
-            if let Some(record) = self.readers[self.current].next() {
-                let record = record.context("read record")?;
-                let id = String::from_utf8_lossy(record.id()).to_string();
-                let mut seq = record.seq().to_vec();
+            let idx = self.current;
+            let record = self.readers[idx]
+                .reader
+                .next()
+                .map_err(|e| anyhow::anyhow!("read FASTQ record: {e:?}"))?;
+            if let Some(record) = record {
+                let (id, mut seq, qual) = {
+                    let id = extract_fastq_id(record.header());
+                    let seq = record.seq().to_vec();
+                    let qual = Some(record.qual().to_vec());
+                    (id, seq, qual)
+                };
                 normalize_bases(&mut seq);
-                let qual = record.qual().map(|q| q.to_vec());
                 bases += seq.len();
                 reads.push(ReadRecord { id, seq, qual });
-                if bases >= self.batch_bases && !reads.is_empty() {
+
+                let consumed = self.readers[idx]
+                    .reader
+                    .tell()
+                    .0
+                    .min(self.readers[idx].total_bytes);
+                self.progress.read_bytes = self.completed_bytes.saturating_add(consumed);
+
+                if bases >= self.batch_bases {
                     break;
                 }
             } else {
+                self.completed_bytes = self
+                    .completed_bytes
+                    .saturating_add(self.readers[idx].total_bytes);
+                self.progress.read_bytes = self.completed_bytes;
                 self.current += 1;
             }
         }
@@ -100,41 +119,59 @@ impl ReadStream {
 
 struct FastxReaderWithProgress {
     reader: Box<dyn needletail::FastxReader>,
-    progress: ReadProgress,
 }
 
 struct ReadProgress {
     total_bytes: u64,
-    read_bytes: Arc<AtomicU64>,
+    read_bytes: u64,
 }
 
 impl ReadProgress {
     fn bytes_read(&self) -> u64 {
-        self.read_bytes.load(Ordering::Relaxed)
+        self.read_bytes
     }
 }
 
-fn open_fastx_reader_with_counter<P: AsRef<Path>>(
-    path: P,
-    counter: Arc<AtomicU64>,
-) -> Result<FastxReaderWithProgress> {
+fn open_fastx_reader<P: AsRef<Path>>(path: P) -> Result<FastxReaderWithProgress> {
     let file = File::open(path.as_ref()).context("open FASTA/FASTQ")?;
-    let total = file.metadata().context("stat FASTA/FASTQ")?.len();
     let mmap = unsafe { Mmap::map(&file).context("mmap FASTA/FASTQ")? };
-    let reader = CountingReader::new(io::Cursor::new(mmap), counter.clone());
+    let reader = io::Cursor::new(mmap);
     let fastx_reader = parse_fastx_reader(reader).context("parse FASTA/FASTQ")?;
     Ok(FastxReaderWithProgress {
         reader: fastx_reader,
-        progress: ReadProgress {
-            total_bytes: total,
-            read_bytes: counter,
-        },
     })
 }
 
-fn open_fastx_reader<P: AsRef<Path>>(path: P) -> Result<FastxReaderWithProgress> {
-    let counter = Arc::new(AtomicU64::new(0));
-    open_fastx_reader_with_counter(path, counter)
+struct FastqReaderWithProgress {
+    reader: KiraFastqReader,
+    total_bytes: u64,
+}
+
+fn open_fastq_reader<P: AsRef<Path>>(path: P) -> Result<FastqReaderWithProgress> {
+    let path = path.as_ref();
+    let total_bytes = File::open(path)
+        .and_then(|f| f.metadata())
+        .context("stat FASTQ")?
+        .len();
+    let reader = KiraFastqReader::from_path_auto(path)
+        .map_err(|e| anyhow::anyhow!("open FASTQ/FASTQ.GZ/BGZF: {e:?}"))?;
+    Ok(FastqReaderWithProgress {
+        reader,
+        total_bytes,
+    })
+}
+
+fn extract_fastq_id(header: &[u8]) -> String {
+    let header = if let Some(stripped) = header.strip_prefix(b"@") {
+        stripped
+    } else {
+        header
+    };
+    let end = header
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(header.len());
+    String::from_utf8_lossy(&header[..end]).to_string()
 }
 
 fn normalize_bases(seq: &mut [u8]) {
@@ -146,27 +183,6 @@ fn normalize_bases(seq: &mut [u8]) {
             b't' | b'T' => b'T',
             _ => b'N',
         };
-    }
-}
-
-struct CountingReader<R> {
-    inner: R,
-    counter: Arc<AtomicU64>,
-}
-
-impl<R> CountingReader<R> {
-    fn new(inner: R, counter: Arc<AtomicU64>) -> Self {
-        Self { inner, counter }
-    }
-}
-
-impl<R: Read> Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.counter.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        Ok(n)
     }
 }
 

@@ -9,9 +9,10 @@ use crate::alignment::prefilter::{
 };
 use crate::alignment::{
     AlignmentConfig, AnchorSpan, BatchInput, align_batch_simd, align_chain_with_meta,
-    exact_match_alignment, oriented_read,
+    exact_match_alignment,
 };
 use crate::index::Index;
+use crate::seq::reverse_complement;
 use crate::simd::{self, SimdMode};
 use crate::types::{Alignment, Chain, CigarKind, CigarOp, ReadRecord, Strand};
 
@@ -177,7 +178,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     let reads = input.reads;
     let chains = input.chains;
 
-    let simd_mode = simd::detect();
+    let simd_mode = simd::detect_cached();
     let lanes = match simd_mode {
         SimdMode::Avx2 => 8,
         SimdMode::Neon => 4,
@@ -212,6 +213,8 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         let mut accepted_read = false;
         let len = read.seq.len();
         let short_read = len <= 300;
+        let read_fwd = read.seq.as_slice();
+        let mut read_rev_cache: Option<Vec<u8>> = None;
         if short_read {
             short_read_batch = true;
         }
@@ -267,11 +270,17 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                 strand: chain.strand,
             };
             let is_rev = matches!(span.strand, Strand::Reverse);
-            let read_seq = oriented_read(read, span.strand);
+            let read_seq = if is_rev {
+                read_rev_cache
+                    .get_or_insert_with(|| reverse_complement(read_fwd))
+                    .as_slice()
+            } else {
+                read_fwd
+            };
             let read_len = read_seq.len();
 
             if let Some(aln) =
-                exact_match_alignment(read_len, &read_seq, ref_seq, &span, cfg.cfg, is_rev)
+                exact_match_alignment(read_len, read_seq, ref_seq, &span, cfg.cfg, is_rev)
             {
                 stats.exact_matches += 1;
                 alignments[idx].push(aln);
@@ -290,7 +299,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                 metrics,
                 reason,
             } = prefilter_chain(
-                &read_seq,
+                read_seq,
                 ref_seq,
                 &span,
                 cfg.cfg,
@@ -384,11 +393,11 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                 && cfg.max_alignments <= 1
             {
                 let m = metrics.as_ref().unwrap();
-                let aln = build_ungapped_alignment(&read_seq, ref_seq, m, &span, cfg.cfg);
+                let aln = build_ungapped_alignment(read_seq, ref_seq, m, &span, cfg.cfg);
                 stats.prefilter_reason_counts[PrefilterReason::Accepted.idx()] += 1;
                 PrefilterResult::Accept(aln)
             } else if forced {
-                PrefilterResult::Accept(build_forced_accept(&read_seq, ref_seq, &span, cfg.cfg))
+                PrefilterResult::Accept(build_forced_accept(read_seq, ref_seq, &span, cfg.cfg))
             } else {
                 result
             };
@@ -426,7 +435,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                     let job_idx = simd_jobs.len();
                     simd_jobs.push(SimdJob {
                         read_idx: idx,
-                        read_seq,
+                        read_seq: read_seq.to_vec(),
                         ref_window,
                         win_start,
                         chain: span,
@@ -458,10 +467,12 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     stats.ungapped_mismatches_p95 = percentile_u16(&mut mism, 95) as usize;
     let id_x100 = percentile_u16(&mut ids, 90);
     stats.ungapped_identity_p90 = (id_x100 as f32) / 100.0;
-    stats.accept_len_p50 = percentile_u16(&mut accept_lens.clone(), 50) as usize;
-    stats.accept_len_p95 = percentile_u16(&mut accept_lens.clone(), 95) as usize;
-    stats.fallback_len_p50 = percentile_u16(&mut fallback_lens.clone(), 50) as usize;
-    stats.fallback_len_p95 = percentile_u16(&mut fallback_lens.clone(), 95) as usize;
+    accept_lens.sort_unstable();
+    fallback_lens.sort_unstable();
+    stats.accept_len_p50 = percentile_u16_sorted(&accept_lens, 50) as usize;
+    stats.accept_len_p95 = percentile_u16_sorted(&accept_lens, 95) as usize;
+    stats.fallback_len_p50 = percentile_u16_sorted(&fallback_lens, 50) as usize;
+    stats.fallback_len_p95 = percentile_u16_sorted(&fallback_lens, 95) as usize;
 
     stats.dp_reads = dp_used.iter().filter(|v| **v).count();
     if short_read_batch {
@@ -667,6 +678,13 @@ fn percentile_u16(values: &mut Vec<u16>, pct: usize) -> u16 {
         return 0;
     }
     values.sort_unstable();
+    percentile_u16_sorted(values, pct)
+}
+
+fn percentile_u16_sorted(values: &[u16], pct: usize) -> u16 {
+    if values.is_empty() {
+        return 0;
+    }
     let idx = (values.len() - 1) * pct / 100;
     values[idx]
 }
