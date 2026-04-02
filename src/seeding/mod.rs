@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::index::{Index, MinimizerIndex, Occ};
+use crate::seq::reverse_complement;
 use crate::sketch::{MinimizerConfig, minimizers};
 use crate::types::{Anchor, Minimizer, ReadRecord, SeedHit, Strand};
 
@@ -193,17 +194,4 @@ fn select_index(
     } else {
         (&index.short, index.short.k, index.short.w)
     }
-}
-
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|b| match *b {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            _ => b'N',
-        })
-        .collect()
 }

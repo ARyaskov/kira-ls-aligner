@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::index::Index;
+use crate::seq::reverse_complement;
 use crate::types::{Anchor, ReadRecord, Strand};
 
 use super::stage1_sketch::{ReadSketch, SketchBatch};
@@ -231,19 +232,6 @@ fn extend_proto(read: &ReadRecord, index: &Index, cand: &AnchorCandidate) -> Anc
         strand,
         score,
     }
-}
-
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|b| match *b {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            _ => b'N',
-        })
-        .collect()
 }
 
 #[derive(Default)]

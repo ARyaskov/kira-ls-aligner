@@ -1,4 +1,6 @@
-/// SIMD dispatch helpers. Unsafe code is confined to this module.
+use std::sync::OnceLock;
+
+/// SIMD dispatch helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimdMode {
     Scalar,
@@ -6,105 +8,41 @@ pub enum SimdMode {
     Neon,
 }
 
-/// Detect the best available SIMD mode at runtime.
+/// Detect the best available SIMD mode at runtime via kira-simd.
 pub fn detect() -> SimdMode {
-    #[cfg(all(target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            return SimdMode::Avx2;
-        }
+    match kira_simd::backend::active_backend() {
+        kira_simd::backend::Backend::Avx2 => SimdMode::Avx2,
+        kira_simd::backend::Backend::Neon => SimdMode::Neon,
+        _ => SimdMode::Scalar,
     }
-    #[cfg(all(target_arch = "aarch64"))]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return SimdMode::Neon;
-        }
-    }
-    SimdMode::Scalar
+}
+
+#[inline]
+pub fn detect_cached() -> SimdMode {
+    static MODE: OnceLock<SimdMode> = OnceLock::new();
+    *MODE.get_or_init(detect)
 }
 
 /// Count mismatches between two equal-length slices.
+#[inline]
 pub fn count_mismatches(a: &[u8], b: &[u8]) -> usize {
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0;
-    }
-    match detect() {
-        #[cfg(target_arch = "x86_64")]
-        SimdMode::Avx2 => unsafe { avx2::count_mismatches(a, b) },
-        #[cfg(target_arch = "aarch64")]
-        SimdMode::Neon => unsafe { neon::count_mismatches(a, b) },
-        _ => scalar_count_mismatches(a, b),
-    }
+    kira_simd::compare::count_mismatches(a, b)
 }
 
-fn scalar_count_mismatches(a: &[u8], b: &[u8]) -> usize {
-    let len = a.len().min(b.len());
-    let mut mismatches = 0usize;
-    for i in 0..len {
-        if a[i] != b[i] {
-            mismatches += 1;
-        }
-    }
-    mismatches
+/// Count mismatches with early stop when limit is exceeded.
+#[inline]
+pub fn count_mismatches_bounded(a: &[u8], b: &[u8], max_mismatches: u32) -> u32 {
+    kira_simd::compare::count_mismatches_bounded(a, b, max_mismatches)
 }
 
-#[cfg(target_arch = "x86_64")]
-mod avx2 {
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
-
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn count_mismatches(a: &[u8], b: &[u8]) -> usize {
-        let mut i = 0usize;
-        let len = a.len().min(b.len());
-        let mut mismatches = 0usize;
-        while i + 32 <= len {
-            let pa = unsafe { a.as_ptr().add(i) } as *const __m256i;
-            let pb = unsafe { b.as_ptr().add(i) } as *const __m256i;
-            let va = unsafe { _mm256_loadu_si256(pa) };
-            let vb = unsafe { _mm256_loadu_si256(pb) };
-            let eq = _mm256_cmpeq_epi8(va, vb);
-            let mask = _mm256_movemask_epi8(eq) as u32;
-            let matches = mask.count_ones() as usize;
-            mismatches += 32 - matches;
-            i += 32;
-        }
-        while i < len {
-            if a[i] != b[i] {
-                mismatches += 1;
-            }
-            i += 1;
-        }
-        mismatches
-    }
+/// out[i] = ref_pos[i] - query_pos[i].
+#[inline]
+pub fn compute_diagonals(ref_pos: &[u32], query_pos: &[u32], out_diags: &mut [i32]) {
+    kira_simd::compare::compute_diagonals_i32(ref_pos, query_pos, out_diags)
 }
 
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use std::arch::aarch64::{uint8x16_t, vaddvq_u8, vceqq_u8, vld1q_u8, vshrq_n_u8};
-
-    #[target_feature(enable = "neon")]
-    pub unsafe fn count_mismatches(a: &[u8], b: &[u8]) -> usize {
-        let mut i = 0usize;
-        let len = a.len().min(b.len());
-        let mut mismatches = 0usize;
-        while i + 16 <= len {
-            let pa = unsafe { a.as_ptr().add(i) };
-            let pb = unsafe { b.as_ptr().add(i) };
-            let va: uint8x16_t = unsafe { vld1q_u8(pa) };
-            let vb: uint8x16_t = unsafe { vld1q_u8(pb) };
-            let eq = vceqq_u8(va, vb);
-            let ones = vshrq_n_u8(eq, 7);
-            let matches = vaddvq_u8(ones) as usize;
-            mismatches += 16 - matches;
-            i += 16;
-        }
-        while i < len {
-            if a[i] != b[i] {
-                mismatches += 1;
-            }
-            i += 1;
-        }
-        mismatches
-    }
+/// out[i] = 1 if read_pos[i] < read_len else 0.
+#[inline]
+pub fn mask_read_pos_in_range(read_pos: &[u32], read_len: u32, mask: &mut [u8]) {
+    kira_simd::compare::mask_lt_u32(read_pos, read_len, mask)
 }

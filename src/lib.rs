@@ -7,6 +7,7 @@ pub mod io;
 pub mod mapq;
 pub mod pipeline;
 pub mod seeding;
+pub mod seq;
 pub mod simd;
 pub mod sketch;
 pub mod types;
