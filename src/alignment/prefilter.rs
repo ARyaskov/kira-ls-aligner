@@ -1,6 +1,6 @@
 use crate::alignment::AlignmentConfig;
 use crate::simd;
-use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, Strand};
+use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, Strand};
 
 /// Prefilter decision for a chain.
 #[derive(Clone, Debug)]
@@ -393,7 +393,7 @@ pub(crate) fn build_ungapped_alignment(
     }
 
     let mut nm = 0u32;
-    let mut md = String::new();
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
     let mut run = 0u32;
     for i in 0..span {
         let qb = read_seq[read_start + i];
@@ -402,12 +402,14 @@ pub(crate) fn build_ungapped_alignment(
             run += 1;
         } else {
             nm += 1;
-            md.push_str(&run.to_string());
-            md.push(rb as char);
+            crate::alignment::push_u32_decimal(&mut md_bytes, run);
+            md_bytes.push(rb);
             run = 0;
         }
     }
-    md.push_str(&run.to_string());
+    crate::alignment::push_u32_decimal(&mut md_bytes, run);
+    // SAFETY: only ASCII digits and ACGTN bases were pushed.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
 
     let mism = nm as i32;
     let matches = span as i32 - mism;
@@ -430,5 +432,7 @@ pub(crate) fn build_ungapped_alignment(
         md,
         as_score: score,
         xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
     }
 }

@@ -15,6 +15,53 @@ target/
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
 
+### IDE ###
 .idea/
+.vscode/
+*.swp
+*.swo
+
+### Vendored upstream tools (not part of this crate) ###
 bwa-mem2/
 minimap2/
+
+### Test inputs we don't ship with the repo ###
+# These come from public archives and are too large for the repo. Users
+# are expected to download them separately (see docs/ for sources).
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+SRR*.fastq
+SRR*.fastq.gz
+
+### Alignment outputs / bench artefacts ###
+# Anything we produce during bench runs — never commit these.
+*.sam
+*.bam
+*.cram
+out_*.sam
+baseline.sam
+test_*.sam
+*.bai
+
+### Logs ###
+*.log
+bench.log
+stderr.log
+stdout.log
+
+### CUDA build artefacts (when not inside target/) ###
+# nvcc sometimes writes intermediate files to the project root if invoked
+# carelessly. The PTX itself lives under target/<profile>/build/.../out/
+# so target/ above already covers it.
+*.ptx
+!src/cuda/*.ptx   # but allow PTX checked-in deliberately under src/cuda
+
+### Index files we build locally ###
+*.kiraidx
+
+### OS detritus ###
+.DS_Store
+Thumbs.db
+desktop.ini
