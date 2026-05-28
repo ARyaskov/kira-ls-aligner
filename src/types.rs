@@ -46,12 +46,35 @@ pub struct Reference {
     pub sequences: Vec<RefSeq>,
 }
 
+/// Pair role for a read in paired-end mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PairRole {
+    #[default]
+    Unpaired,
+    R1,
+    R2,
+}
+
 /// A read with sequence and optional quality scores.
 #[derive(Clone, Debug)]
 pub struct ReadRecord {
     pub id: String,
     pub seq: Vec<u8>,
     pub qual: Option<Vec<u8>>,
+    /// Pair role (`Unpaired` for single-end).
+    pub pair_role: PairRole,
+}
+
+impl ReadRecord {
+    /// Construct a single-end read.
+    pub fn new_unpaired(id: String, seq: Vec<u8>, qual: Option<Vec<u8>>) -> Self {
+        Self {
+            id,
+            seq,
+            qual,
+            pair_role: PairRole::Unpaired,
+        }
+    }
 }
 
 /// A minimizer sketch entry.
@@ -111,6 +134,8 @@ pub enum CigarKind {
     Ins,
     Del,
     SoftClip,
+    /// SAM `N` op — reference region skipped (intron in splice alignments).
+    Skipped,
 }
 
 impl fmt::Display for CigarOp {
@@ -120,6 +145,7 @@ impl fmt::Display for CigarOp {
             CigarKind::Ins => 'I',
             CigarKind::Del => 'D',
             CigarKind::SoftClip => 'S',
+            CigarKind::Skipped => 'N',
         };
         write!(f, "{}{}", self.len, op_char)
     }
@@ -150,4 +176,30 @@ pub struct Alignment {
     pub md: String,
     pub as_score: i32,
     pub xs_score: Option<i32>,
+    /// Transcript strand for splice alignments.
+    pub xs_strand: Option<Strand>,
+    pub mate: MateInfo,
+}
+
+/// Paired-end / mate context for an alignment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MateInfo {
+    /// SAM flag 0x1: read is part of a pair (regardless of mapping status).
+    pub is_paired: bool,
+    /// SAM flag 0x2: both reads of the pair properly aligned per insert-size and orientation policy.
+    pub is_proper_pair: bool,
+    /// SAM flag 0x8: mate is unmapped.
+    pub mate_is_unmapped: bool,
+    /// SAM flag 0x20: mate aligned to reverse strand.
+    pub mate_is_rev: bool,
+    /// SAM flag 0x40: this is the first segment in the template (R1).
+    pub is_first_in_pair: bool,
+    /// SAM flag 0x80: this is the last segment in the template (R2).
+    pub is_second_in_pair: bool,
+    /// Mate's reference ID. `None` ⇒ RNEXT='*' (mate unmapped or unpaired).
+    pub mate_ref_id: Option<u32>,
+    /// Mate's 0-based reference position.
+    pub mate_pos: u32,
+    /// Signed observed template length (TLEN). 0 when undefined.
+    pub tlen: i32,
 }

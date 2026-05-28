@@ -1,7 +1,7 @@
 [package]
 name = "kira-ls-aligner"
 description = "Unified short- and long-read sequence aligner written in Rust 2024. It combines minimap2-style minimizers and chaining with BWA-MEM2-style exact-match anchoring and output semantics. The goal is drop-in compatibility with bwa-mem pipelines while supporting long reads efficiently."
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -25,6 +25,7 @@ categories = [
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
+tempfile = "3"
 memmap2 = "0.9"
 kira-fastq = "0.1"
 needletail = "0.6"
@@ -33,10 +34,29 @@ rustc-hash = "2"
 sysinfo = "0.38"
 thiserror = "2"
 kira-simd = { version = "0.1.0", features = ["runtime-dispatch", "avx2", "sse42", "neon", "scalar"] }
+kira_kv_engine = { version = "0.6", default-features = true }
+
+kira-bam = "0.1"
+
+# CUDA backend (optional, opt-in via `cuda` feature). Pinned to a cudarc
+# version that supports loading PTX at runtime — required for shipping a
+# single binary that targets multiple GPU generations including Pascal
+# (compute_61, GTX 1060+).
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "cuda-12060", "dynamic-loading"], optional = true }
+
+[build-dependencies]
+# Used only when building with `--features cuda` to compile the .cu kernel
+# into PTX at build time. `find_cuda_helper` locates a CUDA toolkit
+# installation across Linux/Windows/macOS so the user only needs CUDA
+# installed, not exact paths.
+find_cuda_helper = { version = "0.2", optional = true }
 
 [features]
 default = []
-cuda = []
+# Build with `cargo build --release --features cuda` after installing CUDA
+# Toolkit (>= 11.0; tested up to 12.x). The build script then compiles
+# src/cuda/spectral.cu → target/.../spectral.ptx for SM_61+ targets.
+cuda = ["dep:cudarc", "dep:find_cuda_helper"]
 
 [profile.release]
 lto = "thin"

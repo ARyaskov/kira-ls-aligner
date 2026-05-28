@@ -1,4 +1,8 @@
+pub mod chunk_io;
+pub mod insert_estimate;
 pub mod mode;
+pub mod pairing;
+pub mod split_read;
 pub mod stage0_input;
 pub mod stage1_sketch;
 pub mod stage2_seeding;
@@ -6,16 +10,26 @@ pub mod stage3_chaining;
 pub mod stage4_alignment;
 pub mod stage5_scoring;
 pub mod stage6_output;
+pub mod tiled;
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use std::sync::{Arc, RwLock};
+
 use crate::alignment::AlignmentConfig;
+use crate::alignment::junc_bed::JunctionIndex;
+use crate::alignment::splice::SpliceConfig;
 use crate::chaining::ChainingConfig;
 use crate::index::Index;
-use crate::io::{OutputConfig, SamWriter};
+use crate::io::{OutputConfig, SamFormatter};
 use crate::mapq::MapqConfig;
+use crate::pipeline::insert_estimate::InsertEstimator;
+use crate::pipeline::pairing::{
+    PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs,
+    rescue_unmapped_mates,
+};
 use crate::pipeline::stage1_sketch::{SketchBatchStats, SketchConfig, run as sketch_run};
 use crate::pipeline::stage2_seeding::{SeedBatchStats, run as seed_run};
 use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
@@ -23,7 +37,7 @@ use crate::pipeline::stage4_alignment::{
     AlignmentBatchStats, AlignmentStageConfig, run as align_run,
 };
 use crate::pipeline::stage5_scoring::run as score_run;
-use crate::pipeline::stage6_output::run as output_run;
+use crate::pipeline::stage6_output::serialize as output_serialize;
 use crate::seeding::SeedingConfig;
 
 /// Pipeline configuration aggregated across stages.
@@ -51,6 +65,10 @@ pub struct PipelineConfig {
     pub short_preset: bool,
     pub mapq: MapqConfig,
     pub output: OutputConfig,
+    /// Paired-end ingestion + proper-pair policy.
+    pub paired: PairedConfig,
+    /// Splice-aware alignment policy.
+    pub splice: SpliceConfig,
 }
 
 /// Per-batch stage timing results (stages 1-6).
@@ -75,41 +93,64 @@ pub struct PipelineBatchStats {
     pub chaining: ChainingBatchStats,
 }
 
+/// Result of `Pipeline::process_batch_serialized` — stats plus a ready-to-write SAM byte buffer.
+pub struct PipelineBatchOutput {
+    pub stats: PipelineBatchStats,
+    pub sam_buf: Vec<u8>,
+}
+
 pub struct Pipeline {
     pub config: PipelineConfig,
+    /// Optional in-memory junction annotation (`--junc-bed`).
+    pub junctions: Option<Arc<JunctionIndex>>,
+    /// Position tolerance for junction lookup (matches the CLI flag).
+    pub junc_bed_tolerance: u32,
+    /// Insert-size estimator.
+    pub insert_estimator: Arc<RwLock<InsertEstimator>>,
 }
 
 impl Pipeline {
     pub fn new(config: PipelineConfig) -> Self {
-        Self { config }
+        let estimator = Arc::new(RwLock::new(InsertEstimator::new(config.paired)));
+        Self {
+            config,
+            junctions: None,
+            junc_bed_tolerance: 2,
+            insert_estimator: estimator,
+        }
     }
 
-    pub fn process_batch(
+    /// Attach a parsed junction annotation.
+    pub fn with_junctions(
+        mut self,
+        junctions: Option<Arc<JunctionIndex>>,
+        tolerance: u32,
+    ) -> Self {
+        self.junctions = junctions;
+        self.junc_bed_tolerance = tolerance;
+        self
+    }
+
+    /// Run only stages 1-4 (sketch → seed → chain → align).
+    pub fn process_to_align_batch(
         &self,
         input: stage0_input::InputBatch,
         index: &Index,
-        writer: &mut SamWriter,
-        read_group: Option<&str>,
-    ) -> Result<PipelineBatchStats> {
-        let mut stages = [Duration::ZERO; 6];
-
-        let t0 = Instant::now();
+    ) -> crate::pipeline::stage4_alignment::AlignBatch {
         let sketch = sketch_run(input, self.config.sketch);
-        let sketch_stats = sketch.stats;
-        stages[0] = t0.elapsed();
-
-        let t1 = Instant::now();
         let seeds = seed_run(sketch, index, self.config.seeding);
-        let seed_stats = seeds.stats.clone();
-        stages[1] = t1.elapsed();
-
-        let t2 = Instant::now();
         let chains = chain_run(seeds, self.config.chaining);
-        let chaining_stats = chains.stats.clone();
-        stages[2] = t2.elapsed();
-
-        let t3 = Instant::now();
-        let align = align_run(
+        if self.config.splice.enabled {
+            return crate::alignment::splice::splice_align_batch(
+                chains,
+                index,
+                self.config.alignment,
+                self.config.splice,
+                self.junctions.as_deref(),
+                self.junc_bed_tolerance,
+            );
+        }
+        align_run(
             chains,
             index,
             AlignmentStageConfig {
@@ -131,30 +172,179 @@ impl Pipeline {
                 max_alignments: self.config.max_alignments,
                 short_preset: self.config.short_preset,
             },
+        )
+    }
+
+    /// Run stages 1-6 producing a ready-to-write SAM byte buffer.
+    pub fn process_batch_serialized(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+        formatter: &SamFormatter,
+        read_group: Option<&str>,
+    ) -> Result<PipelineBatchOutput> {
+        let mut stages = [Duration::ZERO; 6];
+
+        let t0 = Instant::now();
+        let sketch = sketch_run(input, self.config.sketch);
+        let sketch_stats = sketch.stats;
+        stages[0] = t0.elapsed();
+
+        let t1 = Instant::now();
+        let seeds = seed_run(sketch, index, self.config.seeding);
+        let seed_stats = seeds.stats.clone();
+        stages[1] = t1.elapsed();
+
+        let t2 = Instant::now();
+        let chains = chain_run(seeds, self.config.chaining);
+        let chaining_stats = chains.stats.clone();
+        stages[2] = t2.elapsed();
+
+        let t3 = Instant::now();
+        let mut t_stage4 = Duration::ZERO;
+        let mut t_rescue_unmapped = Duration::ZERO;
+        let mut t_pair_rerank = Duration::ZERO;
+        let mut t_rescue_discordant = Duration::ZERO;
+        let mut t_apply_pairing = Duration::ZERO;
+        let ts4 = Instant::now();
+        let mut align = if self.config.splice.enabled {
+            crate::alignment::splice::splice_align_batch(
+                chains,
+                index,
+                self.config.alignment,
+                self.config.splice,
+                self.junctions.as_deref(),
+                self.junc_bed_tolerance,
+            )
+        } else {
+            align_run(
+                chains,
+                index,
+                AlignmentStageConfig {
+                    cfg: self.config.alignment,
+                    min_chain_ratio: self.config.min_chain_ratio,
+                    accept_enable: self.config.accept_enable,
+                    accept_only_top1: self.config.accept_only_top1,
+                    accept_span_slack: self.config.accept_span_slack,
+                    accept_min_identity: self.config.accept_min_identity,
+                    accept_max_mismatches: self.config.accept_max_mismatches,
+                    accept_require_score_margin: self.config.accept_require_score_margin,
+                    dp_topk: self.config.dp_topk,
+                    dp_abort_margin: self.config.dp_abort_margin,
+                    debug_prefilter: self.config.debug_prefilter,
+                    debug_prefilter_n: self.config.debug_prefilter_n,
+                    debug_force_accept: self.config.debug_force_accept,
+                    debug_force_accept_n: self.config.debug_force_accept_n,
+                    long_read_threshold: self.config.long_read_threshold,
+                    max_alignments: self.config.max_alignments,
+                    short_preset: self.config.short_preset,
+                },
+            )
+        };
+        t_stage4 = ts4.elapsed();
+
+        let paired_cfg = self
+            .insert_estimator
+            .read()
+            .map(|e| e.current())
+            .unwrap_or(self.config.paired);
+
+        let tru = Instant::now();
+        rescue_unmapped_mates(
+            &align.reads,
+            &mut align.alignments,
+            index,
+            &paired_cfg,
+            self.config.alignment,
+            RescueConfig::default(),
         );
+        t_rescue_unmapped = tru.elapsed();
+
+        let tpr = Instant::now();
+        pair_rerank(
+            &align.reads,
+            &mut align.alignments,
+            &paired_cfg,
+            self.config.dp_topk.max(1),
+        );
+        t_pair_rerank = tpr.elapsed();
+
+        let trd = Instant::now();
+        rescue_discordant_pairs(
+            &align.reads,
+            &mut align.alignments,
+            index,
+            &paired_cfg,
+            self.config.alignment,
+            RescueConfig::default(),
+        );
+        t_rescue_discordant = trd.elapsed();
+
+        let tap = Instant::now();
+        apply_pairing(
+            &align.reads,
+            &mut align.alignments,
+            &mut align.unmapped_mate_info,
+            &paired_cfg,
+        );
+        t_apply_pairing = tap.elapsed();
+
+        let refined_after = if paired_cfg.is_paired() {
+            self.insert_estimator
+                .write()
+                .ok()
+                .and_then(|mut e| e.observe_batch(&align.alignments))
+        } else {
+            None
+        };
+        let paired_cfg_final = refined_after.unwrap_or(paired_cfg);
+
         stages[3] = t3.elapsed();
+        if std::env::var_os("KIRA_STATS").is_some() {
+            eprintln!(
+                "[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",
+                t_stage4.as_secs_f64() * 1000.0,
+                t_rescue_unmapped.as_secs_f64() * 1000.0,
+                t_pair_rerank.as_secs_f64() * 1000.0,
+                t_rescue_discordant.as_secs_f64() * 1000.0,
+                t_apply_pairing.as_secs_f64() * 1000.0,
+                stages[3].as_secs_f64() * 1000.0,
+            );
+        }
 
         let t4 = Instant::now();
-        let scored = score_run(align, self.config.mapq);
+        let pair_ctx = if paired_cfg_final.is_paired() {
+            Some(crate::mapq::PairMapqContext {
+                insert_mean: paired_cfg_final.insert_mean,
+                insert_sd: paired_cfg_final.insert_sd,
+                discordant_cap: 10,
+            })
+        } else {
+            None
+        };
+        let scored = score_run(align, self.config.mapq, pair_ctx);
         let align_stats = scored.stats.clone();
         stages[4] = t4.elapsed();
 
         let t5 = Instant::now();
-        output_run(
+        let sam_buf = output_serialize(
             scored,
-            writer,
+            formatter,
             read_group,
             self.config.output,
             self.config.max_alignments,
-        )?;
+        );
         stages[5] = t5.elapsed();
 
-        Ok(PipelineBatchStats {
-            times: PipelineStageTimes { stages },
-            align: align_stats,
-            sketch: sketch_stats,
-            seed: seed_stats,
-            chaining: chaining_stats,
+        Ok(PipelineBatchOutput {
+            stats: PipelineBatchStats {
+                times: PipelineStageTimes { stages },
+                align: align_stats,
+                sketch: sketch_stats,
+                seed: seed_stats,
+                chaining: chaining_stats,
+            },
+            sam_buf,
         })
     }
 }

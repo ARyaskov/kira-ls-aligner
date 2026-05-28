@@ -34,8 +34,6 @@ pub fn chain_anchors_rmq(
             end += 1;
         }
         let group = &filtered[start..end];
-        // RMQ/Fenwick tuning strategy (default: mild). Switch to aggressive
-        // by commenting the line below and uncommenting the aggressive call.
         let tuned = tune_cfg_mild(cfg, group);
         // let tuned = tune_cfg_aggressive(cfg, group);
         let mut group_chains = chain_group_rmq(group, tuned, stats);

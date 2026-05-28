@@ -28,4 +28,8 @@ pub struct IndexArgs {
     /// Maximum occurrences recorded per minimizer.
     #[arg(long = "max-occ", default_value_t = 500)]
     pub max_occ: usize,
+
+    /// Which index to build: `both` (default), `short`, or `long`.
+    #[arg(long = "only", default_value = "both")]
+    pub only: String,
 }

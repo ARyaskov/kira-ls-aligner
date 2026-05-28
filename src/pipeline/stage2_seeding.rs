@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::index::Index;
-use crate::seq::reverse_complement;
+use crate::seq::reverse_complement_into;
 use crate::types::{Anchor, ReadRecord, Strand};
 
 use super::stage1_sketch::{ReadSketch, SketchBatch};
@@ -83,28 +82,54 @@ fn seed_one(
 
     ctx.proto.clear();
     ctx.candidates.clear();
+    ctx.diag_counts.clear();
+    ctx.rc_ready = false;
 
     // ranked/pruned seeding: limit each minimizer bucket to top-K occurrences
     let mins = &sketch.minimizers;
     let read_len = read.seq.len() as u32;
     let k = sketch.k as u32;
 
+    let n_mins = mins.len();
+    grow_scratch(ctx, n_mins);
+    ctx.hashes_scratch.clear();
     for m in mins {
-        let bucket_len = match index.bucket_len(table, m.hash) {
-            Some(len) => len,
+        ctx.hashes_scratch.push(m.hash);
+    }
+    index.bucket_batch_into(
+        table,
+        &ctx.hashes_scratch,
+        &mut ctx.canon_scratch,
+        &mut ctx.ids_scratch,
+        &mut ctx.buckets_scratch,
+    );
+
+    for (m_idx, m) in mins.iter().enumerate() {
+        let (start, end) = match ctx.buckets_scratch[m_idx] {
+            Some(range) => range,
             None => continue,
         };
+        let bucket_len = end - start;
         if bucket_len == 0 || bucket_len > cfg.max_occ {
             continue;
         }
 
-        let mut occs: Vec<(u32, u32, Strand)> = Vec::new();
-        index.for_each_occ(table, m.hash, |o| {
-            occs.push((o.ref_id, o.pos, o.strand));
-        });
+        ctx.occs.clear();
+        let slot_opt = ctx.ids_scratch[m_idx];
+        let mut hot_hit = false;
+        if let Some(slot) = slot_opt {
+            if let Some(cached) = table.hot_lookup(slot as u32) {
+                ctx.occs.extend_from_slice(cached);
+                hot_hit = true;
+            }
+        }
+        if !hot_hit {
+            for occ_idx in start..end {
+                let o = index.occ_at(table, occ_idx);
+                ctx.occs.push((o.ref_id, o.pos, o.strand));
+            }
+        }
 
-        // Deterministic ranking: prefer smaller buckets and coherent diagonals.
-        // Keep only top-K occurrences per minimizer.
         let k_hits = if bucket_len <= 8 {
             8
         } else if bucket_len <= 32 {
@@ -112,8 +137,10 @@ fn seed_one(
         } else {
             2
         };
-        occs.sort_by_key(|(rid, pos, strand)| (*rid, *pos, *strand as u8));
-        for (rid, pos, strand) in occs.into_iter().take(k_hits) {
+        ctx.occs
+            .sort_by_key(|(rid, pos, strand)| (*rid, *pos, *strand as u8));
+        let take_n = k_hits.min(ctx.occs.len());
+        for &(rid, pos, strand) in ctx.occs[..take_n].iter() {
             let is_rev = strand != m.strand;
             let read_pos = if is_rev {
                 (read.seq.len() - m.pos as usize - sketch.k) as u32
@@ -153,24 +180,26 @@ fn seed_one(
     const MAX_ANCHORS_PER_DIAG: usize = 8;
 
     ctx.candidates.sort_by_key(|c| std::cmp::Reverse(c.score));
-    let mut diag_counts: HashMap<(u32, Strand, i32), usize> = HashMap::new();
     ctx.anchors.clear();
 
-    for cand in ctx.candidates.iter() {
+    for cand_idx in 0..ctx.candidates.len() {
         if ctx.anchors.len() >= MAX_ANCHORS_PER_READ {
             break;
         }
+        let cand = &ctx.candidates[cand_idx];
         let key = (cand.proto.ref_id, cand.proto.strand, cand.proto.diag);
-        let count = diag_counts.entry(key).or_insert(0);
+        let count = ctx.diag_counts.entry(key).or_insert(0);
         if *count >= MAX_ANCHORS_PER_DIAG {
             continue;
         }
         *count += 1;
 
-        // Optional exact extension: only for top few candidates
+        // Optional exact extension: only for top few candidates.
         let anchor = if ctx.anchors.len() < 8 {
-            extend_proto(read, index, cand)
+            let cand = &ctx.candidates[cand_idx];
+            extend_proto(read, index, cand, &mut ctx.rc_buf, &mut ctx.rc_ready)
         } else {
+            let cand = &ctx.candidates[cand_idx];
             Anchor {
                 read_start: cand.proto.read_start,
                 read_end: cand.proto.read_end.min(read_len),
@@ -187,13 +216,23 @@ fn seed_one(
     (std::mem::take(&mut ctx.anchors), before)
 }
 
-fn extend_proto(read: &ReadRecord, index: &Index, cand: &AnchorCandidate) -> Anchor {
+/// Run exact-match extension around an anchor candidate.
+fn extend_proto(
+    read: &ReadRecord,
+    index: &Index,
+    cand: &AnchorCandidate,
+    rc_buf: &mut Vec<u8>,
+    rc_ready: &mut bool,
+) -> Anchor {
     let ref_seq = index.ref_bases(cand.proto.ref_id as usize);
-    let rc_read = reverse_complement(&read.seq);
-    let (read_seq, strand) = if cand.proto.strand == Strand::Reverse {
-        (&rc_read, Strand::Reverse)
+    let (read_seq, strand): (&[u8], Strand) = if cand.proto.strand == Strand::Reverse {
+        if !*rc_ready {
+            reverse_complement_into(&read.seq, rc_buf);
+            *rc_ready = true;
+        }
+        (rc_buf.as_slice(), Strand::Reverse)
     } else {
-        (&read.seq, Strand::Forward)
+        (read.seq.as_slice(), Strand::Forward)
     };
 
     let mut q_start = cand.proto.read_start as i32;
@@ -236,8 +275,37 @@ fn extend_proto(read: &ReadRecord, index: &Index, cand: &AnchorCandidate) -> Anc
 
 #[derive(Default)]
 struct ThreadCtx {
-    proto: HashMap<(u32, Strand, i32), ProtoAnchor>,
+    proto: FxHashMap<(u32, Strand, i32), ProtoAnchor>,
+    diag_counts: FxHashMap<(u32, Strand, i32), usize>,
+    occs: Vec<(u32, u32, Strand)>,
     candidates: Vec<AnchorCandidate>,
     anchors: Vec<Anchor>,
+    rc_buf: Vec<u8>,
+    rc_ready: bool,
     anchors_before_prune: usize,
+    /// Per-read minimizer hash batch — populated then passed to `Index::bucket_batch_into`.
+    hashes_scratch: Vec<u64>,
+    /// Canonical-hash scratch for `lookup_batch_u64_simd_into`.
+    canon_scratch: Vec<u64>,
+    /// MPH-id results for `lookup_batch_u64_simd_into`.
+    ids_scratch: Vec<Option<usize>>,
+    /// `(start, end)` bucket descriptors — same length as `hashes_scratch`.
+    buckets_scratch: Vec<Option<(usize, usize)>>,
+}
+
+/// Grow per-thread scratch buffers to fit at least `n` minimizers.
+#[inline]
+fn grow_scratch(ctx: &mut ThreadCtx, n: usize) {
+    if ctx.canon_scratch.len() < n {
+        ctx.canon_scratch.resize(n, 0);
+    }
+    if ctx.ids_scratch.len() < n {
+        ctx.ids_scratch.resize(n, None);
+    }
+    if ctx.buckets_scratch.len() < n {
+        ctx.buckets_scratch.resize(n, None);
+    }
+    if ctx.hashes_scratch.capacity() < n {
+        ctx.hashes_scratch.reserve(n - ctx.hashes_scratch.capacity());
+    }
 }

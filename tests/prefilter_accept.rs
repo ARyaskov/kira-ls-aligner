@@ -11,6 +11,7 @@ fn cfg() -> AlignmentConfig {
         gap_extend: 1,
         bandwidth: 50,
         xdrop: 50,
+        clip_penalty: 5,
     }
 }
 

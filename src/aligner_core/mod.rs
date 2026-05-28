@@ -6,8 +6,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 use sysinfo::System;
 
+use std::sync::Arc;
+
+use crate::alignment::junc_bed::JunctionIndex;
 use crate::index::{Index, IndexConfig};
-use crate::io::{ReadStream, SamWriter, read_reference};
+use crate::io::{HeaderConfig, ReadStream, SamWriter, read_reference};
 use crate::pipeline::mode::{ModeFeatures, classify};
 use crate::pipeline::stage0_input;
 use crate::pipeline::stage4_alignment::AlignmentBatchStats;
@@ -23,6 +26,12 @@ pub struct AlignerConfig {
     pub pipeline: PipelineConfig,
     pub auto_profiles: Option<crate::pipeline::mode::ReadModeProfiles>,
     pub read_group: Option<String>,
+    /// SAM header customisation: @PG / @CO injections, @RG.
+    pub header: Option<HeaderConfig>,
+    /// Parsed splice junction annotation (`--junc-bed`).
+    pub junctions: Option<Arc<JunctionIndex>>,
+    /// Position tolerance for junction lookups (`--junc-bed-tolerance`).
+    pub junc_bed_tolerance: u32,
 }
 
 /// Aligner orchestrator.
@@ -133,13 +142,27 @@ impl Aligner {
 
     fn run_with_index<R>(
         &self,
-        index: Index,
+        mut index: Index,
         reads_paths: &[std::path::PathBuf],
         output_path: Option<R>,
     ) -> Result<()>
     where
         R: AsRef<Path>,
     {
+        let hot_n: usize = std::env::var("KIRA_HOT_CACHE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000);
+        if hot_n > 0 {
+            let max_occs: usize = std::env::var("KIRA_HOT_CACHE_MAX_OCCS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8_000_000);
+            let mmap_bytes = index.mmap.as_deref().map(|m| &m[..]);
+            index.short.build_hot_cache(mmap_bytes, hot_n, max_occs);
+            index.long.build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
+        }
+
         let stats_enabled = std::env::var_os("KIRA_STATS").is_some();
         let mut stage0_total = Duration::ZERO;
         let mut pipeline_totals = [Duration::ZERO; 6];
@@ -160,10 +183,38 @@ impl Aligner {
         };
 
         let mut writer = SamWriter::new(output_path, index.reference.clone())?;
-        writer.write_header_with_rg(self.cfg.read_group.as_deref())?;
+        let is_paf =
+            matches!(self.cfg.pipeline.output.format, crate::io::EmitFormat::Paf);
+        if !is_paf {
+            match &self.cfg.header {
+                Some(hdr) => writer.write_header_with_ctx(hdr)?,
+                None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
+            }
+        }
 
-        let mut stream = ReadStream::new_multi(reads_paths, self.cfg.batch_bases)?;
-        let mut pipeline = Pipeline::new(self.cfg.pipeline);
+        let formatter = writer.formatter_handle();
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        let writer_thread = std::thread::Builder::new()
+            .name("kira-sam-writer".to_string())
+            .spawn(move || -> Result<()> {
+                let mut writer = writer;
+                while let Ok(buf) = write_rx.recv() {
+                    writer.write_batch(&buf)?;
+                }
+                writer.flush()?;
+                Ok(())
+            })
+            .context("spawn writer thread")?;
+
+        let mut stream = ReadStream::new_multi_with_mode(
+            reads_paths,
+            self.cfg.batch_bases,
+            self.cfg.pipeline.paired.mode,
+        )?;
+        let mut pipeline = Pipeline::new(self.cfg.pipeline).with_junctions(
+            self.cfg.junctions.clone(),
+            self.cfg.junc_bed_tolerance,
+        );
         if stats_enabled {
             eprintln!(
                 "[KIRA_CONFIG] {}",
@@ -204,12 +255,17 @@ impl Aligner {
                 let input = stage0_input::run(reads);
                 let stage0_time = fetch_time + stage0_start.elapsed();
 
-                let batch_stats = pipeline.process_batch(
+                let batch_out = pipeline.process_batch_serialized(
                     input,
                     &index,
-                    &mut writer,
+                    &formatter,
                     self.cfg.read_group.as_deref(),
                 )?;
+                let batch_stats = batch_out.stats;
+                if write_tx.send(batch_out.sam_buf).is_err() {
+                    // Writer thread died — surface the error on next join.
+                    break;
+                }
 
                 if let Some(profiles) = auto_profiles.as_mut() {
                     if profiles.decided.is_none() {
@@ -249,6 +305,7 @@ impl Aligner {
                     chain_total_used += batch_stats.chaining.anchors_used_for_chaining;
                     chain_total_pruned += batch_stats.chaining.chains_pruned_early;
                     print_batch_stats(batch_idx, stage0_time, &batch_stats.times, &batch_stats.align, progress.as_ref());
+                    print_algo_counters(&format!("batch {}", batch_idx), &batch_stats.align);
                     eprintln!(
                         "[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                         batch_idx,
@@ -277,9 +334,20 @@ impl Aligner {
 
                 batch_idx += 1;
             }
-            writer.flush()?;
             Ok(())
         })?;
+
+        drop(write_tx);
+        match writer_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.context("SAM writer thread failed")),
+            Err(panic) => {
+                return Err(anyhow::anyhow!(
+                    "SAM writer thread panicked: {:?}",
+                    panic
+                ));
+            }
+        }
 
         if stats_enabled {
             if let Some(pb) = progress.as_ref() {
@@ -295,6 +363,7 @@ impl Aligner {
                 progress.as_ref(),
                 mode_selected,
             );
+            print_algo_counters("summary", &align_total);
             eprintln!(
                 "[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                 seed_total_before, seed_total_after, chain_total_used, chain_total_pruned,
@@ -355,7 +424,7 @@ fn update_progress(
     };
 
     let out_size = output_path.and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()));
-    let mut msg = format!("threads={}/{}", threads, cores);
+    let mut msg = format!("threads={threads}/{cores}");
     if let Some((used, total)) = mem {
         msg.push_str(&format!(" RAM={} / {}", fmt_bytes(used), fmt_bytes(total)));
     }
@@ -368,7 +437,7 @@ fn update_progress(
             SimdMode::Neon => "simd=neon",
             SimdMode::Scalar => "simd=scalar",
         };
-        msg.push_str(&format!(" {}", simd));
+        msg.push_str(&format!(" {simd}"));
     }
     msg.push_str(&format!(" cuda={}", cuda_status()));
     pb.set_message(msg);
@@ -397,12 +466,40 @@ fn fmt_bytes(bytes: u64) -> String {
     } else if b >= KB {
         format!("{:.2} KB", b / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
 fn fmt_ms(d: Duration) -> String {
     format!("{:.3} ms", d.as_secs_f64() * 1000.0)
+}
+
+/// Emit a one-line per-algorithm cascade-attribution summary.
+fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
+    let total = stats.reads.max(1) as f32;
+    let pct = |n: usize| n as f32 * 100.0 / total;
+    let spectral_total = stats.packed_spectral_resolved
+        + stats.spectral_sieve_resolved
+        + stats.gpu_spectral_resolved
+        + stats.prefilter_accept;
+    let sw_total = stats.dp_simd + stats.dp_scalar;
+    eprintln!(
+        "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
+        label,
+        stats.reads,
+        stats.exact_matches, pct(stats.exact_matches),
+        stats.prefilter_accept, pct(stats.prefilter_accept),
+        stats.packed_spectral_resolved, pct(stats.packed_spectral_resolved),
+        stats.spectral_sieve_resolved, pct(stats.spectral_sieve_resolved),
+        stats.gpu_spectral_resolved, pct(stats.gpu_spectral_resolved),
+        stats.wfa_resolved, pct(stats.wfa_resolved),
+        stats.dp_simd, pct(stats.dp_simd),
+        stats.dp_scalar, pct(stats.dp_scalar),
+        stats.unmapped, pct(stats.unmapped),
+        spectral_total, pct(spectral_total),
+        sw_total, pct(sw_total),
+        stats.wfa_resolved, pct(stats.wfa_resolved),
+    );
 }
 
 fn print_batch_stats(
@@ -462,10 +559,9 @@ fn print_batch_stats(
         align_stats.avg_read_len(),
     );
     if let Some(pb) = pb {
-        pb.println(line);
-    } else {
-        eprintln!("{}", line);
+        pb.println(&line);
     }
+    eprintln!("{line}");
 }
 
 fn print_summary_stats(
@@ -527,21 +623,11 @@ fn print_summary_stats(
         align_total.avg_read_len(),
     );
     if let Some((mode, p50)) = mode_selected {
-        if let Some(pb) = pb {
-            pb.println(format!(
-                "[KIRA_MODE] summary: selected={:?} median_read_len={}",
-                mode, p50
-            ));
-        } else {
-            eprintln!(
-                "[KIRA_MODE] summary: selected={:?} median_read_len={}",
-                mode, p50
-            );
-        }
+        eprintln!(
+            "[KIRA_MODE] summary: selected={:?} median_read_len={}",
+            mode, p50
+        );
     }
-    if let Some(pb) = pb {
-        pb.println(line);
-    } else {
-        eprintln!("{}", line);
-    }
+    let _ = pb;
+    eprintln!("{line}");
 }

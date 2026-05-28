@@ -1,8 +1,16 @@
+pub mod bitpacked;
+pub mod cgk;
+pub mod junc_bed;
+pub mod myers;
 pub mod prefilter;
+pub mod router;
+pub mod spectral;
+pub mod splice;
+pub mod wfa;
 
 use crate::seq::reverse_complement_into;
 use crate::simd::{self, SimdMode};
-use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, ReadRecord, Strand};
+use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, ReadRecord, Strand};
 
 /// Alignment scoring configuration.
 #[derive(Clone, Copy, Debug)]
@@ -13,6 +21,8 @@ pub struct AlignmentConfig {
     pub gap_extend: i32,
     pub bandwidth: i32,
     pub xdrop: i32,
+    /// bwa-mem `-L`. Cost of a tail soft-clip vs. extending through an indel.
+    pub clip_penalty: i32,
 }
 
 /// Summary span for alignment stage.
@@ -67,6 +77,358 @@ pub fn oriented_read(read: &ReadRecord, strand: Strand) -> OrientedRead<'_> {
     OrientedRead::new(read.seq.as_slice(), strand)
 }
 
+/// Which step of the fast-DP cascade produced an alignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FastPathKind {
+    /// Bit-Packed Spectral — 2-bit DNA + SWAR popcount, ungapped only.
+    PackedSpectral,
+    /// Byte-resolution Spectral Sieve — ungapped multi-shift Hamming.
+    SpectralSieve,
+    /// Wavefront Alignment — affine-gap semi-global, handles indels.
+    Wfa,
+    /// CGK-rescued alignment: cascade exhausted its primary path.
+    CgkRescue,
+}
+
+/// Try to build a DP-quality alignment via the routed fast aligner.
+pub fn try_fast_dp_alignment(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    chain_score: i32,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+) -> Option<(Alignment, FastPathKind)> {
+    let result =
+        try_fast_dp_alignment_inner(read_seq, ref_seq, chain, chain_score, cfg, is_rev);
+    if result.is_some() {
+        return result;
+    }
+    let strand = if is_rev { Strand::Reverse } else { Strand::Forward };
+    if let Some(aln) = cgk::try_cgk_fallback(read_seq, strand) {
+        return Some((aln, FastPathKind::CgkRescue));
+    }
+    None
+}
+
+/// Original cascade body.
+fn try_fast_dp_alignment_inner(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    chain_score: i32,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+) -> Option<(Alignment, FastPathKind)> {
+    let read_len = read_seq.len();
+    if read_len == 0 {
+        return None;
+    }
+    let kind = router::choose_aligner(read_len);
+    // Long reads or `KIRA_ALGO=sw` → banded SW immediately.
+    if matches!(kind, router::AlignerKind::BandedSw) {
+        return None;
+    }
+    if !router::fast_path_worth_attempting(chain_score, read_len) {
+        return None;
+    }
+
+    let expected_ref_start = chain.ref_start as i32 - chain.read_start as i32;
+    if expected_ref_start < 0 {
+        return None;
+    }
+    let win_start = expected_ref_start as usize;
+    if win_start >= ref_seq.len() {
+        return None;
+    }
+    let band = cfg.bandwidth.max(1) as usize;
+    let pad = band;
+    let max_text_len = ref_seq.len() - win_start;
+    let text_len = (read_len + pad).min(max_text_len);
+    if text_len < read_len {
+        // Not enough reference to host the pattern — fall back.
+        return None;
+    }
+    let text = &ref_seq[win_start..win_start + text_len];
+
+    if matches!(kind, router::AlignerKind::PackedSpectral) {
+        if let Some(aln) =
+            try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
+        {
+            return Some((aln, FastPathKind::PackedSpectral));
+        }
+    }
+
+    if matches!(
+        kind,
+        router::AlignerKind::PackedSpectral | router::AlignerKind::SpectralSieve
+    ) {
+        if let Some(aln) =
+            try_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
+        {
+            return Some((aln, FastPathKind::SpectralSieve));
+        }
+        // Spectral didn't apply (indel suspected) — fall through to WFA below.
+    }
+
+    let myers_k = router::myers_reject_bound(read_len);
+    if myers::bounded_edit_distance(read_seq, text, myers_k).is_none() {
+        return None;
+    }
+
+    let pen = wfa::WfaPenalties {
+        mismatch: cfg.mismatch,
+        gap_open: cfg.gap_open,
+        gap_extend: cfg.gap_extend,
+    };
+    let budget = router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
+    let wfa_aln = wfa::wfa_align_semi_global(read_seq, text, pen, budget)?;
+
+    let aln = wfa_result_to_alignment(read_seq, text, win_start, chain.ref_id, wfa_aln, cfg, is_rev)?;
+    Some((aln, FastPathKind::Wfa))
+}
+
+/// Convert a `wfa::WfaAlignment` produced by `wfa_align_semi_global` into our in-pipeline.
+pub fn wfa_result_to_alignment(
+    read_seq: &[u8],
+    text: &[u8],
+    win_start_global: usize,
+    ref_id: u32,
+    wfa_aln: wfa::WfaAlignment,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+) -> Option<Alignment> {
+    let read_len = read_seq.len();
+    let cigar = wfa_aln.cigar;
+    let (cigar_ref, cigar_query) = cigar.iter().fold((0usize, 0usize), |(r, q), op| {
+        let l = op.len as usize;
+        match op.op {
+            CigarKind::Match => (r + l, q + l),
+            CigarKind::Ins | CigarKind::SoftClip => (r, q + l),
+            CigarKind::Del | CigarKind::Skipped => (r + l, q),
+        }
+    });
+    if cigar_ref > text.len() || cigar_query > read_seq.len() {
+        return None;
+    }
+    let mut sw_score: i32 = 0;
+    let mut nm: u32 = 0;
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
+    let mut match_run: u32 = 0;
+    let mut qi = 0usize;
+    let mut ti = 0usize;
+    for op in &cigar {
+        match op.op {
+            CigarKind::Match => {
+                for _ in 0..op.len {
+                    let qb = read_seq[qi];
+                    let rb = text[ti];
+                    if qb == rb {
+                        sw_score += cfg.match_score;
+                        match_run += 1;
+                    } else {
+                        sw_score -= cfg.mismatch;
+                        nm += 1;
+                        push_u32_decimal(&mut md_bytes, match_run);
+                        md_bytes.push(rb);
+                        match_run = 0;
+                    }
+                    qi += 1;
+                    ti += 1;
+                }
+            }
+            CigarKind::Ins => {
+                sw_score -= cfg.gap_open + cfg.gap_extend * op.len as i32;
+                nm += op.len;
+                qi += op.len as usize;
+            }
+            CigarKind::Del => {
+                sw_score -= cfg.gap_open + cfg.gap_extend * op.len as i32;
+                nm += op.len;
+                push_u32_decimal(&mut md_bytes, match_run);
+                md_bytes.push(b'^');
+                for _ in 0..op.len {
+                    md_bytes.push(text[ti]);
+                    ti += 1;
+                }
+                match_run = 0;
+            }
+            CigarKind::SoftClip => {
+                qi += op.len as usize;
+            }
+            CigarKind::Skipped => {
+                push_u32_decimal(&mut md_bytes, match_run);
+                match_run = 0;
+                ti += op.len as usize;
+            }
+        }
+    }
+    push_u32_decimal(&mut md_bytes, match_run);
+    // SAFETY: only ASCII digits, ACGTN and '^' were pushed.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+
+    let ref_end_global = win_start_global + wfa_aln.text_end;
+
+    Some(Alignment {
+        kind: AlignmentKind::DpAligned,
+        ref_id,
+        ref_start: win_start_global as u32,
+        ref_end: ref_end_global as u32,
+        read_start: 0,
+        read_end: read_len as u32,
+        cigar,
+        score: sw_score,
+        mapq: 0,
+        is_rev,
+        is_secondary: false,
+        is_supplementary: false,
+        nm,
+        md,
+        as_score: sw_score,
+        xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
+    })
+}
+
+/// Bit-Packed Spectral fast path.
+fn try_packed_spectral_alignment(
+    read_seq: &[u8],
+    text: &[u8],
+    win_start: usize,
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+) -> Option<Alignment> {
+    let read_len = read_seq.len();
+    let max_mism = router::spectral_max_mismatches(read_len);
+
+    let read_packed = bitpacked::PackedDna::pack(read_seq);
+    let ref_packed = bitpacked::PackedDna::pack(text);
+    let ref_shifted = ref_packed.pre_shifted_window();
+
+    let hit = bitpacked::scan(&read_packed, &ref_shifted, text.len(), max_mism)?;
+
+    let cigar = vec![CigarOp {
+        len: read_len as u32,
+        op: CigarKind::Match,
+    }];
+
+    let ref_aligned = &text[hit.shift..hit.shift + read_len];
+    let mut nm: u32 = 0;
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
+    let mut match_run: u32 = 0;
+    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
+        if qb == rb {
+            match_run += 1;
+        } else {
+            nm += 1;
+            push_u32_decimal(&mut md_bytes, match_run);
+            md_bytes.push(*rb);
+            match_run = 0;
+        }
+    }
+    push_u32_decimal(&mut md_bytes, match_run);
+    // SAFETY: only ASCII digits and ACGTN bases were pushed.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+
+    let matches = hit.matches as i32;
+    let mismatches = hit.mismatches as i32;
+    let sw_score = matches * cfg.match_score - mismatches * cfg.mismatch;
+
+    let ref_start_global = win_start + hit.shift;
+    let ref_end_global = ref_start_global + read_len;
+
+    Some(Alignment {
+        kind: AlignmentKind::DpAligned,
+        ref_id: chain.ref_id,
+        ref_start: ref_start_global as u32,
+        ref_end: ref_end_global as u32,
+        read_start: 0,
+        read_end: read_len as u32,
+        cigar,
+        score: sw_score,
+        mapq: 0,
+        is_rev,
+        is_secondary: false,
+        is_supplementary: false,
+        nm,
+        md,
+        as_score: sw_score,
+        xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
+    })
+}
+
+/// Spectral Sieve fast path: scan all candidate shifts in the local reference window.
+fn try_spectral_alignment(
+    read_seq: &[u8],
+    text: &[u8],
+    win_start: usize,
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+) -> Option<Alignment> {
+    let read_len = read_seq.len();
+    let max_mism = router::spectral_max_mismatches(read_len);
+    let hit = spectral::scan(read_seq, text, max_mism)?;
+
+    // Build CIGAR: one big M (no internal soft-clip; the entire read aligns).
+    let cigar = vec![CigarOp {
+        len: read_len as u32,
+        op: CigarKind::Match,
+    }];
+
+    // NM / MD from the chosen shift.
+    let ref_aligned = &text[hit.shift..hit.shift + read_len];
+    let mut nm: u32 = 0;
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
+    let mut match_run: u32 = 0;
+    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
+        if qb == rb {
+            match_run += 1;
+        } else {
+            nm += 1;
+            push_u32_decimal(&mut md_bytes, match_run);
+            md_bytes.push(*rb);
+            match_run = 0;
+        }
+    }
+    push_u32_decimal(&mut md_bytes, match_run);
+    // SAFETY: only ASCII digits and ACGTN bases were pushed.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+
+    // SW-style score: matches reward, mismatches penalty (no gap cost — ungapped).
+    let matches = hit.matches as i32;
+    let mismatches = hit.mismatches as i32;
+    let sw_score = matches * cfg.match_score - mismatches * cfg.mismatch;
+
+    let ref_start_global = win_start + hit.shift;
+    let ref_end_global = ref_start_global + read_len;
+
+    Some(Alignment {
+        kind: AlignmentKind::DpAligned,
+        ref_id: chain.ref_id,
+        ref_start: ref_start_global as u32,
+        ref_end: ref_end_global as u32,
+        read_start: 0,
+        read_end: read_len as u32,
+        cigar,
+        score: sw_score,
+        mapq: 0,
+        is_rev,
+        is_secondary: false,
+        is_supplementary: false,
+        nm,
+        md,
+        as_score: sw_score,
+        xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
+    })
+}
+
 /// Attempt fast exact-match alignment (no DP).
 pub fn exact_match_alignment(
     read_len: usize,
@@ -112,6 +474,8 @@ pub fn exact_match_alignment(
         md: read_len.to_string(),
         as_score: score,
         xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
     })
 }
 
@@ -169,6 +533,206 @@ pub fn align_chain(
     abort_score: i32,
 ) -> Alignment {
     align_chain_with_meta(read, ref_seq, chain, cfg, abort_score).0
+}
+
+/// Public banded-SW wrapper.
+pub fn banded_sw_public(
+    read: &[u8],
+    reference: &[u8],
+    offset: i32,
+    cfg: AlignmentConfig,
+    abort_score: i32,
+) -> SwPublicResult {
+    let r = banded_sw(read, reference, offset, cfg, abort_score);
+    SwPublicResult {
+        ref_start: r.ref_start,
+        ref_end: r.ref_end,
+        read_start: r.read_start,
+        read_end: r.read_end,
+        score: r.score,
+        cigar: r.cigar,
+        early_abort: r.early_abort,
+    }
+}
+
+/// Public mirror of the internal `SwResult` — separate type so we can keep the private one private.
+#[derive(Clone, Debug)]
+pub struct SwPublicResult {
+    pub ref_start: u32,
+    pub ref_end: u32,
+    pub read_start: i32,
+    pub read_end: i32,
+    pub score: i32,
+    pub cigar: Vec<CigarOp>,
+    pub early_abort: bool,
+}
+
+/// Align a read against a *wide* reference window — no chain anchor required.
+pub fn align_in_window(
+    read_seq: &[u8],
+    ref_window: &[u8],
+    win_start: u32,
+    ref_id: u32,
+    is_rev: bool,
+    cfg: AlignmentConfig,
+    min_score: i32,
+) -> Option<Alignment> {
+    let read_len = read_seq.len();
+    if read_len == 0 || ref_window.is_empty() || read_len > ref_window.len() {
+        return None;
+    }
+    if std::env::var_os("KIRA_RESCUE_NO_FAST").is_some() {
+        return align_in_window_wide_sw(
+            read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score,
+        );
+    }
+
+    let read_packed = bitpacked::PackedDna::pack(read_seq);
+    let ref_packed = bitpacked::PackedDna::pack(ref_window);
+    let ref_shifted = ref_packed.pre_shifted_window();
+    let best = match bitpacked::scan_best(&read_packed, &ref_shifted, ref_window.len()) {
+        Some(h) => h,
+        None => return None,
+    };
+    let max_mism = router::spectral_max_mismatches(read_len);
+
+    // Case 1 — ungapped accept.
+    if best.mismatches <= max_mism {
+        if let Some(aln) = build_spectral_alignment(
+            read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score, &best,
+        ) {
+            return Some(aln);
+        }
+    }
+
+    let hopeless_threshold = read_len / 2;
+    if best.mismatches >= hopeless_threshold {
+        return None;
+    }
+
+    let band = cfg.bandwidth.max(20);
+    let mut narrow_cfg = cfg;
+    narrow_cfg.bandwidth = band;
+    let sw = banded_sw(
+        read_seq,
+        ref_window,
+        best.shift as i32,
+        narrow_cfg,
+        i32::MIN / 8,
+    );
+    if sw.score < min_score {
+        return None;
+    }
+    let chain = AnchorSpan {
+        ref_id,
+        ref_start: win_start + sw.ref_start as u32,
+        ref_end: win_start + sw.ref_end as u32,
+        read_start: sw.read_start.max(0) as u32,
+        read_end: sw.read_end.max(0) as u32,
+        strand: if is_rev {
+            crate::types::Strand::Reverse
+        } else {
+            crate::types::Strand::Forward
+        },
+    };
+    Some(build_alignment(read_seq, ref_window, win_start, &chain, is_rev, sw))
+}
+
+/// Wide-band SW path — the original `align_in_window` body.
+fn align_in_window_wide_sw(
+    read_seq: &[u8],
+    ref_window: &[u8],
+    win_start: u32,
+    ref_id: u32,
+    is_rev: bool,
+    cfg: AlignmentConfig,
+    min_score: i32,
+) -> Option<Alignment> {
+    let mut wide_cfg = cfg;
+    wide_cfg.bandwidth = (ref_window.len() as i32 / 2).max(cfg.bandwidth);
+    let sw = banded_sw(read_seq, ref_window, 0, wide_cfg, i32::MIN / 8);
+    if sw.score < min_score {
+        return None;
+    }
+    let chain = AnchorSpan {
+        ref_id,
+        ref_start: win_start + sw.ref_start as u32,
+        ref_end: win_start + sw.ref_end as u32,
+        read_start: sw.read_start.max(0) as u32,
+        read_end: sw.read_end.max(0) as u32,
+        strand: if is_rev {
+            crate::types::Strand::Reverse
+        } else {
+            crate::types::Strand::Forward
+        },
+    };
+    Some(build_alignment(read_seq, ref_window, win_start, &chain, is_rev, sw))
+}
+
+/// Helper that builds an ungapped `Alignment` from a `PackedHit`.
+fn build_spectral_alignment(
+    read_seq: &[u8],
+    ref_window: &[u8],
+    win_start: u32,
+    ref_id: u32,
+    is_rev: bool,
+    cfg: AlignmentConfig,
+    min_score: i32,
+    hit: &bitpacked::PackedHit,
+) -> Option<Alignment> {
+    let read_len = read_seq.len();
+    let matches = hit.matches as i32;
+    let mismatches = hit.mismatches as i32;
+    let sw_score = matches * cfg.match_score - mismatches * cfg.mismatch;
+    if sw_score < min_score {
+        return None;
+    }
+
+    let ref_aligned = &ref_window[hit.shift..hit.shift + read_len];
+    let mut nm: u32 = 0;
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
+    let mut match_run: u32 = 0;
+    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
+        if qb == rb {
+            match_run += 1;
+        } else {
+            nm += 1;
+            push_u32_decimal(&mut md_bytes, match_run);
+            md_bytes.push(*rb);
+            match_run = 0;
+        }
+    }
+    push_u32_decimal(&mut md_bytes, match_run);
+    // SAFETY: only ASCII digits and ACGTN bases were pushed.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+
+    let cigar = vec![CigarOp {
+        len: read_len as u32,
+        op: CigarKind::Match,
+    }];
+    let ref_start_global = win_start + hit.shift as u32;
+    let ref_end_global = ref_start_global + read_len as u32;
+
+    Some(Alignment {
+        kind: AlignmentKind::DpAligned,
+        ref_id,
+        ref_start: ref_start_global,
+        ref_end: ref_end_global,
+        read_start: 0,
+        read_end: read_len as u32,
+        cigar,
+        score: sw_score,
+        mapq: 0,
+        is_rev,
+        is_secondary: false,
+        is_supplementary: false,
+        nm,
+        md,
+        as_score: sw_score,
+        xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
+    })
 }
 
 /// Align a batch of short-read inputs with SIMD where possible.
@@ -307,6 +871,8 @@ fn build_alignment(
         md,
         as_score: sw.score,
         xs_score: None,
+        xs_strand: None,
+        mate: MateInfo::default(),
     }
 }
 
@@ -331,6 +897,8 @@ fn banded_sw(
     let mut best_score = 0;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
+    let mut best_qlen_score: i32 = 0;
+    let mut best_qlen_j: usize = 0;
 
     let mut early_abort = false;
 
@@ -403,6 +971,10 @@ fn banded_sw(
                 best_i = i;
                 best_j = j as usize;
             }
+            if i == q_len && h > best_qlen_score {
+                best_qlen_score = h;
+                best_qlen_j = j as usize;
+            }
         }
 
         trace_rows[i] = trace;
@@ -422,6 +994,14 @@ fn banded_sw(
                 break;
             }
         }
+    }
+
+    if best_qlen_score > 0
+        && best_qlen_score.saturating_add(cfg.clip_penalty) > best_score
+    {
+        best_score = best_qlen_score;
+        best_i = q_len;
+        best_j = best_qlen_j;
     }
 
     let mut cigar = Vec::new();
@@ -520,6 +1100,25 @@ fn clamp_window(ref_len: usize, ref_start: u32, ref_end: u32, bandwidth: i32) ->
     (start, end.max(start + 1))
 }
 
+/// Append decimal digits of `v` to a byte buffer without allocating.
+#[inline]
+pub(crate) fn push_u32_decimal(out: &mut Vec<u8>, mut v: u32) {
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0usize;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    for idx in (0..i).rev() {
+        out.push(tmp[idx]);
+    }
+}
+
 fn compute_nm_md(
     read: &[u8],
     reference: &[u8],
@@ -528,7 +1127,7 @@ fn compute_nm_md(
     cigar: &[CigarOp],
 ) -> (u32, String) {
     let mut nm = 0u32;
-    let mut md = String::new();
+    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
     let mut match_count = 0u32;
     let mut qpos = read_start;
     let mut rpos = ref_start;
@@ -543,8 +1142,8 @@ fn compute_nm_md(
                         match_count += 1;
                     } else {
                         nm += 1;
-                        md.push_str(&match_count.to_string());
-                        md.push(rb as char);
+                        push_u32_decimal(&mut md_bytes, match_count);
+                        md_bytes.push(rb);
                         match_count = 0;
                     }
                     qpos += 1;
@@ -557,11 +1156,11 @@ fn compute_nm_md(
             }
             CigarKind::Del => {
                 nm += op.len;
-                md.push_str(&match_count.to_string());
-                md.push('^');
+                push_u32_decimal(&mut md_bytes, match_count);
+                md_bytes.push(b'^');
                 for _ in 0..op.len {
                     let rb = reference.get(rpos).copied().unwrap_or(b'N');
-                    md.push(rb as char);
+                    md_bytes.push(rb);
                     rpos += 1;
                 }
                 match_count = 0;
@@ -569,129 +1168,265 @@ fn compute_nm_md(
             CigarKind::SoftClip => {
                 qpos += op.len as usize;
             }
+            CigarKind::Skipped => {
+                push_u32_decimal(&mut md_bytes, match_count);
+                match_count = 0;
+                rpos += op.len as usize;
+            }
         }
     }
-    md.push_str(&match_count.to_string());
+    push_u32_decimal(&mut md_bytes, match_count);
+    // SAFETY: only ASCII digits, ACGTN and '^' were pushed — all valid UTF-8.
+    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
     (nm, md)
 }
 
 #[cfg(target_arch = "x86_64")]
+struct SwAvx2Scratch {
+    prev_h: Vec<std::arch::x86_64::__m256i>,
+    prev_e: Vec<std::arch::x86_64::__m256i>,
+    cur_h: Vec<std::arch::x86_64::__m256i>,
+    cur_e: Vec<std::arch::x86_64::__m256i>,
+    // Cell-major trace, transposed read/ref byte gathers.
+    trace: Vec<u8>,
+    read_cols: Vec<u8>,
+    ref_cols: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SwAvx2Scratch {
+    const fn new() -> Self {
+        Self {
+            prev_h: Vec::new(),
+            prev_e: Vec::new(),
+            cur_h: Vec::new(),
+            cur_e: Vec::new(),
+            trace: Vec::new(),
+            read_cols: Vec::new(),
+            ref_cols: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static SW_SCRATCH: std::cell::RefCell<SwAvx2Scratch> =
+        const { std::cell::RefCell::new(SwAvx2Scratch::new()) };
+}
+
+/// 16-lane i16 SIMD Smith-Waterman.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<SwResult> {
-    use std::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_loadu_si256, _mm256_max_epi32, _mm256_set1_epi32,
-        _mm256_storeu_si256,
-    };
+    use std::arch::x86_64::{_mm256_set1_epi16, _mm256_setzero_si256};
 
-    let lanes = inputs.len();
+    const LANES: usize = 16;
+    let lanes = inputs.len().min(LANES);
     let q_len = inputs[0].read_seq.len();
     let r_len = inputs[0].ref_window.len();
 
-    let neg_inf = i32::MIN / 4;
-    let v_zero = _mm256_set1_epi32(0);
-    let v_go = _mm256_set1_epi32(-cfg.gap_open);
-    let v_ge = _mm256_set1_epi32(-cfg.gap_extend);
+    let v_zero = _mm256_setzero_si256();
+    let v_neg = _mm256_set1_epi16(-16384);
 
-    let mut prev_h: Vec<__m256i> = vec![v_zero; r_len + 1];
-    let mut prev_e: Vec<__m256i> = vec![_mm256_set1_epi32(neg_inf); r_len + 1];
-    let mut cur_h: Vec<__m256i> = vec![v_zero; r_len + 1];
-    let mut cur_e: Vec<__m256i> = vec![_mm256_set1_epi32(neg_inf); r_len + 1];
+    SW_SCRATCH.with(|scratch| {
+        let mut s = scratch.borrow_mut();
+        // Destructure to get independent &mut borrows of each buffer field.
+        let SwAvx2Scratch {
+            prev_h,
+            prev_e,
+            cur_h,
+            cur_e,
+            trace,
+            read_cols,
+            ref_cols,
+        } = &mut *s;
 
-    let mut trace: Vec<Vec<u8>> = vec![vec![0u8; (q_len + 1) * (r_len + 1)]; lanes];
-    let mut best_score = vec![0i32; lanes];
-    let mut best_i = vec![0usize; lanes];
-    let mut best_j = vec![0usize; lanes];
-    let abort_scores: Vec<i32> = inputs.iter().map(|i| i.abort_score).collect();
-    let mut lane_done = vec![false; lanes];
+        prev_h.clear();
+        prev_h.resize(r_len + 1, v_zero);
+        prev_e.clear();
+        prev_e.resize(r_len + 1, v_neg);
+        cur_h.clear();
+        cur_h.resize(r_len + 1, v_zero);
+        cur_e.clear();
+        cur_e.resize(r_len + 1, v_neg);
+        trace.clear();
+        trace.resize((q_len + 1) * (r_len + 1) * LANES, 0);
+        read_cols.clear();
+        read_cols.resize((q_len + 1) * LANES, 0);
+        ref_cols.clear();
+        ref_cols.resize((r_len + 1) * LANES, 0);
 
-    let mut h_buf = [0i32; 8];
-    let mut hm_buf = [0i32; 8];
-    let mut e_buf = [0i32; 8];
-    let mut f_buf = [0i32; 8];
+        // SAFETY: this caller already has AVX2 enabled via target_feature.
+        unsafe {
+            sw_batch_avx2_inner(
+                inputs, cfg, lanes, q_len, r_len, prev_h, prev_e, cur_h, cur_e, trace,
+                read_cols, ref_cols,
+            )
+        }
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sw_batch_avx2_inner(
+    inputs: &[BatchInput<'_>],
+    cfg: AlignmentConfig,
+    lanes: usize,
+    q_len: usize,
+    r_len: usize,
+    prev_h: &mut Vec<std::arch::x86_64::__m256i>,
+    prev_e: &mut Vec<std::arch::x86_64::__m256i>,
+    cur_h: &mut Vec<std::arch::x86_64::__m256i>,
+    cur_e: &mut Vec<std::arch::x86_64::__m256i>,
+    trace: &mut [u8],
+    read_cols: &mut [u8],
+    ref_cols: &mut [u8],
+) -> Vec<SwResult> {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_adds_epi16, _mm256_andnot_si256, _mm256_blendv_epi8,
+        _mm256_castsi256_si128, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_cvtepi8_epi16,
+        _mm256_max_epi16, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm256_storeu_si256, _mm_cmpeq_epi8, _mm_loadu_si128,
+        _mm_storeu_si128,
+    };
+
+    const LANES: usize = 16;
+
+    let v_zero = _mm256_setzero_si256();
+    let v_go = _mm256_set1_epi16(-cfg.gap_open as i16);
+    let v_ge = _mm256_set1_epi16(-cfg.gap_extend as i16);
+    let v_match = _mm256_set1_epi16(cfg.match_score as i16);
+    let v_mism = _mm256_set1_epi16(-cfg.mismatch as i16);
+    let v_one = _mm256_set1_epi16(1);
+    let v_two = _mm256_set1_epi16(2);
+    let v_three = _mm256_set1_epi16(3);
+    let v_neg = _mm256_set1_epi16(-16384);
+
+    let trace_w = r_len + 1;
+
+    // SIMD best-score / best-position tracking.
+    let mut best_v = v_zero;
+    let mut best_i_v = v_zero;
+    let mut best_j_v = v_zero;
+    let mut best_qlen_v = v_zero;
+    let mut best_qlen_j_v = v_zero;
+
+    let mut abort_scores = [0i32; LANES];
+    for k in 0..lanes {
+        abort_scores[k] = inputs[k].abort_score;
+    }
+    let mut lane_done = [false; LANES];
+
+    for i in 1..=q_len {
+        let base = i * LANES;
+        for k in 0..lanes {
+            read_cols[base + k] = inputs[k].read_seq[i - 1];
+        }
+    }
+    // Same idea for the reference window — gather once into a tightly packed buffer.
+    for j in 1..=r_len {
+        let base = j * LANES;
+        for k in 0..lanes {
+            ref_cols[base + k] = inputs[k].ref_window[j - 1];
+        }
+    }
+
+    let mut best_arr = [0i16; LANES];
 
     for i in 1..=q_len {
         cur_h[0] = v_zero;
-        cur_e[0] = _mm256_set1_epi32(neg_inf);
-        let mut cur_f = _mm256_set1_epi32(neg_inf);
+        cur_e[0] = v_neg;
+        let mut cur_f = v_neg;
 
-        let mut read_row = [0u8; 8];
-        for lane in 0..lanes {
-            read_row[lane] = inputs[lane].read_seq[i - 1];
-        }
+        // Load 16 read bytes (one per lane) into the low 128 bits of a vector.
+        let read_v = unsafe {
+            _mm_loadu_si128(read_cols.as_ptr().add(i * LANES) as *const __m128i)
+        };
 
         for j in 1..=r_len {
-            let mut ref_col = [0u8; 8];
-            for lane in 0..lanes {
-                ref_col[lane] = inputs[lane].ref_window[j - 1];
+            // Load 16 reference bytes (one per lane).
+            let ref_v = unsafe {
+                _mm_loadu_si128(ref_cols.as_ptr().add(j * LANES) as *const __m128i)
+            };
+
+            let eq8 = _mm_cmpeq_epi8(read_v, ref_v);
+            let eq16 = _mm256_cvtepi8_epi16(eq8);
+            let score_vec = _mm256_blendv_epi8(v_mism, v_match, eq16);
+
+            let h_diag = unsafe { *prev_h.get_unchecked(j - 1) };
+            let h_match = _mm256_adds_epi16(h_diag, score_vec);
+
+            let e_from_h = _mm256_adds_epi16(unsafe { *prev_h.get_unchecked(j) }, v_go);
+            let e_from_e = _mm256_adds_epi16(unsafe { *prev_e.get_unchecked(j) }, v_ge);
+            let e = _mm256_max_epi16(e_from_h, e_from_e);
+
+            let f_from_h = _mm256_adds_epi16(unsafe { *cur_h.get_unchecked(j - 1) }, v_go);
+            let f_from_f = _mm256_adds_epi16(cur_f, v_ge);
+            let f = _mm256_max_epi16(f_from_h, f_from_f);
+
+            let h_tmp = _mm256_max_epi16(h_match, e);
+            let h_tmp = _mm256_max_epi16(h_tmp, f);
+            let h = _mm256_max_epi16(h_tmp, v_zero);
+
+            unsafe {
+                *cur_h.get_unchecked_mut(j) = h;
+                *cur_e.get_unchecked_mut(j) = e;
             }
-            let mut score_arr = [0i32; 8];
-            for lane in 0..lanes {
-                score_arr[lane] = if read_row[lane] == ref_col[lane] {
-                    cfg.match_score
-                } else {
-                    -cfg.mismatch
-                };
-            }
-            let score_vec = unsafe { _mm256_loadu_si256(score_arr.as_ptr() as *const __m256i) };
-
-            let h_diag = prev_h[j - 1];
-            let h_match = _mm256_add_epi32(h_diag, score_vec);
-
-            let e_from_h = _mm256_add_epi32(prev_h[j], v_go);
-            let e_from_e = _mm256_add_epi32(prev_e[j], v_ge);
-            let e = _mm256_max_epi32(e_from_h, e_from_e);
-
-            let f_from_h = _mm256_add_epi32(cur_h[j - 1], v_go);
-            let f_from_f = _mm256_add_epi32(cur_f, v_ge);
-            let f = _mm256_max_epi32(f_from_h, f_from_f);
-
-            let mut h = _mm256_max_epi32(h_match, e);
-            h = _mm256_max_epi32(h, f);
-            h = _mm256_max_epi32(h, v_zero);
-
-            cur_h[j] = h;
-            cur_e[j] = e;
             cur_f = f;
 
-            unsafe { _mm256_storeu_si256(h_buf.as_mut_ptr() as *mut __m256i, h) };
-            unsafe { _mm256_storeu_si256(hm_buf.as_mut_ptr() as *mut __m256i, h_match) };
-            unsafe { _mm256_storeu_si256(e_buf.as_mut_ptr() as *mut __m256i, e) };
-            unsafe { _mm256_storeu_si256(f_buf.as_mut_ptr() as *mut __m256i, f) };
+            let is_zero = _mm256_cmpeq_epi16(h, v_zero);
+            let h_eq_match = _mm256_cmpeq_epi16(h, h_match);
+            let h_eq_e = _mm256_cmpeq_epi16(h, e);
+            let is_match = _mm256_andnot_si256(is_zero, h_eq_match);
+            let is_e = _mm256_andnot_si256(is_zero, _mm256_andnot_si256(h_eq_match, h_eq_e));
 
-            for lane in 0..lanes {
-                let idx = i * (r_len + 1) + j;
-                let hval = h_buf[lane];
-                if hval == 0 {
-                    trace[lane][idx] = 0;
-                } else if hval == hm_buf[lane] {
-                    trace[lane][idx] = 1;
-                } else if hval == e_buf[lane] {
-                    trace[lane][idx] = 2;
-                } else {
-                    trace[lane][idx] = 3;
-                }
-                if hval > best_score[lane] {
-                    best_score[lane] = hval;
-                    best_i[lane] = i;
-                    best_j[lane] = j;
-                }
+            let tr = _mm256_blendv_epi8(v_three, v_two, is_e);
+            let tr = _mm256_blendv_epi8(tr, v_one, is_match);
+            let tr = _mm256_blendv_epi8(tr, v_zero, is_zero);
+
+            // Pack 16 × i16 → 16 × u8 into the low 128 bits of one vector and store.
+            let packed = _mm256_packus_epi16(tr, tr);
+            let packed = _mm256_permute4x64_epi64::<0xD8>(packed);
+            let low = _mm256_castsi256_si128(packed);
+            unsafe {
+                let dst = trace.as_mut_ptr().add((i * trace_w + j) * LANES) as *mut __m128i;
+                _mm_storeu_si128(dst, low);
+            }
+
+            // SIMD best-score / best-position update.
+            let new_best = _mm256_cmpgt_epi16(h, best_v);
+            best_v = _mm256_max_epi16(best_v, h);
+            let i_vec = _mm256_set1_epi16(i as i16);
+            let j_vec = _mm256_set1_epi16(j as i16);
+            best_i_v = _mm256_blendv_epi8(best_i_v, i_vec, new_best);
+            best_j_v = _mm256_blendv_epi8(best_j_v, j_vec, new_best);
+
+            if i == q_len {
+                let new_qlen_best = _mm256_cmpgt_epi16(h, best_qlen_v);
+                best_qlen_v = _mm256_max_epi16(best_qlen_v, h);
+                best_qlen_j_v = _mm256_blendv_epi8(best_qlen_j_v, j_vec, new_qlen_best);
             }
         }
 
+        // Scalar abort check (once per row, not per cell).
         let remaining = (q_len - i) as i32;
+        unsafe {
+            _mm256_storeu_si256(best_arr.as_mut_ptr() as *mut __m256i, best_v);
+        }
         let mut all_done = true;
-        for lane in 0..lanes {
-            if lane_done[lane] {
+        for k in 0..lanes {
+            if lane_done[k] {
                 continue;
             }
-            let abort = abort_scores[lane];
+            let abort = abort_scores[k];
             if abort > i32::MIN / 8 {
-                let max_possible = best_score[lane] + remaining * cfg.match_score;
+                let max_possible = best_arr[k] as i32 + remaining * cfg.match_score;
                 if max_possible < abort {
-                    lane_done[lane] = true;
+                    lane_done[k] = true;
                 }
             }
-            if !lane_done[lane] {
+            if !lane_done[k] {
                 all_done = false;
             }
         }
@@ -699,21 +1434,47 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             break;
         }
 
-        std::mem::swap(&mut prev_h, &mut cur_h);
-        std::mem::swap(&mut prev_e, &mut cur_e);
+        std::mem::swap(prev_h, cur_h);
+        std::mem::swap(prev_e, cur_e);
     }
 
+    // Reduce SIMD best vectors to per-lane arrays for traceback.
+    let mut best_score_arr = [0i16; LANES];
+    let mut best_i_arr = [0i16; LANES];
+    let mut best_j_arr = [0i16; LANES];
+    let mut best_qlen_score_arr = [0i16; LANES];
+    let mut best_qlen_j_arr = [0i16; LANES];
+    unsafe {
+        _mm256_storeu_si256(best_score_arr.as_mut_ptr() as *mut __m256i, best_v);
+        _mm256_storeu_si256(best_i_arr.as_mut_ptr() as *mut __m256i, best_i_v);
+        _mm256_storeu_si256(best_j_arr.as_mut_ptr() as *mut __m256i, best_j_v);
+        _mm256_storeu_si256(best_qlen_score_arr.as_mut_ptr() as *mut __m256i, best_qlen_v);
+        _mm256_storeu_si256(best_qlen_j_arr.as_mut_ptr() as *mut __m256i, best_qlen_j_v);
+    }
+
+    let clip_pen_i16 = cfg.clip_penalty.clamp(0, i16::MAX as i32) as i16;
+
     let mut results = Vec::with_capacity(lanes);
-    for lane in 0..lanes {
+    for k in 0..lanes {
+        let local_score = best_score_arr[k];
+        let qlen_score = best_qlen_score_arr[k];
+        let (start_i, start_j, bs) = if qlen_score > 0
+            && qlen_score.saturating_add(clip_pen_i16) > local_score
+        {
+            (q_len as i32, best_qlen_j_arr[k] as i32, qlen_score as i32)
+        } else {
+            (best_i_arr[k] as i32, best_j_arr[k] as i32, local_score as i32)
+        };
+
         let mut cigar = Vec::new();
-        let mut i = best_i[lane] as i32;
-        let mut j = best_j[lane] as i32;
+        let mut i = start_i;
+        let mut j = start_j;
         let read_end = i;
         let ref_end = j as u32;
 
         while i > 0 && j > 0 {
-            let idx = i as usize * (r_len + 1) + j as usize;
-            let tr = trace[lane][idx];
+            let idx = (i as usize * trace_w + j as usize) * LANES + k;
+            let tr = unsafe { *trace.get_unchecked(idx) };
             if tr == 0 {
                 break;
             }
@@ -741,9 +1502,9 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             ref_end,
             read_start: i,
             read_end,
-            score: best_score[lane],
+            score: bs,
             cigar,
-            early_abort: lane_done[lane],
+            early_abort: lane_done[k],
         });
     }
 
@@ -779,6 +1540,8 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
     let mut best_score = vec![0i32; lanes];
     let mut best_i = vec![0usize; lanes];
     let mut best_j = vec![0usize; lanes];
+    let mut best_qlen_score = vec![0i32; lanes];
+    let mut best_qlen_j = vec![0usize; lanes];
     let abort_scores: Vec<i32> = inputs.iter().map(|i| i.abort_score).collect();
     let mut lane_done = vec![false; lanes];
 
@@ -853,6 +1616,10 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
                     best_i[lane] = i;
                     best_j[lane] = j;
                 }
+                if i == q_len && hval > best_qlen_score[lane] {
+                    best_qlen_score[lane] = hval;
+                    best_qlen_j[lane] = j;
+                }
             }
         }
 
@@ -883,9 +1650,17 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
 
     let mut results = Vec::with_capacity(lanes);
     for lane in 0..lanes {
+        let (start_i, start_j, bs) = if best_qlen_score[lane] > 0
+            && best_qlen_score[lane].saturating_add(cfg.clip_penalty) > best_score[lane]
+        {
+            (q_len as i32, best_qlen_j[lane] as i32, best_qlen_score[lane])
+        } else {
+            (best_i[lane] as i32, best_j[lane] as i32, best_score[lane])
+        };
+
         let mut cigar = Vec::new();
-        let mut i = best_i[lane] as i32;
-        let mut j = best_j[lane] as i32;
+        let mut i = start_i;
+        let mut j = start_j;
         let read_end = i;
         let ref_end = j as u32;
 
@@ -919,7 +1694,7 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             ref_end,
             read_start: i,
             read_end,
-            score: best_score[lane],
+            score: bs,
             cigar,
             early_abort: lane_done[lane],
         });
