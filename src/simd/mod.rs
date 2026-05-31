@@ -5,13 +5,22 @@ use std::sync::OnceLock;
 pub enum SimdMode {
     Scalar,
     Avx2,
+    /// AVX2 + AVX-VNNI (Alder Lake+ / Zen4+). Enables the 32-lane i8 SW kernel
+    /// on top of the i16 AVX2 path.
+    AvxVnni,
     Neon,
 }
 
 /// Detect the best available SIMD mode at runtime via kira-simd.
 pub fn detect() -> SimdMode {
     match kira_simd::backend::active_backend() {
-        kira_simd::backend::Backend::Avx2 => SimdMode::Avx2,
+        kira_simd::backend::Backend::Avx2 => {
+            if has_avx_vnni() {
+                SimdMode::AvxVnni
+            } else {
+                SimdMode::Avx2
+            }
+        }
         kira_simd::backend::Backend::Neon => SimdMode::Neon,
         _ => SimdMode::Scalar,
     }
@@ -21,6 +30,25 @@ pub fn detect() -> SimdMode {
 pub fn detect_cached() -> SimdMode {
     static MODE: OnceLock<SimdMode> = OnceLock::new();
     *MODE.get_or_init(detect)
+}
+
+/// Runtime detection for AVX-VNNI (Intel Alder Lake / Sapphire Rapids, AMD Zen 4+).
+///
+/// `KIRA_VNNI_DISABLE=1` forces this to report `false` — useful for benchmarking
+/// the i16 path vs the i8 path on the same CPU, and as an emergency kill-switch.
+#[inline]
+pub fn has_avx_vnni() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::env::var_os("KIRA_VNNI_DISABLE").is_some() {
+            return false;
+        }
+        is_x86_feature_detected!("avxvnni")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Count mismatches between two equal-length slices.

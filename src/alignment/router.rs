@@ -49,11 +49,29 @@ pub fn algo_preference() -> AlgoPreference {
 pub const DEFAULT_WFA_MAX_READ_LEN: usize = 300;
 
 /// Default error-rate budget for WFA.
-pub const DEFAULT_WFA_BUDGET_PCT: u32 = 15;
+///
+/// Raised 15 → 25 to widen the WFA window on HG002/HG38: at 150 bp the
+/// budget is `150 * 25/100 * mismatch ≈ 37 * mismatch` score units, which
+/// covers the typical real-read indel + 1–2 SNP case that the previous
+/// 15% budget was cascading to banded SW. Override with `KIRA_WFA_BUDGET_PCT`.
+pub const DEFAULT_WFA_BUDGET_PCT: u32 = 25;
 
 /// Default Myers reject bound: `read_len * pct / 100 + floor`.
-pub const DEFAULT_MYERS_BOUND_PCT: u32 = 10;
+///
+/// Raised 10 → 15 so the cheap edit-distance pre-screen ahead of WFA stops
+/// dropping reads with 1 het SNP + a small indel (≈3–4 edits in 150 bp,
+/// hits the prior bound 19; new bound 26). Override with `KIRA_MYERS_BOUND_PCT`.
+pub const DEFAULT_MYERS_BOUND_PCT: u32 = 15;
 pub const DEFAULT_MYERS_BOUND_FLOOR: u32 = 4;
+
+/// Default Spectral Sieve mismatch budget defaults.
+///
+/// Floor raised 5 → 8 so very short reads (<100 bp where the percent rounds
+/// below floor) still accept reads sitting on a het site plus 1–2 sequencing
+/// errors. Percent unchanged (8 % of read_len). Override with
+/// `KIRA_SPECTRAL_MISM_PCT` / `KIRA_SPECTRAL_MISM_FLOOR`.
+pub const DEFAULT_SPECTRAL_MISM_PCT: u32 = 8;
+pub const DEFAULT_SPECTRAL_MISM_FLOOR: u32 = 8;
 
 fn env_u32(name: &'static str, default: u32) -> u32 {
     static CELLS: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, u32>>> =
@@ -143,8 +161,8 @@ pub fn fast_path_worth_attempting(chain_score: i32, read_len: usize) -> bool {
 /// Maximum mismatches Spectral Sieve will accept for an ungapped alignment.
 #[inline]
 pub fn spectral_max_mismatches(read_len: usize) -> usize {
-    let pct = env_u32("KIRA_SPECTRAL_MISM_PCT", 8) as usize;
-    let floor = env_u32("KIRA_SPECTRAL_MISM_FLOOR", 5) as usize;
+    let pct = env_u32("KIRA_SPECTRAL_MISM_PCT", DEFAULT_SPECTRAL_MISM_PCT) as usize;
+    let floor = env_u32("KIRA_SPECTRAL_MISM_FLOOR", DEFAULT_SPECTRAL_MISM_FLOOR) as usize;
     ((read_len * pct) / 100).max(floor)
 }
 

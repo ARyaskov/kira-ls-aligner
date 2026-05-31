@@ -16,7 +16,7 @@
 
 ## Installation
 
-Install from crates.io (Rust 1.91+ / Windows / Linux / MacOS):
+Install from crates.io (Rust 1.95+ / Windows / Linux / MacOS):
 
 ```bash
 cargo install kira-ls-aligner
@@ -24,7 +24,7 @@ cargo install kira-ls-aligner
 
 Or
 
-Build from source (Rust 1.91+):
+Build from source (Rust 1.95+):
 
 ```bash
 cargo build --release

@@ -41,16 +41,29 @@ pub struct SketchBatchStats {
 }
 
 pub fn run(input: InputBatch, cfg: SketchConfig) -> SketchBatch {
+    run_with_mask(input, cfg, &[])
+}
+
+/// Sketch the batch with a per-read skip mask. When `skip_mask[i]` is true,
+/// read `i` gets an empty `ReadSketch` (no minimizers) — used by the
+/// Aho-Corasick fast path to short-circuit the cascade for exact-match reads.
+pub fn run_with_mask(input: InputBatch, cfg: SketchConfig, skip_mask: &[bool]) -> SketchBatch {
     let reads = input.reads;
     let sketches: Vec<ReadSketch> = reads
         .par_iter()
-        .map(|read| {
+        .enumerate()
+        .map(|(idx, read)| {
             let (k, w) = if read.seq.len() >= cfg.long_read_threshold {
                 (cfg.long_k, cfg.long_w)
             } else {
                 (cfg.short_k, cfg.short_w)
             };
-            let mins = minimizers(&read.seq, &MinimizerConfig { k, w });
+            let skip = skip_mask.get(idx).copied().unwrap_or(false);
+            let mins = if skip {
+                Vec::new()
+            } else {
+                minimizers(&read.seq, &MinimizerConfig { k, w })
+            };
             ReadSketch {
                 minimizers: mins,
                 k,

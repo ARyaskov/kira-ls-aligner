@@ -153,6 +153,7 @@ fn chimeric_read_emits_supplementary() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
 
     // Hand-built chain list: stage 4's primary (chrA) at slot 0,
@@ -206,6 +207,7 @@ fn no_supplementary_when_only_one_chain() {
         seq: ref_bytes(&reference, 0)[300..400].to_vec(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let chains = vec![vec![chain(0, 100, 0, 300, 100)]];
     let mut alignments: Vec<Vec<Alignment>> = vec![vec![primary_aln(0, 100, 0, 300)]];
@@ -238,6 +240,7 @@ fn no_supplementary_for_overlapping_chains() {
         seq: a[300..400].to_vec(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     // Both chains cover read[0..100] — 100% overlap.
     let chains = vec![vec![

@@ -81,9 +81,22 @@ pub struct MemArgs {
     #[arg(long = "debug-force-accept-n", default_value_t = 100, hide = true)]
     pub debug_force_accept_n: usize,
 
-    /// Number of threads.
+    /// Number of threads. On hybrid CPUs (Alder Lake+) this acts as an
+    /// upper bound when `--num-p-threads` / `--num-e-threads` are not set
+    /// explicitly; the auto-detected P/E split decides how it's spent.
     #[arg(short = 't', long = "threads", default_value_t = 8)]
     pub threads: usize,
+
+    /// Override the number of workers pinned to Performance cores
+    /// (SIMD-heavy stages). On homogeneous hosts this is ignored.
+    #[arg(long = "num-p-threads", value_name = "N")]
+    pub num_p_threads: Option<usize>,
+
+    /// Override the number of workers pinned to Efficient cores
+    /// (light bookkeeping + SAM emit). On homogeneous hosts this is
+    /// ignored.
+    #[arg(long = "num-e-threads", value_name = "N")]
+    pub num_e_threads: Option<usize>,
 
     /// Batch size in bases.
     #[arg(short = 'K', long = "batch", default_value_t = 1_000_000)]
@@ -244,6 +257,8 @@ impl MemArgs {
             debug_force_accept: false,
             debug_force_accept_n: 100,
             threads,
+            num_p_threads: None,
+            num_e_threads: None,
             batch_bases,
             preset: "auto".to_string(),
             seed_len: None,

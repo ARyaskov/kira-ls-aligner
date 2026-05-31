@@ -80,6 +80,7 @@ fn refinement_slides_boundary_to_canonical_signal() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let chain = Chain {
         ref_id: 0,
@@ -160,6 +161,7 @@ fn canonical_signal_boosts_score_over_non_canonical() {
         seq: read_seq.clone(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let chain = Chain {
         ref_id: 0,
@@ -204,6 +206,7 @@ fn canonical_signal_boosts_score_over_non_canonical() {
         seq: read_nc,
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let aln_nc = align_spliced_chain(
         &chain,
@@ -248,6 +251,7 @@ fn polya_tail_is_soft_clipped() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let chain = Chain {
         ref_id: 0,
@@ -321,6 +325,7 @@ fn polya_disabled_when_min_len_zero() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     };
     let chain = Chain {
         ref_id: 0,

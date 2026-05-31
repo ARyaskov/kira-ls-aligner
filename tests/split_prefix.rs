@@ -195,6 +195,8 @@ fn tiled_alignment_recovers_reads_across_tiles() {
 
     let cfg = TiledRunConfig {
         threads: 2,
+        num_p_threads: None,
+        num_e_threads: None,
         batch_bases: 1_000_000,
         index_cfg: IndexConfig {
             short_k: 19,
@@ -289,6 +291,8 @@ fn tiled_single_tile_is_trivial_and_still_works() {
     pipe.paired.mode = IngestMode::Unpaired;
     let cfg = TiledRunConfig {
         threads: 1,
+        num_p_threads: None,
+        num_e_threads: None,
         batch_bases: 1_000_000,
         index_cfg: IndexConfig {
             short_k: 19,

@@ -19,9 +19,11 @@ use anyhow::Result;
 use std::sync::{Arc, RwLock};
 
 use crate::alignment::AlignmentConfig;
+use crate::alignment::ac_batch::{self, AcBatchOutput};
 use crate::alignment::junc_bed::JunctionIndex;
 use crate::alignment::splice::SpliceConfig;
 use crate::chaining::ChainingConfig;
+use crate::exec::DualPool;
 use crate::index::Index;
 use crate::io::{OutputConfig, SamFormatter};
 use crate::mapq::MapqConfig;
@@ -30,7 +32,9 @@ use crate::pipeline::pairing::{
     PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs,
     rescue_unmapped_mates,
 };
-use crate::pipeline::stage1_sketch::{SketchBatchStats, SketchConfig, run as sketch_run};
+use crate::pipeline::stage1_sketch::{
+    SketchBatchStats, SketchConfig, run_with_mask as sketch_run_with_mask,
+};
 use crate::pipeline::stage2_seeding::{SeedBatchStats, run as seed_run};
 use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
@@ -107,16 +111,40 @@ pub struct Pipeline {
     pub junc_bed_tolerance: u32,
     /// Insert-size estimator.
     pub insert_estimator: Arc<RwLock<InsertEstimator>>,
+    /// Hybrid-aware executor. SIMD-heavy stages run on the P-pool;
+    /// light bookkeeping stages run on the E-pool. On homogeneous hosts
+    /// both lanes resolve to the same pool, so non-hybrid runs incur no
+    /// extra cost.
+    pub pool: Arc<DualPool>,
 }
 
 impl Pipeline {
     pub fn new(config: PipelineConfig) -> Self {
+        Self::with_pool(
+            config,
+            Arc::new(
+                DualPool::homogeneous(
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1),
+                )
+                .expect("homogeneous fallback pool always builds"),
+            ),
+        )
+    }
+
+    /// Build a pipeline that routes stages through a caller-supplied
+    /// hybrid-aware executor. The standalone callers (`Aligner`,
+    /// `run_tiled`) build a single `DualPool` once at startup and share
+    /// it across every batch.
+    pub fn with_pool(config: PipelineConfig, pool: Arc<DualPool>) -> Self {
         let estimator = Arc::new(RwLock::new(InsertEstimator::new(config.paired)));
         Self {
             config,
             junctions: None,
             junc_bed_tolerance: 2,
             insert_estimator: estimator,
+            pool,
         }
     }
 
@@ -132,47 +160,71 @@ impl Pipeline {
     }
 
     /// Run only stages 1-4 (sketch → seed → chain → align).
+    ///
+    /// Stage routing:
+    /// * AC batch, sketch, alignment → P-pool (SIMD-heavy hot paths).
+    /// * Seeding, chaining → E-pool (memory + scalar bookkeeping).
     pub fn process_to_align_batch(
         &self,
         input: stage0_input::InputBatch,
         index: &Index,
     ) -> crate::pipeline::stage4_alignment::AlignBatch {
-        let sketch = sketch_run(input, self.config.sketch);
-        let seeds = seed_run(sketch, index, self.config.seeding);
-        let chains = chain_run(seeds, self.config.chaining);
-        if self.config.splice.enabled {
-            return crate::alignment::splice::splice_align_batch(
-                chains,
+        let ac = self.pool.install_compute(|| {
+            ac_batch::run(
+                &input.reads,
                 index,
                 self.config.alignment,
-                self.config.splice,
-                self.junctions.as_deref(),
-                self.junc_bed_tolerance,
-            );
-        }
-        align_run(
-            chains,
-            index,
-            AlignmentStageConfig {
-                cfg: self.config.alignment,
-                min_chain_ratio: self.config.min_chain_ratio,
-                accept_enable: self.config.accept_enable,
-                accept_only_top1: self.config.accept_only_top1,
-                accept_span_slack: self.config.accept_span_slack,
-                accept_min_identity: self.config.accept_min_identity,
-                accept_max_mismatches: self.config.accept_max_mismatches,
-                accept_require_score_margin: self.config.accept_require_score_margin,
-                dp_topk: self.config.dp_topk,
-                dp_abort_margin: self.config.dp_abort_margin,
-                debug_prefilter: self.config.debug_prefilter,
-                debug_prefilter_n: self.config.debug_prefilter_n,
-                debug_force_accept: self.config.debug_force_accept,
-                debug_force_accept_n: self.config.debug_force_accept_n,
-                long_read_threshold: self.config.long_read_threshold,
-                max_alignments: self.config.max_alignments,
-                short_preset: self.config.short_preset,
-            },
-        )
+                self.config.max_alignments,
+            )
+        });
+        let skip_mask = ac.resolved_mask();
+        let sketch = self
+            .pool
+            .install_compute(|| sketch_run_with_mask(input, self.config.sketch, &skip_mask));
+        let seeds = self
+            .pool
+            .install_light(|| seed_run(sketch, index, self.config.seeding));
+        let chains = self
+            .pool
+            .install_light(|| chain_run(seeds, self.config.chaining));
+        let mut align = self.pool.install_compute(|| {
+            if self.config.splice.enabled {
+                crate::alignment::splice::splice_align_batch(
+                    chains,
+                    index,
+                    self.config.alignment,
+                    self.config.splice,
+                    self.junctions.as_deref(),
+                    self.junc_bed_tolerance,
+                )
+            } else {
+                align_run(
+                    chains,
+                    index,
+                    AlignmentStageConfig {
+                        cfg: self.config.alignment,
+                        min_chain_ratio: self.config.min_chain_ratio,
+                        accept_enable: self.config.accept_enable,
+                        accept_only_top1: self.config.accept_only_top1,
+                        accept_span_slack: self.config.accept_span_slack,
+                        accept_min_identity: self.config.accept_min_identity,
+                        accept_max_mismatches: self.config.accept_max_mismatches,
+                        accept_require_score_margin: self.config.accept_require_score_margin,
+                        dp_topk: self.config.dp_topk,
+                        dp_abort_margin: self.config.dp_abort_margin,
+                        debug_prefilter: self.config.debug_prefilter,
+                        debug_prefilter_n: self.config.debug_prefilter_n,
+                        debug_force_accept: self.config.debug_force_accept,
+                        debug_force_accept_n: self.config.debug_force_accept_n,
+                        long_read_threshold: self.config.long_read_threshold,
+                        max_alignments: self.config.max_alignments,
+                        short_preset: self.config.short_preset,
+                    },
+                )
+            }
+        });
+        merge_ac_alignments(&mut align.alignments, ac);
+        align
     }
 
     /// Run stages 1-6 producing a ready-to-write SAM byte buffer.
@@ -186,62 +238,100 @@ impl Pipeline {
         let mut stages = [Duration::ZERO; 6];
 
         let t0 = Instant::now();
-        let sketch = sketch_run(input, self.config.sketch);
+        // Stage 1 (AC + sketch) is SIMD-heavy → P-pool. Capture stats
+        // before crossing the pool boundary so the install closure only
+        // returns owned data.
+        let (ac, sketch) = self.pool.install_compute(|| {
+            let ac = ac_batch::run(
+                &input.reads,
+                index,
+                self.config.alignment,
+                self.config.max_alignments,
+            );
+            let skip_mask = ac.resolved_mask();
+            let sketch = sketch_run_with_mask(input, self.config.sketch, &skip_mask);
+            (ac, sketch)
+        });
+        let ac_stats = ac.stats;
         let sketch_stats = sketch.stats;
         stages[0] = t0.elapsed();
 
+        // Stage 2 seeding — memory-bound hash lookups → E-pool.
         let t1 = Instant::now();
-        let seeds = seed_run(sketch, index, self.config.seeding);
+        let seeds = self
+            .pool
+            .install_light(|| seed_run(sketch, index, self.config.seeding));
         let seed_stats = seeds.stats.clone();
         stages[1] = t1.elapsed();
 
+        // Stage 3 chaining — scalar RMQ → E-pool.
         let t2 = Instant::now();
-        let chains = chain_run(seeds, self.config.chaining);
+        let chains = self
+            .pool
+            .install_light(|| chain_run(seeds, self.config.chaining));
         let chaining_stats = chains.stats.clone();
         stages[2] = t2.elapsed();
 
         let t3 = Instant::now();
-        let mut t_stage4 = Duration::ZERO;
-        let mut t_rescue_unmapped = Duration::ZERO;
-        let mut t_pair_rerank = Duration::ZERO;
-        let mut t_rescue_discordant = Duration::ZERO;
-        let mut t_apply_pairing = Duration::ZERO;
+        let t_stage4;
+        let t_rescue_unmapped;
+        let t_pair_rerank;
+        let t_rescue_discordant;
+        let t_apply_pairing;
         let ts4 = Instant::now();
-        let mut align = if self.config.splice.enabled {
-            crate::alignment::splice::splice_align_batch(
-                chains,
-                index,
-                self.config.alignment,
-                self.config.splice,
-                self.junctions.as_deref(),
-                self.junc_bed_tolerance,
-            )
-        } else {
-            align_run(
-                chains,
-                index,
-                AlignmentStageConfig {
-                    cfg: self.config.alignment,
-                    min_chain_ratio: self.config.min_chain_ratio,
-                    accept_enable: self.config.accept_enable,
-                    accept_only_top1: self.config.accept_only_top1,
-                    accept_span_slack: self.config.accept_span_slack,
-                    accept_min_identity: self.config.accept_min_identity,
-                    accept_max_mismatches: self.config.accept_max_mismatches,
-                    accept_require_score_margin: self.config.accept_require_score_margin,
-                    dp_topk: self.config.dp_topk,
-                    dp_abort_margin: self.config.dp_abort_margin,
-                    debug_prefilter: self.config.debug_prefilter,
-                    debug_prefilter_n: self.config.debug_prefilter_n,
-                    debug_force_accept: self.config.debug_force_accept,
-                    debug_force_accept_n: self.config.debug_force_accept_n,
-                    long_read_threshold: self.config.long_read_threshold,
-                    max_alignments: self.config.max_alignments,
-                    short_preset: self.config.short_preset,
-                },
-            )
-        };
+        // Stage 4 alignment — banded SW / spectral / WFA, the hottest
+        // SIMD path in the whole pipeline → P-pool.
+        let mut align = self.pool.install_compute(|| {
+            if self.config.splice.enabled {
+                crate::alignment::splice::splice_align_batch(
+                    chains,
+                    index,
+                    self.config.alignment,
+                    self.config.splice,
+                    self.junctions.as_deref(),
+                    self.junc_bed_tolerance,
+                )
+            } else {
+                align_run(
+                    chains,
+                    index,
+                    AlignmentStageConfig {
+                        cfg: self.config.alignment,
+                        min_chain_ratio: self.config.min_chain_ratio,
+                        accept_enable: self.config.accept_enable,
+                        accept_only_top1: self.config.accept_only_top1,
+                        accept_span_slack: self.config.accept_span_slack,
+                        accept_min_identity: self.config.accept_min_identity,
+                        accept_max_mismatches: self.config.accept_max_mismatches,
+                        accept_require_score_margin: self.config.accept_require_score_margin,
+                        dp_topk: self.config.dp_topk,
+                        dp_abort_margin: self.config.dp_abort_margin,
+                        debug_prefilter: self.config.debug_prefilter,
+                        debug_prefilter_n: self.config.debug_prefilter_n,
+                        debug_force_accept: self.config.debug_force_accept,
+                        debug_force_accept_n: self.config.debug_force_accept_n,
+                        long_read_threshold: self.config.long_read_threshold,
+                        max_alignments: self.config.max_alignments,
+                        short_preset: self.config.short_preset,
+                    },
+                )
+            }
+        });
+        merge_ac_alignments(&mut align.alignments, ac);
         t_stage4 = ts4.elapsed();
+
+        if std::env::var_os("KIRA_STATS").is_some() {
+            eprintln!(
+                "[KIRA_AC] reads={} eligible={} resolved={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
+                ac_stats.n_reads,
+                ac_stats.reads_eligible,
+                ac_stats.reads_resolved,
+                ac_stats.fwd_hits,
+                ac_stats.rev_hits,
+                ac_stats.build_ms,
+                ac_stats.scan_ms,
+            );
+        }
 
         let paired_cfg = self
             .insert_estimator
@@ -250,14 +340,15 @@ impl Pipeline {
             .unwrap_or(self.config.paired);
 
         let tru = Instant::now();
-        rescue_unmapped_mates(
-            &align.reads,
-            &mut align.alignments,
-            index,
-            &paired_cfg,
-            self.config.alignment,
-            RescueConfig::default(),
-        );
+        {
+            let reads = &align.reads;
+            let alns = &mut align.alignments;
+            let pcfg = paired_cfg;
+            let acfg = self.config.alignment;
+            self.pool.install_compute(move || {
+                rescue_unmapped_mates(reads, alns, index, &pcfg, acfg, RescueConfig::default())
+            });
+        }
         t_rescue_unmapped = tru.elapsed();
 
         let tpr = Instant::now();
@@ -270,14 +361,15 @@ impl Pipeline {
         t_pair_rerank = tpr.elapsed();
 
         let trd = Instant::now();
-        rescue_discordant_pairs(
-            &align.reads,
-            &mut align.alignments,
-            index,
-            &paired_cfg,
-            self.config.alignment,
-            RescueConfig::default(),
-        );
+        {
+            let reads = &align.reads;
+            let alns = &mut align.alignments;
+            let pcfg = paired_cfg;
+            let acfg = self.config.alignment;
+            self.pool.install_compute(move || {
+                rescue_discordant_pairs(reads, alns, index, &pcfg, acfg, RescueConfig::default())
+            });
+        }
         t_rescue_discordant = trd.elapsed();
 
         let tap = Instant::now();
@@ -322,18 +414,24 @@ impl Pipeline {
         } else {
             None
         };
-        let scored = score_run(align, self.config.mapq, pair_ctx);
+        // Stage 5 MAPQ — light scalar math → E-pool.
+        let scored = self
+            .pool
+            .install_light(|| score_run(align, self.config.mapq, pair_ctx));
         let align_stats = scored.stats.clone();
         stages[4] = t4.elapsed();
 
+        // Stage 6 SAM emit — pure string formatting, fits the E-pool.
         let t5 = Instant::now();
-        let sam_buf = output_serialize(
-            scored,
-            formatter,
-            read_group,
-            self.config.output,
-            self.config.max_alignments,
-        );
+        let sam_buf = self.pool.install_light(|| {
+            output_serialize(
+                scored,
+                formatter,
+                read_group,
+                self.config.output,
+                self.config.max_alignments,
+            )
+        });
         stages[5] = t5.elapsed();
 
         Ok(PipelineBatchOutput {
@@ -346,5 +444,20 @@ impl Pipeline {
             },
             sam_buf,
         })
+    }
+}
+
+/// Move AC-stage alignments into the cascade output. Reads resolved by AC had
+/// their minimizers suppressed in stage 1, so their cascade slot is empty —
+/// we overwrite it with the perfect-match alignment(s) produced by AC.
+fn merge_ac_alignments(
+    cascade: &mut [Vec<crate::types::Alignment>],
+    mut ac: AcBatchOutput,
+) {
+    debug_assert_eq!(cascade.len(), ac.alignments.len());
+    for (dst, src) in cascade.iter_mut().zip(ac.alignments.iter_mut()) {
+        if !src.is_empty() {
+            *dst = std::mem::take(src);
+        }
     }
 }

@@ -63,6 +63,11 @@ pub struct ReadRecord {
     pub qual: Option<Vec<u8>>,
     /// Pair role (`Unpaired` for single-end).
     pub pair_role: PairRole,
+    /// Minimum reference occurrence among this read's seeds — a copy-number
+    /// estimate for the source locus. 1 = uniquely placeable; >=2 means every
+    /// seed also occurs elsewhere, so the placement is ambiguous (repeat/paralog).
+    /// Set in seeding (stage 2); used to cap MAPQ in stage 5.
+    pub repeat_min_occ: u32,
 }
 
 impl ReadRecord {
@@ -73,6 +78,7 @@ impl ReadRecord {
             seq,
             qual,
             pair_role: PairRole::Unpaired,
+            repeat_min_occ: 1,
         }
     }
 }

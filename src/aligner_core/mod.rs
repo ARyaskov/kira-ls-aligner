@@ -3,12 +3,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::ThreadPoolBuilder;
 use sysinfo::System;
 
 use std::sync::Arc;
 
 use crate::alignment::junc_bed::JunctionIndex;
+use crate::exec::DualPool;
+use crate::exec::pool::DualPoolConfig;
 use crate::index::{Index, IndexConfig};
 use crate::io::{HeaderConfig, ReadStream, SamWriter, read_reference};
 use crate::pipeline::mode::{ModeFeatures, classify};
@@ -21,6 +22,10 @@ use crate::simd::{SimdMode, detect_cached};
 #[derive(Clone, Debug)]
 pub struct AlignerConfig {
     pub threads: usize,
+    /// Optional override: number of workers pinned to Performance cores.
+    pub num_p_threads: Option<usize>,
+    /// Optional override: number of workers pinned to Efficient cores.
+    pub num_e_threads: Option<usize>,
     pub batch_bases: usize,
     pub index: IndexConfig,
     pub pipeline: PipelineConfig,
@@ -206,15 +211,33 @@ impl Aligner {
             })
             .context("spawn writer thread")?;
 
+        let pool = Arc::new(
+            DualPool::new(DualPoolConfig {
+                p_threads: self.cfg.num_p_threads,
+                e_threads: self.cfg.num_e_threads,
+                total_threads: Some(self.cfg.threads),
+            })
+            .context("build hybrid-aware thread pools")?,
+        );
+        // Always surface the pool layout — even outside KIRA_STATS — so
+        // users notice when the auto-detected split disagrees with what
+        // they expected (e.g. a misreported hybrid CPU falling back to a
+        // single pool).
+        eprintln!(
+            "[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={}",
+            pool.is_hybrid(),
+            pool.p_threads(),
+            pool.e_threads(),
+            pool.total_threads(),
+        );
+
         let mut stream = ReadStream::new_multi_with_mode(
             reads_paths,
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
         )?;
-        let mut pipeline = Pipeline::new(self.cfg.pipeline).with_junctions(
-            self.cfg.junctions.clone(),
-            self.cfg.junc_bed_tolerance,
-        );
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+            .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
         if stats_enabled {
             eprintln!(
                 "[KIRA_CONFIG] {}",
@@ -235,12 +258,12 @@ impl Aligner {
             None
         };
 
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(self.cfg.threads)
-            .build()
-            .context("build thread pool")?;
-
-        pool.install(|| -> Result<()> {
+        // Run the batch loop on the caller's own thread. Each stage
+        // installs into the appropriate pool itself, so wrapping the
+        // loop in install_driver would only burn a P-pool worker as a
+        // permanent driver (it would have to block on every E-pool
+        // install) for no parallelism benefit.
+        let drive_result: Result<()> = (|| -> Result<()> {
             let mut batch_idx: u64 = 0;
             loop {
                 let fetch_start = Instant::now();
@@ -335,7 +358,8 @@ impl Aligner {
                 batch_idx += 1;
             }
             Ok(())
-        })?;
+        })();
+        drive_result?;
 
         drop(write_tx);
         match writer_thread.join() {
@@ -364,6 +388,7 @@ impl Aligner {
                 mode_selected,
             );
             print_algo_counters("summary", &align_total);
+            print_cascade_summary(&align_total);
             eprintln!(
                 "[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                 seed_total_before, seed_total_after, chain_total_used, chain_total_pruned,
@@ -382,6 +407,77 @@ impl Aligner {
         }
 
         Ok(())
+    }
+
+    /// Run the full alignment pipeline in-process and return the complete SAM
+    /// (header + records) as a byte buffer — nothing is written to disk. For
+    /// fused in-memory pipelines (e.g. `kira-bt solid`) that hand the SAM
+    /// straight to sort/markdup/pileup. Reuses the same per-batch path as the
+    /// file writer (`process_batch_serialized`); skips progress/stats and the
+    /// adaptive per-batch mode re-selection of `run_with_index`.
+    pub fn align_to_sam_bytes(
+        &self,
+        mut index: Index,
+        reads_paths: &[std::path::PathBuf],
+    ) -> Result<Vec<u8>> {
+        let hot_n: usize = std::env::var("KIRA_HOT_CACHE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000);
+        if hot_n > 0 {
+            let max_occs: usize = std::env::var("KIRA_HOT_CACHE_MAX_OCCS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8_000_000);
+            let mmap_bytes = index.mmap.as_deref().map(|m| &m[..]);
+            index.short.build_hot_cache(mmap_bytes, hot_n, max_occs);
+            index.long.build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
+        }
+
+        let pool = Arc::new(
+            DualPool::new(DualPoolConfig {
+                p_threads: self.cfg.num_p_threads,
+                e_threads: self.cfg.num_e_threads,
+                total_threads: Some(self.cfg.threads),
+            })
+            .context("build hybrid-aware thread pools")?,
+        );
+
+        let out = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut writer =
+            SamWriter::from_writer(Box::new(crate::io::VecSink(out.clone())), index.reference.clone());
+        match &self.cfg.header {
+            Some(hdr) => writer.write_header_with_ctx(hdr)?,
+            None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
+        }
+        let formatter = writer.formatter_handle();
+
+        let mut stream = ReadStream::new_multi_with_mode(
+            reads_paths,
+            self.cfg.batch_bases,
+            self.cfg.pipeline.paired.mode,
+        )?;
+        let pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+            .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+
+        while let Some(reads) = stream.next_batch()? {
+            let input = stage0_input::run(reads);
+            let bo = pipeline.process_batch_serialized(
+                input,
+                &index,
+                &formatter,
+                self.cfg.read_group.as_deref(),
+            )?;
+            writer.write_batch(&bo.sam_buf)?;
+        }
+        writer.flush()?;
+        drop(writer);
+
+        let bytes = Arc::try_unwrap(out)
+            .map_err(|_| anyhow::anyhow!("SAM buffer still shared"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("SAM buffer mutex poisoned"))?;
+        Ok(bytes)
     }
 }
 
@@ -434,6 +530,7 @@ fn update_progress(
     if let Some(mode) = simd_mode {
         let simd = match mode {
             SimdMode::Avx2 => "simd=avx2",
+            SimdMode::AvxVnni => "simd=avx-vnni",
             SimdMode::Neon => "simd=neon",
             SimdMode::Scalar => "simd=scalar",
         };
@@ -474,6 +571,35 @@ fn fmt_ms(d: Duration) -> String {
     format!("{:.3} ms", d.as_secs_f64() * 1000.0)
 }
 
+/// Emit the compact cascade-bucket summary used to track fast-path coverage.
+///
+/// Four buckets only — `spectral` (every non-DP fast path: exact, prefilter,
+/// packed/byte spectral, GPU spectral, LSH and CGK rescue), `wfa`, `sw`
+/// (banded SIMD + scalar) and `unmapped`. The line is machine-parseable so
+/// HG002/HG38 tuning scripts can grep for it.
+fn print_cascade_summary(stats: &AlignmentBatchStats) {
+    let spectral = stats.exact_matches
+        + stats.prefilter_accept
+        + stats.packed_spectral_resolved
+        + stats.spectral_sieve_resolved
+        + stats.gpu_spectral_resolved
+        + stats.lsh_rescue_resolved
+        + stats.cgk_rescue_resolved;
+    let wfa = stats.wfa_resolved;
+    let sw = stats.dp_simd + stats.dp_scalar;
+    let unmapped = stats.unmapped;
+    let total = spectral + wfa + sw + unmapped;
+    let denom = total.max(1) as f64;
+    eprintln!(
+        "[CASCADE] spectral={} ({:.2}%) wfa={} ({:.2}%) sw={} ({:.2}%) unmapped={} ({:.2}%) (total={})",
+        spectral, spectral as f64 * 100.0 / denom,
+        wfa,      wfa      as f64 * 100.0 / denom,
+        sw,       sw       as f64 * 100.0 / denom,
+        unmapped, unmapped as f64 * 100.0 / denom,
+        total,
+    );
+}
+
 /// Emit a one-line per-algorithm cascade-attribution summary.
 fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
     let total = stats.reads.max(1) as f32;
@@ -484,7 +610,7 @@ fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
         + stats.prefilter_accept;
     let sw_total = stats.dp_simd + stats.dp_scalar;
     eprintln!(
-        "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
+        "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
         label,
         stats.reads,
         stats.exact_matches, pct(stats.exact_matches),
@@ -493,6 +619,8 @@ fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
         stats.spectral_sieve_resolved, pct(stats.spectral_sieve_resolved),
         stats.gpu_spectral_resolved, pct(stats.gpu_spectral_resolved),
         stats.wfa_resolved, pct(stats.wfa_resolved),
+        stats.lsh_rescue_resolved, pct(stats.lsh_rescue_resolved),
+        stats.cgk_rescue_resolved, pct(stats.cgk_rescue_resolved),
         stats.dp_simd, pct(stats.dp_simd),
         stats.dp_scalar, pct(stats.dp_scalar),
         stats.unmapped, pct(stats.unmapped),

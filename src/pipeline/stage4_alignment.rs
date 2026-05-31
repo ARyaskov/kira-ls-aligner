@@ -89,6 +89,8 @@ pub struct AlignmentBatchStats {
     pub wfa_resolved: usize,
     /// Reads resolved by CGK rescue.
     pub cgk_rescue_resolved: usize,
+    /// Reads resolved by SimHash-LSH rescue.
+    pub lsh_rescue_resolved: usize,
     /// Reads resolved by the CUDA spectral dispatcher.
     pub gpu_spectral_resolved: usize,
     /// Reads that finished stage 4 without an alignment.
@@ -126,6 +128,7 @@ impl AlignmentBatchStats {
         self.spectral_sieve_resolved += other.spectral_sieve_resolved;
         self.wfa_resolved += other.wfa_resolved;
         self.cgk_rescue_resolved += other.cgk_rescue_resolved;
+        self.lsh_rescue_resolved += other.lsh_rescue_resolved;
         self.gpu_spectral_resolved += other.gpu_spectral_resolved;
         self.unmapped += other.unmapped;
         self.ungapped_score_p95 = other.ungapped_score_p95;
@@ -225,6 +228,7 @@ struct PerReadResult<'a> {
     spectral_sieve_resolved: usize,
     wfa_resolved: usize,
     cgk_rescue_resolved: usize,
+    lsh_rescue_resolved: usize,
 }
 
 impl<'a> Default for PerReadResult<'a> {
@@ -254,6 +258,7 @@ impl<'a> Default for PerReadResult<'a> {
             spectral_sieve_resolved: 0,
             wfa_resolved: 0,
             cgk_rescue_resolved: 0,
+            lsh_rescue_resolved: 0,
         }
     }
 }
@@ -304,7 +309,16 @@ fn process_read_prefilter<'a>(
     res.chain_best = best;
     res.chain_second = chain_second;
 
-    let effective_dp_topk = if short_read { 1 } else { cfg.dp_topk.max(1) };
+    let short_topk = {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("KIRA_SHORT_DPTOPK").ok().and_then(|s| s.parse().ok()).filter(|&k| k >= 1).unwrap_or(1)
+        })
+    };
+    // Short reads default to top-1 (fast), but a 2nd DP alignment at the competing locus gives the
+    // honest second-best score that lowers MAPQ on paralog mismaps (so the caller's MQ filter can
+    // drop them). KIRA_SHORT_DPTOPK=2 re-enables it. Default 1 = unchanged.
+    let effective_dp_topk = if short_read { short_topk } else { cfg.dp_topk.max(1) };
     let mut accepted_read = false;
     let mut selected = 0usize;
     for chain in chain_list.iter() {
@@ -445,8 +459,13 @@ fn process_read_prefilter<'a>(
         };
 
         let final_result = if matches!(result, PrefilterResult::Fallback)
+            && !matches!(reason, PrefilterReason::IndelSuspect)
             && confidence >= if short_read { 0.65 } else { 0.85 }
             && metrics.is_some()
+            // Only accept the ungapped alignment if it covers (near) the whole read.
+            // A large soft-clip here means the unaligned tail likely holds an indel
+            // that bwa gaps -> route to the gapped DP cascade instead of clipping it.
+            && metrics.as_ref().map_or(false, |m| (m.len as usize) + 2 >= read_len && m.mism <= 3)
             && is_top1
             && short_read
             && cfg.max_alignments <= 1
@@ -501,6 +520,7 @@ fn process_read_prefilter<'a>(
                     FastPathKind::SpectralSieve => res.spectral_sieve_resolved += 1,
                     FastPathKind::Wfa => res.wfa_resolved += 1,
                     FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
+                    FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
                 }
                 break;
             }
@@ -541,6 +561,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
 
     let simd_mode = simd::detect_cached();
     let lanes = match simd_mode {
+        SimdMode::AvxVnni => 32,
         SimdMode::Avx2 => 16,
         SimdMode::Neon => 4,
         SimdMode::Scalar => 1,
@@ -617,6 +638,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         stats.spectral_sieve_resolved += res.spectral_sieve_resolved;
         stats.wfa_resolved += res.wfa_resolved;
         stats.cgk_rescue_resolved += res.cgk_rescue_resolved;
+        stats.lsh_rescue_resolved += res.lsh_rescue_resolved;
         alignments.push(std::mem::take(&mut res.accepted));
         chain_best_per_read.push(res.chain_best);
         chain_second_per_read.push(res.chain_second);
@@ -771,6 +793,12 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         alignments[idx].push(aln);
     }
 
+    let xs_min_ratio_pct: i64 = {
+        static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("KIRA_XS_MINRATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+        })
+    };
     for (i, alns) in alignments.iter_mut().enumerate() {
         if alns.len() != 1 {
             continue;
@@ -785,7 +813,11 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
             continue;
         }
         let sub = ((first.score as i64) * (cs as i64) / (cb as i64)) as i32;
-        if sub > 0 {
+        // Only record a competing-locus score (which compresses MAPQ) when the 2nd chain is a
+        // substantial fraction of the best. Weak 2nd chains surfaced by k_hits=64 are spurious
+        // partial matches, not real paralogs, and were compressing MAPQ at unique sites — leaving
+        // the caller unable to separate paralog FP from true sites by MQ. Default 0 = unchanged.
+        if sub > 0 && (cs as i64) * 100 >= (cb as i64) * xs_min_ratio_pct {
             first.xs_score = Some(sub);
         }
     }

@@ -25,7 +25,7 @@ pub fn run(input: AlignBatch, cfg: MapqConfig, pair_ctx: Option<PairMapqContext>
         .par_iter_mut()
         .zip(reads.par_iter())
         .for_each(|(alns, read)| {
-            assign_mapq(alns, read.seq.len(), cfg, pair_ctx);
+            assign_mapq(alns, read.seq.len(), cfg, pair_ctx, read.repeat_min_occ);
         });
 
     ScoredBatch {
