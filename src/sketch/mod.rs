@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use crate::types::{Minimizer, Strand};
 
+pub mod simhash;
+
 /// Minimizer sketch configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct MinimizerConfig {

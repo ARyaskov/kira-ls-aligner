@@ -1,5 +1,7 @@
 //! Paired-end post-processing for stage 4 alignments.
 
+use rayon::prelude::*;
+
 use crate::alignment::{AlignmentConfig, align_in_window};
 use crate::index::Index;
 use crate::io::IngestMode;
@@ -197,96 +199,98 @@ pub fn rescue_unmapped_mates_with_ref(
     }
     debug_assert_eq!(reads.len(), alignments.len());
 
-    let mut i = 0;
-    while i + 1 < reads.len() {
-        let r1_idx = i;
-        let r2_idx = i + 1;
-        let r1 = &reads[r1_idx];
-        let r2 = &reads[r2_idx];
-        if r1.pair_role == PairRole::Unpaired || r2.pair_role == PairRole::Unpaired {
-            i += 1;
-            continue;
-        }
-
-        let r1_empty = alignments[r1_idx].is_empty();
-        let r2_empty = alignments[r2_idx].is_empty();
-        let (anchor_idx, target_idx) = match (r1_empty, r2_empty) {
-            (true, false) => (r2_idx, r1_idx),
-            (false, true) => (r1_idx, r2_idx),
-            _ => {
-                i += 2;
-                continue;
+    // Pairs are independent — parallelize over R1/R2 chunks (per-pair logic unchanged).
+    alignments
+        .par_chunks_mut(2)
+        .zip(reads.par_chunks(2))
+        .for_each(|(aln_pair, read_pair)| {
+            if aln_pair.len() < 2 || read_pair.len() < 2 {
+                return;
             }
-        };
+            if read_pair[0].pair_role == PairRole::Unpaired
+                || read_pair[1].pair_role == PairRole::Unpaired
+            {
+                return;
+            }
 
-        let anchor = &alignments[anchor_idx][0];
-        if anchor.score < rescue_cfg.min_anchor_score {
-            i += 2;
-            continue;
-        }
-        let anchor_ref_id = anchor.ref_id;
-        let anchor_ref_start = anchor.ref_start;
-        let anchor_ref_end = anchor.ref_end;
-        let anchor_is_rev = anchor.is_rev;
+            // anchor = mapped side, target = empty side
+            let (anchor_local, target_local) =
+                match (aln_pair[0].is_empty(), aln_pair[1].is_empty()) {
+                    (true, false) => (1usize, 0usize),
+                    (false, true) => (0usize, 1usize),
+                    _ => return,
+                };
 
-        let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
-        let ref_len = ref_seq.len() as i64;
-        let (win_start_u64, win_end_u64) = if cfg.estimator_locked && cfg.insert_sd > 0 {
-            let mean = cfg.insert_mean as i64;
-            let half = 3 * cfg.insert_sd as i64;
-            if !anchor_is_rev {
-                let centre = anchor_ref_end as i64 + mean;
-                let start = (centre - half).max(0).min(ref_len);
-                let end = (centre + half).max(0).min(ref_len);
-                (start as u64, end as u64)
+            let anchor_score = aln_pair[anchor_local][0].score;
+            if anchor_score < rescue_cfg.min_anchor_score {
+                return;
+            }
+            let anchor_ref_id = aln_pair[anchor_local][0].ref_id;
+            let anchor_ref_start = aln_pair[anchor_local][0].ref_start;
+            let anchor_ref_end = aln_pair[anchor_local][0].ref_end;
+            let anchor_is_rev = aln_pair[anchor_local][0].is_rev;
+
+            let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
+            let ref_len = ref_seq.len() as i64;
+            let (win_start_u64, win_end_u64) = if cfg.estimator_locked && cfg.insert_sd > 0 {
+                let mean = cfg.insert_mean as i64;
+                let half = 3 * cfg.insert_sd as i64;
+                if !anchor_is_rev {
+                    let centre = anchor_ref_end as i64 + mean;
+                    (
+                        (centre - half).max(0).min(ref_len) as u64,
+                        (centre + half).max(0).min(ref_len) as u64,
+                    )
+                } else {
+                    let centre = anchor_ref_start as i64 - mean;
+                    (
+                        (centre - half).max(0).min(ref_len) as u64,
+                        (centre + half).max(0).min(ref_len) as u64,
+                    )
+                }
             } else {
-                let centre = anchor_ref_start as i64 - mean;
-                let start = (centre - half).max(0).min(ref_len);
-                let end = (centre + half).max(0).min(ref_len);
-                (start as u64, end as u64)
+                let insert_max = cfg.insert_max as u64;
+                if !anchor_is_rev {
+                    (
+                        anchor_ref_end as u64,
+                        (anchor_ref_end as u64 + insert_max).min(ref_len as u64),
+                    )
+                } else {
+                    (
+                        (anchor_ref_start as u64).saturating_sub(insert_max),
+                        anchor_ref_start as u64,
+                    )
+                }
+            };
+            if win_end_u64 <= win_start_u64 {
+                return;
             }
-        } else {
-            let insert_max = cfg.insert_max as u64;
-            if !anchor_is_rev {
-                let win_end = (anchor_ref_end as u64 + insert_max).min(ref_len as u64);
-                (anchor_ref_end as u64, win_end)
+            let win_start = win_start_u64 as u32;
+            let ref_window = &ref_seq[win_start as usize..win_end_u64 as usize];
+
+            // Expected mate strand: opposite to the anchor.
+            let target_is_rev = !anchor_is_rev;
+            let target_seq_owned;
+            let target_seq: &[u8] = if target_is_rev {
+                target_seq_owned = reverse_complement(&read_pair[target_local].seq);
+                &target_seq_owned
             } else {
-                let win_start = (anchor_ref_start as u64).saturating_sub(insert_max);
-                (win_start, anchor_ref_start as u64)
+                &read_pair[target_local].seq
+            };
+
+            if let Some(mut aln) = align_in_window(
+                target_seq,
+                ref_window,
+                win_start,
+                anchor_ref_id,
+                target_is_rev,
+                align_cfg,
+                rescue_cfg.min_rescued_score,
+            ) {
+                aln.mapq = 30;
+                aln_pair[target_local].push(aln);
             }
-        };
-        if win_end_u64 <= win_start_u64 {
-            i += 2;
-            continue;
-        }
-        let win_start = win_start_u64 as u32;
-        let ref_window = &ref_seq[win_start as usize..win_end_u64 as usize];
-
-        // Expected mate strand: opposite to the anchor.
-        let target_is_rev = !anchor_is_rev;
-        let target_seq_owned;
-        let target_seq: &[u8] = if target_is_rev {
-            target_seq_owned = reverse_complement(&reads[target_idx].seq);
-            &target_seq_owned
-        } else {
-            &reads[target_idx].seq
-        };
-
-        if let Some(mut aln) = align_in_window(
-            target_seq,
-            ref_window,
-            win_start,
-            anchor_ref_id,
-            target_is_rev,
-            align_cfg,
-            rescue_cfg.min_rescued_score,
-        ) {
-            aln.mapq = 30;
-            alignments[target_idx].push(aln);
-        }
-
-        i += 2;
-    }
+        });
 }
 
 fn primary_summary(alns: &[Alignment]) -> Option<MatePrimary> {
@@ -376,8 +380,13 @@ pub fn pair_rerank(
     }
     debug_assert_eq!(reads.len(), alignments.len());
 
+    // Concordant-promote: widen candidate window and allow primary swap + MAPQ lift.
+    let promote = pair_promote_enabled();
+    let top_k = if promote { pair_promote_topk().max(top_k) } else { top_k };
+    let mapq_floor = if promote { pair_mapq_floor_cfg() } else { 0 };
+
     let pair_bonus_base: i32 = PAIR_BONUS_BASE;
-    let pair_bonus_concordant: i32 = PAIR_BONUS_CONCORDANT;
+    let pair_bonus_concordant: i32 = pair_bonus_concordant_cfg();
 
     let mut i = 0;
     while i + 1 < reads.len() {
@@ -428,6 +437,23 @@ pub fn pair_rerank(
                     alignments[r1_idx][ii].score.saturating_add(bonus);
                 alignments[r2_idx][jj].score =
                     alignments[r2_idx][jj].score.saturating_add(bonus);
+                if promote {
+                    // Make the concordant placement primary (index 0).
+                    if ii != 0 {
+                        alignments[r1_idx].swap(0, ii);
+                    }
+                    if jj != 0 {
+                        alignments[r2_idx].swap(0, jj);
+                    }
+                    if mapq_floor > 0 {
+                        if let Some(a) = alignments[r1_idx].first_mut() {
+                            a.mapq = a.mapq.max(mapq_floor);
+                        }
+                        if let Some(a) = alignments[r2_idx].first_mut() {
+                            a.mapq = a.mapq.max(mapq_floor);
+                        }
+                    }
+                }
             }
         }
 
@@ -440,6 +466,50 @@ const PAIR_BONUS_BASE: i32 = 0;
 
 /// Extra bonus when the (R1[i], R2[j]) cross-product is fully concordant.
 const PAIR_BONUS_CONCORDANT: i32 = 30;
+
+/// `KIRA_PAIR_PROMOTE=1` — promote the best concordant pair to primary and lift MAPQ (default off).
+fn pair_promote_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_PAIR_PROMOTE")
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
+}
+
+/// `KIRA_SHORT_DPTOPK` — promotion candidate-window size (chains kept per short read).
+fn pair_promote_topk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_SHORT_DPTOPK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&k: &usize| k >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// `KIRA_PAIR_BONUS` — concordant joint-score bonus (default 30).
+fn pair_bonus_concordant_cfg() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_PAIR_BONUS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(PAIR_BONUS_CONCORDANT)
+    })
+}
+
+/// `KIRA_PAIR_MAPQ` — MAPQ floor applied to a promoted concordant primary (0 = no boost).
+fn pair_mapq_floor_cfg() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_PAIR_MAPQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// Lightweight view of an alignment used during pair re-ranking.
 #[derive(Clone, Copy, Debug)]
@@ -549,88 +619,85 @@ pub fn rescue_discordant_pairs_with_ref(
     };
     let center_offset: i64 = cfg.insert_mean.max(1) as i64;
 
-    let mut i = 0;
-    while i + 1 < reads.len() {
-        let r1_idx = i;
-        let r2_idx = i + 1;
-        let r1 = &reads[r1_idx];
-        let r2 = &reads[r2_idx];
-        if r1.pair_role == PairRole::Unpaired || r2.pair_role == PairRole::Unpaired {
-            i += 1;
-            continue;
-        }
-        if alignments[r1_idx].is_empty() || alignments[r2_idx].is_empty() {
-            // Single-side unmapped — handled by rescue_unmapped_mates.
-            i += 2;
-            continue;
-        }
+    // Pairs are independent — parallelize over R1/R2 chunks (per-pair logic unchanged).
+    alignments
+        .par_chunks_mut(2)
+        .zip(reads.par_chunks(2))
+        .for_each(|(aln_pair, read_pair)| {
+            if aln_pair.len() < 2 || read_pair.len() < 2 {
+                return;
+            }
+            if read_pair[0].pair_role == PairRole::Unpaired
+                || read_pair[1].pair_role == PairRole::Unpaired
+            {
+                return;
+            }
+            if aln_pair[0].is_empty() || aln_pair[1].is_empty() {
+                // Single-side unmapped — handled by rescue_unmapped_mates.
+                return;
+            }
 
-        let a1 = MatePrimaryScored::from_aln(&alignments[r1_idx][0]);
-        let a2 = MatePrimaryScored::from_aln(&alignments[r2_idx][0]);
-        if pair_is_concordant(&a1, &a2, cfg) {
-            i += 2;
-            continue;
-        }
+            let a1 = MatePrimaryScored::from_aln(&aln_pair[0][0]);
+            let a2 = MatePrimaryScored::from_aln(&aln_pair[1][0]);
+            if pair_is_concordant(&a1, &a2, cfg) {
+                return;
+            }
 
-        // Pick anchor = higher-MAPQ side. Ties broken toward R1.
-        let (anchor_idx, target_idx) = {
-            let m1 = alignments[r1_idx][0].mapq;
-            let m2 = alignments[r2_idx][0].mapq;
-            if m1 >= m2 { (r1_idx, r2_idx) } else { (r2_idx, r1_idx) }
-        };
+            // Anchor = higher-MAPQ side; ties → R1 (local 0).
+            let (anchor_local, target_local) = {
+                let m1 = aln_pair[0][0].mapq;
+                let m2 = aln_pair[1][0].mapq;
+                if m1 >= m2 { (0usize, 1usize) } else { (1usize, 0usize) }
+            };
 
-        let anchor = &alignments[anchor_idx][0];
-        if anchor.score < rescue_cfg.min_anchor_score {
-            i += 2;
-            continue;
-        }
-        let anchor_ref_id = anchor.ref_id;
-        let anchor_ref_start = anchor.ref_start as i64;
-        let anchor_ref_end = anchor.ref_end as i64;
-        let anchor_is_rev = anchor.is_rev;
-        let target_current_score = alignments[target_idx][0].score;
+            let anchor_score = aln_pair[anchor_local][0].score;
+            if anchor_score < rescue_cfg.min_anchor_score {
+                return;
+            }
+            let anchor_ref_id = aln_pair[anchor_local][0].ref_id;
+            let anchor_ref_start = aln_pair[anchor_local][0].ref_start as i64;
+            let anchor_ref_end = aln_pair[anchor_local][0].ref_end as i64;
+            let anchor_is_rev = aln_pair[anchor_local][0].is_rev;
+            let target_current_score = aln_pair[target_local][0].score;
 
-        let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
-        let ref_len = ref_seq.len() as i64;
+            let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
+            let ref_len = ref_seq.len() as i64;
 
-        let (center, target_is_rev) = if !anchor_is_rev {
-            (anchor_ref_end + center_offset, true)
-        } else {
-            (anchor_ref_start - center_offset, false)
-        };
-        let win_start = (center - half_window as i64).max(0).min(ref_len) as u64;
-        let win_end = (center + half_window as i64).max(0).min(ref_len) as u64;
-        if win_end <= win_start {
-            i += 2;
-            continue;
-        }
-        let win_start = win_start as u32;
-        let ref_window = &ref_seq[win_start as usize..win_end as usize];
+            let (center, target_is_rev) = if !anchor_is_rev {
+                (anchor_ref_end + center_offset, true)
+            } else {
+                (anchor_ref_start - center_offset, false)
+            };
+            let win_start = (center - half_window as i64).max(0).min(ref_len) as u64;
+            let win_end = (center + half_window as i64).max(0).min(ref_len) as u64;
+            if win_end <= win_start {
+                return;
+            }
+            let win_start = win_start as u32;
+            let ref_window = &ref_seq[win_start as usize..win_end as usize];
 
-        let target_seq_owned;
-        let target_seq: &[u8] = if target_is_rev {
-            target_seq_owned = reverse_complement(&reads[target_idx].seq);
-            &target_seq_owned
-        } else {
-            &reads[target_idx].seq
-        };
+            let target_seq_owned;
+            let target_seq: &[u8] = if target_is_rev {
+                target_seq_owned = reverse_complement(&read_pair[target_local].seq);
+                &target_seq_owned
+            } else {
+                &read_pair[target_local].seq
+            };
 
-        let min_score = rescue_cfg.min_rescued_score.max(target_current_score);
-        if let Some(mut aln) = align_in_window(
-            target_seq,
-            ref_window,
-            win_start,
-            anchor_ref_id,
-            target_is_rev,
-            align_cfg,
-            min_score,
-        ) {
-            aln.mapq = 30;
-            alignments[target_idx].insert(0, aln);
-        }
-
-        i += 2;
-    }
+            let min_score = rescue_cfg.min_rescued_score.max(target_current_score);
+            if let Some(mut aln) = align_in_window(
+                target_seq,
+                ref_window,
+                win_start,
+                anchor_ref_id,
+                target_is_rev,
+                align_cfg,
+                min_score,
+            ) {
+                aln.mapq = 30;
+                aln_pair[target_local].insert(0, aln);
+            }
+        });
 }
 
 /// Build the MateInfo that the unmapped emitter (stage 6) needs for a paired read with no.
@@ -662,330 +729,5 @@ fn build_unmapped_mate(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dummy_aln(ref_id: u32, ref_start: u32, ref_end: u32, is_rev: bool) -> Alignment {
-        Alignment {
-            kind: crate::types::AlignmentKind::AcceptedUngapped,
-            ref_id,
-            ref_start,
-            ref_end,
-            read_start: 0,
-            read_end: ref_end - ref_start,
-            cigar: vec![crate::types::CigarOp {
-                len: ref_end - ref_start,
-                op: crate::types::CigarKind::Match,
-            }],
-            score: 100,
-            mapq: 60,
-            is_rev,
-            is_secondary: false,
-            is_supplementary: false,
-            nm: 0,
-            md: format!("{}", ref_end - ref_start),
-            as_score: 100,
-            xs_score: None,
-            xs_strand: None,
-            mate: MateInfo::default(),
-        }
-    }
-
-    fn dummy_read(id: &str, role: PairRole) -> ReadRecord {
-        ReadRecord {
-            id: id.to_string(),
-            seq: vec![b'A'; 150],
-            qual: None,
-            pair_role: role,
-        }
-    }
-
-    #[test]
-    fn insert_spec_parses_2_and_4_field_forms() {
-        let mut cfg = PairedConfig::default();
-        cfg.apply_insert_spec("50,500").unwrap();
-        assert_eq!((cfg.insert_min, cfg.insert_max), (50, 500));
-
-        cfg.apply_insert_spec("0,1500,300,40").unwrap();
-        assert_eq!(
-            (cfg.insert_min, cfg.insert_max, cfg.insert_mean, cfg.insert_sd),
-            (0, 1500, 300, 40)
-        );
-
-        assert!(cfg.apply_insert_spec("100").is_err());
-        assert!(cfg.apply_insert_spec("500,100").is_err()); // min > max
-    }
-
-    #[test]
-    fn proper_pair_fr_orientation_in_window() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        // R1 forward at 100, R2 reverse at 350 → fragment 250..500, len 400
-        let reads = vec![
-            dummy_read("frag1", PairRole::R1),
-            dummy_read("frag1", PairRole::R2),
-        ];
-        let mut alns = vec![
-            vec![dummy_aln(0, 100, 250, false)],
-            vec![dummy_aln(0, 350, 500, true)],
-        ];
-        let mut umi = vec![None; reads.len()];
-        apply_pairing(&reads, &mut alns, &mut umi, &cfg);
-        // R1 leftmost → tlen +400
-        assert!(alns[0][0].mate.is_paired);
-        assert!(alns[0][0].mate.is_proper_pair);
-        assert_eq!(alns[0][0].mate.tlen, 400);
-        assert!(alns[0][0].mate.is_first_in_pair);
-        // R2 rightmost → tlen -400
-        assert_eq!(alns[1][0].mate.tlen, -400);
-        assert!(alns[1][0].mate.is_second_in_pair);
-        assert!(alns[1][0].mate.is_proper_pair);
-    }
-
-    #[test]
-    fn not_proper_when_different_refs() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        let reads = vec![
-            dummy_read("x", PairRole::R1),
-            dummy_read("x", PairRole::R2),
-        ];
-        let mut alns = vec![
-            vec![dummy_aln(0, 100, 250, false)],
-            vec![dummy_aln(1, 100, 250, true)],
-        ];
-        let mut umi = vec![None; reads.len()];
-        apply_pairing(&reads, &mut alns, &mut umi, &cfg);
-        assert!(alns[0][0].mate.is_paired);
-        assert!(!alns[0][0].mate.is_proper_pair);
-        assert_eq!(alns[0][0].mate.tlen, 0);
-    }
-
-    #[test]
-    fn mate_unmapped_marks_correct_bit() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        let reads = vec![
-            dummy_read("x", PairRole::R1),
-            dummy_read("x", PairRole::R2),
-        ];
-        let mut alns = vec![vec![dummy_aln(0, 100, 250, false)], vec![]];
-        let mut umi = vec![None; reads.len()];
-        apply_pairing(&reads, &mut alns, &mut umi, &cfg);
-        // R1's mate is unmapped → 0x8 should be set on R1
-        assert!(alns[0][0].mate.is_paired);
-        assert!(alns[0][0].mate.mate_is_unmapped);
-        assert!(!alns[0][0].mate.is_proper_pair);
-        assert_eq!(alns[0][0].mate.mate_ref_id, None);
-    }
-
-    #[test]
-    fn unpaired_mode_is_noop() {
-        let cfg = PairedConfig::default(); // mode = Unpaired
-        let reads = vec![dummy_read("r1", PairRole::Unpaired)];
-        let mut alns = vec![vec![dummy_aln(0, 0, 100, false)]];
-        let mut umi = vec![None; reads.len()];
-        apply_pairing(&reads, &mut alns, &mut umi, &cfg);
-        assert!(!alns[0][0].mate.is_paired);
-    }
-
-    fn dummy_aln_score(
-        ref_id: u32,
-        ref_start: u32,
-        ref_end: u32,
-        is_rev: bool,
-        score: i32,
-    ) -> Alignment {
-        let mut a = dummy_aln(ref_id, ref_start, ref_end, is_rev);
-        a.score = score;
-        a
-    }
-
-    #[test]
-    fn rerank_keeps_concordant_pair_at_slot_0() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        cfg.insert_mean = 400;
-        cfg.insert_sd = 100;
-        let reads = vec![
-            dummy_read("r", PairRole::R1),
-            dummy_read("r", PairRole::R2),
-        ];
-        let mut alns = vec![
-            vec![
-                dummy_aln_score(0, 100, 250, false, 150),
-                dummy_aln_score(1, 1000, 1150, false, 100),
-            ],
-            vec![dummy_aln_score(0, 350, 500, true, 145)],
-        ];
-        pair_rerank(&reads, &mut alns, &cfg, 5);
-        // Slot 0 of R1 stays on chr0. Score was boosted by 30/2=15.
-        assert_eq!(alns[0][0].ref_id, 0);
-        assert!(alns[0][0].score >= 150);
-    }
-
-    #[test]
-    fn rerank_promotes_pair_consistent_alternative() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        cfg.insert_mean = 400;
-        cfg.insert_sd = 100;
-        let reads = vec![
-            dummy_read("r", PairRole::R1),
-            dummy_read("r", PairRole::R2),
-        ];
-        let mut alns = vec![
-            vec![
-                dummy_aln_score(1, 50_000, 50_150, false, 200),
-                dummy_aln_score(0, 100, 250, false, 180),
-            ],
-            vec![dummy_aln_score(0, 350, 500, true, 140)],
-        ];
-        pair_rerank(&reads, &mut alns, &cfg, 5);
-        let chr0_score = alns[0]
-            .iter()
-            .find(|a| a.ref_id == 0)
-            .map(|a| a.score)
-            .unwrap();
-        let chr1_score = alns[0]
-            .iter()
-            .find(|a| a.ref_id == 1)
-            .map(|a| a.score)
-            .unwrap();
-        assert!(
-            chr0_score > chr1_score,
-            "concordant alt (chr0={chr0_score}) didn't overtake lone primary (chr1={chr1_score})"
-        );
-    }
-
-    #[test]
-    fn rerank_no_bonus_when_all_combos_discordant() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        cfg.insert_mean = 400;
-        cfg.insert_sd = 100;
-        let reads = vec![
-            dummy_read("r", PairRole::R1),
-            dummy_read("r", PairRole::R2),
-        ];
-        let r1_orig = 150;
-        let r2_orig = 140;
-        let mut alns = vec![
-            vec![dummy_aln_score(0, 100, 250, false, r1_orig)],
-            vec![dummy_aln_score(0, 100_000, 100_150, true, r2_orig)],
-        ];
-        pair_rerank(&reads, &mut alns, &cfg, 5);
-        assert_eq!(alns[0][0].score, r1_orig);
-        assert_eq!(alns[1][0].score, r2_orig);
-    }
-
-    #[test]
-    fn pair_is_concordant_respects_3sigma() {
-        let mut cfg = PairedConfig::default();
-        cfg.insert_mean = 500;
-        cfg.insert_sd = 100;
-        cfg.estimator_locked = true;
-        // In-window: TLEN 600
-        let a = MatePrimaryScored {
-            ref_id: 0,
-            ref_start: 0,
-            ref_end: 150,
-            is_rev: false,
-            score: 100,
-        };
-        let b = MatePrimaryScored {
-            ref_id: 0,
-            ref_start: 450,
-            ref_end: 600,
-            is_rev: true,
-            score: 100,
-        };
-        assert!(pair_is_concordant(&a, &b, &cfg));
-        // Out of window: TLEN 1000 (5σ)
-        let b_far = MatePrimaryScored {
-            ref_start: 850,
-            ref_end: 1000,
-            ..b
-        };
-        assert!(!pair_is_concordant(&a, &b_far, &cfg));
-        // Cross-chr
-        let b_chr = MatePrimaryScored { ref_id: 1, ..b };
-        assert!(!pair_is_concordant(&a, &b_chr, &cfg));
-        // Wrong orientation (RR)
-        let b_rr = MatePrimaryScored { is_rev: false, ..b };
-        assert!(!pair_is_concordant(&a, &b_rr, &cfg));
-    }
-
-    #[test]
-    fn concordance_window_falls_back_to_min_max_during_bootstrap() {
-        let mut cfg = PairedConfig::default();
-        cfg.insert_min = 0;
-        cfg.insert_max = 1000;
-        cfg.insert_mean = 200;
-        cfg.insert_sd = 50;
-        cfg.estimator_locked = false;
-        let (lo, hi) = concordance_window(&cfg);
-        assert_eq!((lo, hi), (0, 1000));
-
-        cfg.insert_mean = 570;
-        cfg.insert_sd = 155;
-        cfg.estimator_locked = true;
-        let (lo, hi) = concordance_window(&cfg);
-        assert_eq!((lo, hi), (570 - 3 * 155, 570 + 3 * 155));
-    }
-
-    #[test]
-    fn proper_pair_window_uses_5sigma_after_lock() {
-        let mut cfg = PairedConfig::default();
-        cfg.insert_mean = 570;
-        cfg.insert_sd = 155;
-        cfg.estimator_locked = true;
-        let (lo, hi) = proper_pair_window(&cfg);
-        assert_eq!((lo, hi), (0, 570 + 5 * 155));
-        // Bootstrap fallback is still [insert_min, insert_max].
-        cfg.estimator_locked = false;
-        cfg.insert_min = 0;
-        cfg.insert_max = 1000;
-        assert_eq!(proper_pair_window(&cfg), (0, 1000));
-    }
-
-    #[test]
-    fn classify_pair_marks_out_of_5sigma_pair_improper_after_lock() {
-        let mut cfg = PairedConfig::default();
-        cfg.mode = IngestMode::TwoFile;
-        cfg.insert_mean = 500;
-        cfg.insert_sd = 100;
-        cfg.insert_min = 0;
-        cfg.insert_max = 5_000; // legacy field set wide on purpose
-        cfg.estimator_locked = true;
-
-        // TLEN 1100 = 6 σ from mean = 500
-        let p1 = MatePrimary {
-            ref_id: 0,
-            ref_start: 0,
-            ref_end: 150,
-            is_rev: false,
-        };
-        let p2 = MatePrimary {
-            ref_id: 0,
-            ref_start: 950,
-            ref_end: 1100,
-            is_rev: true,
-        };
-        let (proper, _, _) = classify_pair(&p1, &p2, &cfg);
-        assert!(
-            !proper,
-            "TLEN 1100 = 6 σ from mean 500 must be classified discordant post-lock"
-        );
-
-        // TLEN 900 = 4 σ → inside 5 σ → proper.
-        let p2_in = MatePrimary {
-            ref_id: 0,
-            ref_start: 750,
-            ref_end: 900,
-            is_rev: true,
-        };
-        let (proper_in, _, _) = classify_pair(&p1, &p2_in, &cfg);
-        assert!(proper_in, "TLEN 900 = 4 σ from mean must stay proper");
-    }
-}
+#[path = "../../tests/unit/pipeline_pairing.rs"]
+mod tests;

@@ -19,6 +19,159 @@ use crate::seeding::SeedingConfig;
 
 use crate::cli::MemArgs;
 
+/// Read an i32 tuning knob from the environment, falling back to `default`.
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read an f32 tuning knob from the environment, falling back to `default`.
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parameters for the fused in-process aligner ([`build_short_pe_aligner`]).
+pub struct FusedAlignerParams {
+    pub reference: std::path::PathBuf,
+    pub index: Option<std::path::PathBuf>,
+    pub threads: usize,
+    pub num_p_threads: Option<usize>,
+    pub num_e_threads: Option<usize>,
+    pub batch_bases: usize,
+    pub read_group: Option<String>,
+    pub paired: bool,
+    pub interleaved: bool,
+    /// `MIN,MAX[,MEAN,SD]`.
+    pub insert_size: String,
+    /// Number of read files (for paired-mode auto-detection).
+    pub n_read_files: usize,
+}
+
+/// Build a short-read (Illumina-style) aligner for the fused `kira-bt solid`
+/// pipeline and return it plus the resolved index path. Mirrors the `-x short`
+/// configuration of [`cmd_mem`] (k=19/w=10 short index, banded SW, ungapped
+/// accept), with `auto_profiles = None` since the fused in-memory path uses the
+/// pipeline config directly. Kept separate from `cmd_mem` to avoid the
+/// file-emitting plumbing; the scoring/seeding values are intentionally the
+/// same as the short preset.
+pub fn build_short_pe_aligner(
+    p: &FusedAlignerParams,
+) -> Result<(crate::aligner_core::Aligner, Option<std::path::PathBuf>)> {
+    let index_cfg = IndexConfig {
+        short_k: 19,
+        short_w: 10,
+        long_k: 15,
+        long_w: 10,
+        max_occ: 500,
+        build_short: true,
+        build_long: true,
+    };
+    let sketch_cfg = SketchConfig {
+        short_k: 19,
+        short_w: 10,
+        long_k: 15,
+        long_w: 10,
+        long_read_threshold: 500,
+    };
+    let seeding_cfg = SeedingConfig {
+        min_anchor_len: 20,
+        max_occ: 500,
+        long_read_threshold: 500,
+    };
+    let chaining_cfg = ChainingConfig {
+        max_dist: 500,
+        max_anchors: 2000,
+        max_chains: 5,
+        gap_open: 5,
+        gap_extend: 1,
+        log_gap: 0.2,
+        rmq_window: 256,
+    };
+    let alignment_cfg = AlignmentConfig {
+        match_score: 1,
+        mismatch: 4,
+        gap_open: 6,
+        gap_extend: 1,
+        // KIRA_BANDWIDTH / KIRA_XDROP / KIRA_CLIP_PENALTY — alignment-tuning knobs.
+        bandwidth: env_i32("KIRA_BANDWIDTH", 50),
+        xdrop: env_i32("KIRA_XDROP", 50),
+        clip_penalty: env_i32("KIRA_CLIP_PENALTY", 5),
+    };
+    let mapq_cfg = MapqConfig {
+        short_read_len: 500,
+        mapq_cap_short: 60,
+        mapq_cap_long: 60,
+    };
+
+    let (paired_mode, _auto) = resolve_paired_mode(p.paired, p.interleaved, p.n_read_files)?;
+    let mut paired_cfg = PairedConfig::default();
+    paired_cfg.mode = paired_mode;
+    paired_cfg
+        .apply_insert_spec(&p.insert_size)
+        .map_err(|e| anyhow::anyhow!("--insert-size: {e}"))?;
+
+    let pipeline_cfg = PipelineConfig {
+        sketch: sketch_cfg,
+        seeding: seeding_cfg,
+        chaining: chaining_cfg,
+        alignment: alignment_cfg,
+        accept_enable: true,
+        accept_only_top1: true,
+        accept_span_slack: 15,
+        accept_min_identity: 98.5,
+        accept_max_mismatches: 5,
+        accept_require_score_margin: 0,
+        dp_topk: 1,
+        dp_abort_margin: 20,
+        debug_prefilter: false,
+        debug_prefilter_n: 0,
+        debug_force_accept: false,
+        debug_force_accept_n: 0,
+        long_read_threshold: 500,
+        max_alignments: 1,
+        // KIRA_MIN_CHAIN_RATIO — min anchor-coverage fraction to keep a chain (default 0.4).
+        min_chain_ratio: env_f32("KIRA_MIN_CHAIN_RATIO", 0.4),
+        short_preset: true,
+        mapq: mapq_cfg,
+        output: OutputConfig::full(),
+        paired: paired_cfg,
+        splice: SpliceConfig::default(),
+    };
+
+    let mut header = HeaderConfig::default();
+    header.read_group = p.read_group.clone();
+    header.pg_lines.push(format!(
+        "ID:kira-bt-solid\tPN:kira-bt\tVN:{}\tCL:kira-bt solid (fused)",
+        env!("CARGO_PKG_VERSION")
+    ));
+
+    let cfg = AlignerConfig {
+        threads: p.threads,
+        num_p_threads: p.num_p_threads,
+        num_e_threads: p.num_e_threads,
+        batch_bases: p.batch_bases,
+        index: index_cfg,
+        pipeline: pipeline_cfg,
+        auto_profiles: None,
+        read_group: p.read_group.clone(),
+        header: Some(header),
+        junctions: None,
+        junc_bed_tolerance: 2,
+    };
+
+    let resolved_index = p.index.clone().or_else(|| {
+        let candidate = p.reference.with_extension("kiraidx");
+        candidate.is_file().then_some(candidate)
+    });
+
+    Ok((crate::aligner_core::Aligner::new(cfg), resolved_index))
+}
+
 pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     if let Some(rg) = args.read_group.as_deref() {
         if rg.contains("\\t") {
@@ -98,7 +251,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         gap_open: args.gap_open,
         gap_extend: args.gap_extend,
         bandwidth,
-        xdrop: 50,
+        xdrop: 100,
         clip_penalty: args.clip_penalty,
     };
 
@@ -127,7 +280,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
                 bandwidth: 50,
-                xdrop: 50,
+                xdrop: 100,
                 clip_penalty: args.clip_penalty,
             },
             1,
@@ -152,7 +305,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
                 bandwidth: 200,
-                xdrop: 50,
+                xdrop: 100,
                 clip_penalty: args.clip_penalty,
             },
             2,
@@ -320,6 +473,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     let cfg = AlignerConfig {
         threads: args.threads,
+        num_p_threads: args.num_p_threads,
+        num_e_threads: args.num_e_threads,
         batch_bases: args.batch_bases,
         index: index_cfg,
         pipeline: pipeline_cfg,
@@ -437,6 +592,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
             memory: "auto".to_string(),
             tmpdir: None,
             uncompressed: false,
+            compression_level: None,
             require_flags: 0,
             filter_flags: 0,
             no_pg: false,
@@ -511,6 +667,8 @@ fn run_split_prefix(
     }
     let tiled_cfg = TiledRunConfig {
         threads: cfg.threads,
+        num_p_threads: cfg.num_p_threads,
+        num_e_threads: cfg.num_e_threads,
         batch_bases: cfg.batch_bases,
         index_cfg: cfg.index,
         pipeline_cfg: cfg.pipeline,
@@ -558,43 +716,5 @@ pub(crate) fn resolve_paired_mode(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auto_pairs_two_fastqs_without_explicit_flag() {
-        let (mode, auto) = resolve_paired_mode(false, false, 2).unwrap();
-        assert_eq!(mode, IngestMode::TwoFile);
-        assert!(auto, "auto-detect notice must be flagged for caller");
-    }
-
-    #[test]
-    fn one_or_many_fastqs_stay_unpaired_without_explicit_flag() {
-        let (mode, auto) = resolve_paired_mode(false, false, 1).unwrap();
-        assert_eq!(mode, IngestMode::Unpaired);
-        assert!(!auto);
-        let (mode, auto) = resolve_paired_mode(false, false, 3).unwrap();
-        assert_eq!(mode, IngestMode::Unpaired);
-        assert!(!auto);
-    }
-
-    #[test]
-    fn explicit_paired_does_not_trigger_auto_notice() {
-        let (mode, auto) = resolve_paired_mode(true, false, 2).unwrap();
-        assert_eq!(mode, IngestMode::TwoFile);
-        assert!(!auto, "explicit --paired must not raise the notice");
-    }
-
-    #[test]
-    fn interleaved_takes_one_file() {
-        let (mode, _) = resolve_paired_mode(false, true, 1).unwrap();
-        assert_eq!(mode, IngestMode::Interleaved);
-        assert!(resolve_paired_mode(false, true, 2).is_err());
-    }
-
-    #[test]
-    fn paired_with_wrong_count_errors() {
-        assert!(resolve_paired_mode(true, false, 1).is_err());
-        assert!(resolve_paired_mode(true, false, 3).is_err());
-    }
-}
+#[path = "../../../tests/unit/cli_commands_mem.rs"]
+mod tests;

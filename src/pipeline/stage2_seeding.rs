@@ -41,11 +41,11 @@ struct AnchorCandidate {
 }
 
 pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig) -> SeedBatch {
-    let reads = input.reads;
+    let mut reads = input.reads;
     let sketches = input.sketches;
     let mut stats = SeedBatchStats::default();
 
-    let results: Vec<(Vec<Anchor>, usize)> = reads
+    let results: Vec<(Vec<Anchor>, usize, u32)> = reads
         .par_iter()
         .zip(sketches.par_iter())
         .map_init(ThreadCtx::default, |ctx, (read, sketch)| {
@@ -54,9 +54,10 @@ pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig
         .collect();
 
     let mut anchors: Vec<Vec<Anchor>> = Vec::with_capacity(results.len());
-    for (a, before) in results {
+    for (i, (a, before, min_occ)) in results.into_iter().enumerate() {
         stats.anchors_before_prune += before;
         stats.anchors_after_prune += a.len();
+        reads[i].repeat_min_occ = min_occ;
         anchors.push(a);
     }
 
@@ -73,7 +74,7 @@ fn seed_one(
     index: &Index,
     cfg: crate::seeding::SeedingConfig,
     ctx: &mut ThreadCtx,
-) -> (Vec<Anchor>, usize) {
+) -> (Vec<Anchor>, usize, u32) {
     let table = if read.seq.len() >= cfg.long_read_threshold {
         &index.long
     } else {
@@ -104,12 +105,16 @@ fn seed_one(
         &mut ctx.buckets_scratch,
     );
 
+    let mut min_occ: u32 = u32::MAX;
     for (m_idx, m) in mins.iter().enumerate() {
         let (start, end) = match ctx.buckets_scratch[m_idx] {
             Some(range) => range,
             None => continue,
         };
         let bucket_len = end - start;
+        if bucket_len >= 1 {
+            min_occ = min_occ.min(bucket_len as u32);
+        }
         if bucket_len == 0 || bucket_len > cfg.max_occ {
             continue;
         }
@@ -130,16 +135,31 @@ fn seed_one(
             }
         }
 
-        let k_hits = if bucket_len <= 8 {
-            8
-        } else if bucket_len <= 32 {
-            4
-        } else {
-            2
+        // Keep up to 64 occurrences per minimizer (was 2-8). The old cap kept only the
+        // lowest-coordinate copies, which collapsed every read of a dispersed repeat onto
+        // ONE copy (over-pile -> false-positive SNPs AND recall dilution at the true copies).
+        // Seeding the moderate-repeat copies lets chaining rank each read's TRUE copy first
+        // (it has the most consistent minimizer hits — it matches the read at full length),
+        // so the read is placed where it actually belongs rather than at the lowest copy.
+        let k_hits = {
+            static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("KIRA_K_HITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &usize| k >= 1)
+                    .unwrap_or(64)
+            })
         };
-        ctx.occs
-            .sort_by_key(|(rid, pos, strand)| (*rid, *pos, *strand as u8));
+        // Keep the take_n smallest by (rid,pos,strand). Partition, not full sort:
+        // proto accumulation is order-independent, so anchors are identical (O(n)).
         let take_n = k_hits.min(ctx.occs.len());
+        if take_n < ctx.occs.len() {
+            ctx.occs
+                .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
+                    (*rid, *pos, *strand as u8)
+                });
+        }
         for &(rid, pos, strand) in ctx.occs[..take_n].iter() {
             let is_rev = strand != m.strand;
             let read_pos = if is_rev {
@@ -213,7 +233,8 @@ fn seed_one(
         ctx.anchors.push(anchor);
     }
 
-    (std::mem::take(&mut ctx.anchors), before)
+    let min_occ = if min_occ == u32::MAX { 1 } else { min_occ };
+    (std::mem::take(&mut ctx.anchors), before, min_occ)
 }
 
 /// Run exact-match extension around an anchor candidate.

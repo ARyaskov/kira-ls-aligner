@@ -60,6 +60,7 @@ fn r1_record() -> ReadRecord {
         seq: vec![b'A'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R1,
+        repeat_min_occ: 1,
     }
 }
 
@@ -69,6 +70,7 @@ fn r2_record() -> ReadRecord {
         seq: vec![b'T'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R2,
+        repeat_min_occ: 1,
     }
 }
 
@@ -78,6 +80,7 @@ fn unpaired_record() -> ReadRecord {
         seq: vec![b'A'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     }
 }
 

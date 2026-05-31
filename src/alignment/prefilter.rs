@@ -251,8 +251,9 @@ pub fn prefilter_chain(
         };
     }
 
-    let min_id_x10000 = (accept_min_identity * 100.0).round() as u16;
-    if id_x10000 < min_id_x10000 || id_x10000 < 9_850 {
+    let cfg_floor = (accept_min_identity * 100.0).round() as u16;
+    let eff_floor = ungap_min_id().unwrap_or(cfg_floor);
+    if id_x10000 < eff_floor {
         return PrefilterOutcome {
             result: PrefilterResult::Fallback,
             metrics: Some(metrics),
@@ -298,6 +299,19 @@ pub(crate) fn min_len_required(
     let floor = (read_len * 85) / 100;
     floor.max(min_len)
 }
+static UNGAP_TAIL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[inline]
+fn tail_ext_enabled() -> bool {
+    *UNGAP_TAIL.get_or_init(|| std::env::var("KIRA_UNGAP_TAIL").map(|v| v != "0").unwrap_or(true))
+}
+/// Optional override of the ungapped-accept identity floor (x10000). When set, divergent
+/// (variant-bearing) reads above this identity are accepted ungapped full-length instead of
+/// falling to the DP path where they tend to be soft-clipped over the variant or MAPQ-zeroed.
+/// The hard mismatch cap still routes true indel reads (frameshift = many mismatches) to DP.
+fn ungap_min_id() -> Option<u16> {
+    static V: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("KIRA_UNGAP_MINID").ok().and_then(|s| s.parse().ok()))
+}
 fn ungapped_extend(
     read_seq: &[u8],
     ref_seq: &[u8],
@@ -314,10 +328,12 @@ fn ungapped_extend(
     let max_right = (read_len as u32 - chain.read_end).min(ref_len as u32 - chain.ref_end) as usize;
 
     let block = 32usize;
+    let tail = tail_ext_enabled();
     let mut score = 0i32;
     let mut best = 0i32;
 
     let mut i = 0usize;
+    let mut broke = false;
     while i + block <= max_left {
         let read_off = chain.read_start as usize - i - block;
         let ref_off = chain.ref_start as usize - i - block;
@@ -331,14 +347,33 @@ fn ungapped_extend(
             best = score;
             left = i + block;
         } else if best - score > cfg.xdrop {
+            broke = true;
             break;
         }
         i += block;
+    }
+    // Extend through the final sub-block remainder so reads are not soft-clipped to a 32bp
+    // granularity (a systematic clip source that disproportionately drops the divergent ends
+    // of variant-bearing reads). Skip if the block walk already x-dropped out.
+    if tail && !broke && i < max_left {
+        let rem = max_left - i;
+        let read_off = chain.read_start as usize - i - rem;
+        let ref_off = chain.ref_start as usize - i - rem;
+        let mism = simd::count_mismatches(
+            &read_seq[read_off..read_off + rem],
+            &ref_seq[ref_off..ref_off + rem],
+        ) as i32;
+        let matches = rem as i32 - mism;
+        score += matches * cfg.match_score - mism * cfg.mismatch;
+        if score > best {
+            left = i + rem;
+        }
     }
 
     score = 0;
     best = 0;
     i = 0;
+    broke = false;
     while i + block <= max_right {
         let read_off = chain.read_end as usize + i;
         let ref_off = chain.ref_end as usize + i;
@@ -352,9 +387,24 @@ fn ungapped_extend(
             best = score;
             right = i + block;
         } else if best - score > cfg.xdrop {
+            broke = true;
             break;
         }
         i += block;
+    }
+    if tail && !broke && i < max_right {
+        let rem = max_right - i;
+        let read_off = chain.read_end as usize + i;
+        let ref_off = chain.ref_end as usize + i;
+        let mism = simd::count_mismatches(
+            &read_seq[read_off..read_off + rem],
+            &ref_seq[ref_off..ref_off + rem],
+        ) as i32;
+        let matches = rem as i32 - mism;
+        score += matches * cfg.match_score - mism * cfg.mismatch;
+        if score > best {
+            right = i + rem;
+        }
     }
 
     (left, right)

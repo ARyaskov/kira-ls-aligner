@@ -1,11 +1,15 @@
+pub mod ac_batch;
 pub mod bitpacked;
 pub mod cgk;
 pub mod junc_bed;
+pub mod lsh_rescue;
 pub mod myers;
 pub mod prefilter;
 pub mod router;
 pub mod spectral;
 pub mod splice;
+#[cfg(target_arch = "x86_64")]
+pub mod sw_int8_vnni;
 pub mod wfa;
 
 use crate::seq::reverse_complement_into;
@@ -86,6 +90,9 @@ pub enum FastPathKind {
     SpectralSieve,
     /// Wavefront Alignment — affine-gap semi-global, handles indels.
     Wfa,
+    /// SimHash-LSH fuzzy-seed rescue: catches reads with 1-2 mismatches
+    /// that the exact-minimizer cascade missed. Ungapped only.
+    LshRescue,
     /// CGK-rescued alignment: cascade exhausted its primary path.
     CgkRescue,
 }
@@ -105,6 +112,12 @@ pub fn try_fast_dp_alignment(
         return result;
     }
     let strand = if is_rev { Strand::Reverse } else { Strand::Forward };
+    // SimHash-LSH is mismatch-only and cheaper to verify than CGK's WFA
+    // candidate scan, so probe it first; CGK still picks up indel-bearing
+    // reads after.
+    if let Some(aln) = lsh_rescue::try_lsh_fallback(read_seq, strand) {
+        return Some((aln, FastPathKind::LshRescue));
+    }
     if let Some(aln) = cgk::try_cgk_fallback(read_seq, strand) {
         return Some((aln, FastPathKind::CgkRescue));
     }
@@ -758,6 +771,8 @@ pub fn align_batch_simd(
 
     let sw_results: Vec<SwResult> = match mode {
         #[cfg(target_arch = "x86_64")]
+        SimdMode::AvxVnni => unsafe { sw_dispatch_avx_vnni(inputs, cfg, read_len) },
+        #[cfg(target_arch = "x86_64")]
         SimdMode::Avx2 => unsafe { sw_batch_avx2(inputs, cfg) },
         #[cfg(target_arch = "aarch64")]
         SimdMode::Neon => unsafe { sw_batch_neon(inputs, cfg) },
@@ -806,14 +821,14 @@ fn align_chain_from_window_with_meta(
     )
 }
 
-struct SwResult {
-    ref_start: u32,
-    ref_end: u32,
-    read_start: i32,
-    read_end: i32,
-    score: i32,
-    cigar: Vec<CigarOp>,
-    early_abort: bool,
+pub(crate) struct SwResult {
+    pub ref_start: u32,
+    pub ref_end: u32,
+    pub read_start: i32,
+    pub read_end: i32,
+    pub score: i32,
+    pub cigar: Vec<CigarOp>,
+    pub early_abort: bool,
 }
 
 fn build_alignment(
@@ -874,6 +889,17 @@ fn build_alignment(
         xs_strand: None,
         mate: MateInfo::default(),
     }
+}
+
+/// Scalar banded Smith-Waterman — also the fallback for INT8 lanes that saturate.
+pub(crate) fn banded_sw_internal(
+    read: &[u8],
+    reference: &[u8],
+    offset: i32,
+    cfg: AlignmentConfig,
+    abort_score: i32,
+) -> SwResult {
+    banded_sw(read, reference, offset, cfg, abort_score)
 }
 
 fn banded_sw(
@@ -1083,7 +1109,7 @@ fn prev_diag(
     Some((h, score))
 }
 
-fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
+pub(crate) fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
     if let Some(last) = cigar.last_mut() {
         if last.op == op {
             last.len += len;
@@ -1212,6 +1238,34 @@ impl SwAvx2Scratch {
 thread_local! {
     static SW_SCRATCH: std::cell::RefCell<SwAvx2Scratch> =
         const { std::cell::RefCell::new(SwAvx2Scratch::new()) };
+}
+
+/// Dispatcher between the i8 (32-lane) and i16 (16-lane) AVX2 paths.
+///
+/// When the i8 path is viable for this read length and scoring, take it; the
+/// kernel internally per-lane-falls-back to scalar SW if any cell saturates.
+/// Otherwise split the batch into 16-wide AVX2 i16 calls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn sw_dispatch_avx_vnni(
+    inputs: &[BatchInput<'_>],
+    cfg: AlignmentConfig,
+    read_len: usize,
+) -> Vec<SwResult> {
+    if sw_int8_vnni::int8_path_viable(read_len, cfg)
+        && inputs.len() <= sw_int8_vnni::LANES
+    {
+        // SAFETY: target_feature on this function already enabled avx2+avxvnni.
+        return unsafe { sw_int8_vnni::sw_batch_int8(inputs, cfg) };
+    }
+    // Fall through to the i16 path; it caps at 16 lanes per call.
+    let mut results = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(16) {
+        // SAFETY: avx2 is enabled.
+        let part = unsafe { sw_batch_avx2(chunk, cfg) };
+        results.extend(part);
+    }
+    results
 }
 
 /// 16-lane i16 SIMD Smith-Waterman.

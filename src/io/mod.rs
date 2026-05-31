@@ -135,6 +135,7 @@ impl ReadStream {
                     seq,
                     qual,
                     pair_role: PairRole::Unpaired,
+                    repeat_min_occ: 1,
                 });
 
                 let consumed = self.readers[idx]
@@ -195,12 +196,14 @@ impl ReadStream {
                         seq: seq1,
                         qual: qual1,
                         pair_role: PairRole::R1,
+                        repeat_min_occ: 1,
                     });
                     reads.push(ReadRecord {
                         id: id2,
                         seq: seq2,
                         qual: qual2,
                         pair_role: PairRole::R2,
+                        repeat_min_occ: 1,
                     });
 
                     let consumed1 = self.readers[0]
@@ -251,12 +254,14 @@ impl ReadStream {
                         seq: seq1,
                         qual: qual1,
                         pair_role: PairRole::R1,
+                        repeat_min_occ: 1,
                     });
                     reads.push(ReadRecord {
                         id: id2,
                         seq: seq2,
                         qual: qual2,
                         pair_role: PairRole::R2,
+                        repeat_min_occ: 1,
                     });
 
                     let consumed = self.readers[0]
@@ -795,6 +800,15 @@ impl SamWriter {
         })
     }
 
+    /// Build a writer over an arbitrary sink (e.g. an in-memory [`VecSink`]),
+    /// for in-process pipelines that consume SAM without touching disk.
+    pub fn from_writer(writer: Box<dyn Write + Send>, reference: Reference) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(1 << 20, writer),
+            formatter: SamFormatter::new(std::sync::Arc::new(reference)),
+        }
+    }
+
     /// Borrow the formatting half.
     pub fn formatter(&self) -> &SamFormatter {
         &self.formatter
@@ -875,6 +889,23 @@ impl SamWriter {
 
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush().context("flush SAM output")?;
+        Ok(())
+    }
+}
+
+/// In-memory `Write` sink backed by a shared `Vec<u8>`. Lets a [`SamWriter`]
+/// emit SAM bytes into RAM (for in-process pipelines) instead of a file. The
+/// caller keeps a clone of the `Arc` to read the bytes back after the writer
+/// is flushed and dropped.
+#[derive(Clone)]
+pub struct VecSink(pub std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for VecSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("VecSink mutex").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }

@@ -1,3 +1,4 @@
+pub mod lsh;
 pub mod tiling;
 
 use std::fs::{File, OpenOptions};
@@ -768,6 +769,57 @@ impl Index {
             .map(|(i, s)| (i as u32, s.bases(self.mmap_bytes())))
             .collect();
         crate::alignment::cgk::CgkIndex::build_from_sequences(scheme, stride, seqs)
+    }
+
+    /// Build a SimHash-LSH side-index from this `Index`'s reference contigs.
+    pub fn build_lsh_index(
+        &self,
+        window_len: usize,
+        stride: usize,
+        top_bits: u32,
+    ) -> crate::index::lsh::LshIndex {
+        let seqs: Vec<(u32, &[u8])> = self
+            .reference
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as u32, s.bases(self.mmap_bytes())))
+            .collect();
+        crate::index::lsh::LshIndex::build_parallel(seqs, window_len, stride, top_bits)
+    }
+
+    /// Convenience: build the LSH index AND owned base copies, and install
+    /// it as the process-global rescue. Returns the total entry count for
+    /// telemetry.
+    pub fn install_lsh_rescue(
+        &self,
+        cfg: crate::alignment::AlignmentConfig,
+        window_len: usize,
+        stride: usize,
+        top_bits: u32,
+        max_candidates: usize,
+        max_lsh_hamming: u32,
+        max_window_mismatches: u32,
+    ) -> Result<usize> {
+        let index = self.build_lsh_index(window_len, stride, top_bits);
+        let entries = index.entry_count();
+        let ref_bases: Vec<Vec<u8>> = self
+            .reference
+            .sequences
+            .iter()
+            .map(|s| s.bases(self.mmap_bytes()).to_vec())
+            .collect();
+        let rescue = crate::alignment::lsh_rescue::LshRescue {
+            index,
+            ref_bases,
+            cfg,
+            max_candidates,
+            max_lsh_hamming,
+            max_window_mismatches,
+        };
+        crate::alignment::lsh_rescue::set_global_rescue(rescue)
+            .map_err(|e| anyhow::anyhow!("install LSH rescue: {}", e))?;
+        Ok(entries)
     }
 
     /// Convenience: build the CGK index AND owned base copies.

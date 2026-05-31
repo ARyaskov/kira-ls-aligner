@@ -28,6 +28,7 @@ fn mk_read(id: &str, seq_len: usize) -> ReadRecord {
         seq: vec![b'A'; seq_len],
         qual: None,
         pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
     }
 }
 
