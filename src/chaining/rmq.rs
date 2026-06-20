@@ -7,7 +7,12 @@ pub struct ChainingStats {
     pub chains_pruned: usize,
 }
 
-/// RMQ/Fenwick O(n log n) chaining; replaces quadratic DP within bands.
+/// Bounded predecessor chaining in the style of minimap2's short-range DP.
+///
+/// A scalar Fenwick maximum is not sufficient here because transition cost
+/// depends on both query/reference distance and diagonal drift. We keep a
+/// coordinate-sorted window of predecessor candidates and score each valid
+/// transition explicitly. `rmq_window` bounds work per anchor.
 pub fn chain_anchors_rmq(
     anchors: &[Anchor],
     cfg: ChainingConfig,
@@ -16,11 +21,16 @@ pub fn chain_anchors_rmq(
     if anchors.is_empty() {
         return Vec::new();
     }
-    let mut filtered: Vec<Anchor> = anchors.to_vec();
-    filtered.sort_by_key(|a| (a.ref_id, u8::from(a.strand), a.ref_start, a.read_start));
+
+    let mut filtered = anchors.to_vec();
     if filtered.len() > cfg.max_anchors {
+        // Keep informative anchors without preferring low reference
+        // coordinates, then restore coordinate order for chaining.
+        filtered.select_nth_unstable_by_key(cfg.max_anchors, anchor_rank_key);
         filtered.truncate(cfg.max_anchors);
+        stats.chains_pruned += anchors.len() - filtered.len();
     }
+    filtered.sort_by_key(anchor_coord_key);
 
     let mut chains = Vec::new();
     let mut start = 0usize;
@@ -33,219 +43,211 @@ pub fn chain_anchors_rmq(
         {
             end += 1;
         }
-        let group = &filtered[start..end];
-        let tuned = tune_cfg_mild(cfg, group);
-        // let tuned = tune_cfg_aggressive(cfg, group);
-        let mut group_chains = chain_group_rmq(group, tuned, stats);
-        chains.append(&mut group_chains);
+        chains.extend(chain_group(&filtered[start..end], cfg, stats));
         start = end;
     }
 
-    chains.sort_by_key(|c| std::cmp::Reverse(c.score));
-    if chains.len() > cfg.max_chains {
-        chains.truncate(cfg.max_chains);
-    }
+    chains.sort_by_key(|c| {
+        (
+            std::cmp::Reverse(c.score),
+            c.ref_id,
+            u8::from(c.strand),
+            c.ref_start,
+            c.read_start,
+        )
+    });
+    dedup_near_identical_chains(&mut chains);
+    chains.truncate(cfg.max_chains);
     chains
 }
 
-fn chain_group_rmq(
-    anchors: &[Anchor],
-    cfg: ChainingConfig,
-    stats: &mut ChainingStats,
-) -> Vec<Chain> {
+fn chain_group(anchors: &[Anchor], cfg: ChainingConfig, stats: &mut ChainingStats) -> Vec<Chain> {
     let n = anchors.len();
     if n == 0 {
         return Vec::new();
     }
     stats.anchors_used += n;
 
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by_key(|&i| (anchors[i].ref_end, anchors[i].read_end));
-
-    let mut read_ends: Vec<u32> = indices.iter().map(|&i| anchors[i].read_end).collect();
-    read_ends.sort_unstable();
-    read_ends.dedup();
-
-    let mut fenwick = Fenwick::new(read_ends.len());
-
     let mut dp = vec![0i32; n];
-    let mut prev = vec![None::<usize>; n];
-    let mut best_score = 0i32;
+    let mut prev = vec![None; n];
+    let mut has_successor = vec![false; n];
+    let predecessor_limit = cfg.rmq_window.max(1);
 
-    for &idx in indices.iter() {
-        let cur = &anchors[idx];
-        let pos = lower_bound_u32(&read_ends, cur.read_start);
-        let (best_val, best_idx) = fenwick.query(pos);
-        let mut score = cur.score;
-        if let Some(j) = best_idx {
-            let prev_a = &anchors[j];
-            let dq = cur.read_start as i32 - prev_a.read_end as i32;
-            let dr = cur.ref_start as i32 - prev_a.ref_end as i32;
-            if dq >= 0 && dr >= 0 {
-                let gap = dq.max(dr);
-                if gap as u32 <= cfg.max_dist {
-                    let penalty = gap_penalty(gap, cfg);
-                    score = (best_val + cur.score - penalty).max(score);
-                    if score > cur.score {
-                        prev[idx] = Some(j);
-                    }
-                }
+    for i in 0..n {
+        let cur = &anchors[i];
+        dp[i] = cur.score.max(anchor_len(cur) as i32);
+        let mut examined = 0usize;
+        let scan_limit = predecessor_limit.saturating_mul(4);
+
+        for (scanned, j) in (0..i).rev().enumerate() {
+            let candidate = &anchors[j];
+            let ref_delta = cur.ref_start.saturating_sub(candidate.ref_start);
+            if ref_delta > cfg.max_dist {
+                break;
+            }
+            if examined >= predecessor_limit || scanned >= scan_limit {
+                break;
+            }
+
+            let Some(transition) = transition_score(candidate, cur, cfg) else {
+                continue;
+            };
+            examined += 1;
+            let score = dp[j].saturating_add(transition);
+            if score > dp[i] {
+                dp[i] = score;
+                prev[i] = Some(j);
             }
         }
-        dp[idx] = score;
-        best_score = best_score.max(score);
-
-        // prune dominated anchors early
-        if best_score - score > cfg.gap_open * 2 {
-            stats.chains_pruned += 1;
-            continue;
+        if let Some(j) = prev[i] {
+            has_successor[j] = true;
         }
-
-        let key = lower_bound_u32(&read_ends, cur.read_end);
-        fenwick.update(key, score, idx);
     }
 
-    build_chains(anchors, &dp, &prev, cfg.max_chains)
+    let mut endpoints: Vec<usize> = (0..n).filter(|&i| !has_successor[i]).collect();
+    endpoints.sort_by_key(|&i| std::cmp::Reverse(dp[i]));
+    if endpoints.is_empty() {
+        endpoints.extend(0..n);
+        endpoints.sort_by_key(|&i| std::cmp::Reverse(dp[i]));
+    }
+
+    endpoints
+        .into_iter()
+        .take(cfg.max_chains.saturating_mul(2).max(1))
+        .filter_map(|end| build_chain(anchors, &dp, &prev, end))
+        .collect()
 }
 
-fn build_chains(
+fn transition_score(prev: &Anchor, cur: &Anchor, cfg: ChainingConfig) -> Option<i32> {
+    if cur.read_start <= prev.read_start || cur.ref_start <= prev.ref_start {
+        return None;
+    }
+    let dq = cur.read_start - prev.read_start;
+    let dr = cur.ref_start - prev.ref_start;
+    if dq.max(dr) > cfg.max_dist {
+        return None;
+    }
+
+    let query_overlap = prev.read_end.saturating_sub(cur.read_start);
+    let ref_overlap = prev.ref_end.saturating_sub(cur.ref_start);
+    let overlap = query_overlap.max(ref_overlap);
+    let contribution = anchor_len(cur).saturating_sub(overlap) as i32;
+    if contribution <= 0 {
+        return None;
+    }
+
+    let q_gap = cur.read_start.saturating_sub(prev.read_end) as i32;
+    let r_gap = cur.ref_start.saturating_sub(prev.ref_end) as i32;
+    let diagonal_error = (q_gap - r_gap).unsigned_abs() as i32;
+    let penalty = if diagonal_error == 0 {
+        0
+    } else {
+        let log_penalty = ((diagonal_error + 1) as f32).log2() * cfg.log_gap;
+        cfg.gap_open
+            .saturating_add(cfg.gap_extend.saturating_mul(diagonal_error))
+            .saturating_add(log_penalty.round() as i32)
+    };
+    Some(contribution.saturating_sub(penalty))
+}
+
+fn build_chain(
     anchors: &[Anchor],
     dp: &[i32],
     prev: &[Option<usize>],
-    max_chains: usize,
-) -> Vec<Chain> {
-    let n = anchors.len();
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by_key(|&i| std::cmp::Reverse(dp[i]));
-    let mut used = vec![false; n];
-    let mut chains = Vec::new();
+    endpoint: usize,
+) -> Option<Chain> {
+    let mut path = Vec::new();
+    let mut cur = Some(endpoint);
+    while let Some(i) = cur {
+        path.push(anchors[i].clone());
+        cur = prev[i];
+    }
+    path.reverse();
+    let first = path.first()?;
+    let last = path.last()?;
+    Some(Chain {
+        score: dp[endpoint],
+        ref_id: first.ref_id,
+        read_start: first.read_start,
+        read_end: last.read_end,
+        ref_start: first.ref_start,
+        ref_end: last.ref_end,
+        strand: first.strand,
+        anchors: path,
+    })
+}
 
-    for &idx in indices.iter() {
-        if used[idx] {
-            continue;
-        }
-        let mut chain_anchors = Vec::new();
-        let mut cur = Some(idx);
-        while let Some(i) = cur {
-            used[i] = true;
-            chain_anchors.push(anchors[i].clone());
-            cur = prev[i];
-        }
-        chain_anchors.reverse();
-        if chain_anchors.is_empty() {
-            continue;
-        }
-        let ref_id = chain_anchors[0].ref_id;
-        let strand = chain_anchors[0].strand;
-        let read_start = chain_anchors.first().unwrap().read_start;
-        let read_end = chain_anchors.last().unwrap().read_end;
-        let ref_start = chain_anchors.first().unwrap().ref_start;
-        let ref_end = chain_anchors.last().unwrap().ref_end;
-        let score = dp[idx];
-        chains.push(Chain {
-            anchors: chain_anchors,
-            score,
-            ref_id,
-            read_start,
-            read_end,
-            ref_start,
-            ref_end,
-            strand,
+fn dedup_near_identical_chains(chains: &mut Vec<Chain>) {
+    let mut kept: Vec<Chain> = Vec::with_capacity(chains.len());
+    for chain in chains.drain(..) {
+        let duplicate = kept.iter().any(|other| {
+            if chain.ref_id != other.ref_id || chain.strand != other.strand {
+                return false;
+            }
+            let q_overlap = interval_overlap(
+                chain.read_start,
+                chain.read_end,
+                other.read_start,
+                other.read_end,
+            );
+            let r_overlap = interval_overlap(
+                chain.ref_start,
+                chain.ref_end,
+                other.ref_start,
+                other.ref_end,
+            );
+            let q_short = (chain.read_end - chain.read_start)
+                .min(other.read_end - other.read_start)
+                .max(1);
+            let r_short = (chain.ref_end - chain.ref_start)
+                .min(other.ref_end - other.ref_start)
+                .max(1);
+            q_overlap.saturating_mul(100) / q_short >= 90
+                && r_overlap.saturating_mul(100) / r_short >= 90
         });
-        if chains.len() >= max_chains {
-            break;
+        if !duplicate {
+            kept.push(chain);
         }
     }
-    chains
+    *chains = kept;
 }
 
-fn gap_penalty(gap: i32, cfg: ChainingConfig) -> i32 {
-    if gap <= 0 {
-        return 0;
-    }
-    let log_pen = (gap as f32 + 1.0).ln() * cfg.log_gap;
-    cfg.gap_open + cfg.gap_extend * gap + log_pen.round() as i32
+#[inline]
+fn interval_overlap(a0: u32, a1: u32, b0: u32, b1: u32) -> u32 {
+    a1.min(b1).saturating_sub(a0.max(b0))
 }
 
-fn tune_cfg_mild(cfg: ChainingConfig, anchors: &[Anchor]) -> ChainingConfig {
-    let mut tuned = cfg;
-    let n = anchors.len();
-    if n >= 4096 {
-        tuned.max_dist = (cfg.max_dist as f32 * 0.85).max(64.0) as u32;
-        tuned.gap_open = (cfg.gap_open as f32 * 1.10).round() as i32;
-        tuned.log_gap = cfg.log_gap * 1.05;
-    } else if n >= 1024 {
-        tuned.max_dist = (cfg.max_dist as f32 * 0.90).max(64.0) as u32;
-        tuned.gap_open = (cfg.gap_open as f32 * 1.05).round() as i32;
-        tuned.log_gap = cfg.log_gap * 1.02;
-    }
-    tuned
+#[inline]
+fn anchor_len(anchor: &Anchor) -> u32 {
+    anchor
+        .read_end
+        .saturating_sub(anchor.read_start)
+        .min(anchor.ref_end.saturating_sub(anchor.ref_start))
 }
 
-#[allow(dead_code)]
-fn tune_cfg_aggressive(cfg: ChainingConfig, anchors: &[Anchor]) -> ChainingConfig {
-    let mut tuned = cfg;
-    let n = anchors.len();
-    if n >= 4096 {
-        tuned.max_dist = (cfg.max_dist as f32 * 0.70).max(48.0) as u32;
-        tuned.gap_open = (cfg.gap_open as f32 * 1.25).round() as i32;
-        tuned.log_gap = cfg.log_gap * 1.12;
-    } else if n >= 1024 {
-        tuned.max_dist = (cfg.max_dist as f32 * 0.80).max(48.0) as u32;
-        tuned.gap_open = (cfg.gap_open as f32 * 1.15).round() as i32;
-        tuned.log_gap = cfg.log_gap * 1.08;
-    }
-    tuned
+fn anchor_coord_key(anchor: &Anchor) -> (u32, u8, u32, u32, u32, u32) {
+    (
+        anchor.ref_id,
+        u8::from(anchor.strand),
+        anchor.ref_start,
+        anchor.read_start,
+        anchor.ref_end,
+        anchor.read_end,
+    )
 }
 
-fn lower_bound_u32(arr: &[u32], value: u32) -> usize {
-    let mut left = 0usize;
-    let mut right = arr.len();
-    while left < right {
-        let mid = (left + right) / 2;
-        if arr[mid] < value {
-            left = mid + 1;
-        } else {
-            right = mid;
-        }
-    }
-    left.min(arr.len().saturating_sub(1))
-}
-
-struct Fenwick {
-    n: usize,
-    tree: Vec<(i32, Option<usize>)>,
-}
-
-impl Fenwick {
-    fn new(n: usize) -> Self {
-        Self {
-            n,
-            tree: vec![(i32::MIN / 4, None); n + 1],
-        }
-    }
-
-    fn update(&mut self, mut idx: usize, val: i32, anchor_idx: usize) {
-        idx += 1;
-        while idx <= self.n {
-            if val > self.tree[idx].0 {
-                self.tree[idx] = (val, Some(anchor_idx));
-            }
-            idx += idx & (!idx + 1);
-        }
-    }
-
-    fn query(&self, mut idx: usize) -> (i32, Option<usize>) {
-        idx += 1;
-        let mut best = (i32::MIN / 4, None);
-        while idx > 0 {
-            if self.tree[idx].0 > best.0 {
-                best = self.tree[idx];
-            }
-            idx &= idx - 1;
-        }
-        best
-    }
+fn anchor_rank_key(anchor: &Anchor) -> (std::cmp::Reverse<i32>, u64) {
+    let mut x = ((anchor.ref_id as u64) << 32)
+        ^ anchor.ref_start as u64
+        ^ ((anchor.read_start as u64) << 17)
+        ^ ((u8::from(anchor.strand) as u64) << 63);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    (
+        std::cmp::Reverse(anchor.score.max(anchor_len(anchor) as i32)),
+        x.wrapping_mul(0x94d0_49bb_1331_11eb) ^ (x >> 31),
+    )
 }
 
 impl From<Strand> for u8 {

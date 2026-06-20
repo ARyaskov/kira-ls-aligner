@@ -10,9 +10,7 @@ use std::io::BufReader;
 
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::alignment::junc_bed::JunctionIndex;
-use kira_ls_aligner::alignment::splice::{
-    SpliceConfig, SpliceStrandPolicy, align_spliced_chain,
-};
+use kira_ls_aligner::alignment::splice::{SpliceConfig, SpliceStrandPolicy, align_spliced_chain};
 use kira_ls_aligner::types::{
     Anchor, Chain, CigarKind, PairRole, ReadRecord, RefBases, RefSeq, Reference, Strand,
 };
@@ -22,7 +20,9 @@ fn synth_dna(seed: u64, len: usize) -> Vec<u8> {
     let bases = b"ACGT";
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(bases[(s >> 33) as usize & 3]);
     }
     out
@@ -139,7 +139,11 @@ fn non_canonical_signal_with_bed_match_emits_n() {
          {:?}",
         aln.cigar
     );
-    assert_eq!(aln.xs_strand, Some(Strand::Forward), "BED strand should win");
+    assert_eq!(
+        aln.xs_strand,
+        Some(Strand::Forward),
+        "BED strand should win"
+    );
 }
 
 #[test]
@@ -157,8 +161,8 @@ fn no_bed_with_non_canonical_signal_and_require_emits_d() {
         polya_min_len: 10,
     };
     // No junc-bed → require_signal=true rejects non-canonical → D op.
-    let aln = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2)
-        .unwrap();
+    let aln =
+        align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2).unwrap();
 
     let has_n = aln.cigar.iter().any(|op| op.op == CigarKind::Skipped);
     assert!(

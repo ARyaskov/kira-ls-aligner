@@ -113,7 +113,11 @@ fn sub_near_parity_yields_low_mapq() {
     let mut alns = vec![aln];
     assign_mapq(&mut alns, 150, cfg(), None, 1);
     // floor=75, span=75, diff=2 → mapq = 2·60/75 = 1.
-    assert!(alns[0].mapq <= 2, "near-parity sub should yield very low MAPQ, got {}", alns[0].mapq);
+    assert!(
+        alns[0].mapq <= 2,
+        "near-parity sub should yield very low MAPQ, got {}",
+        alns[0].mapq
+    );
 }
 
 #[test]
@@ -144,6 +148,50 @@ fn no_xs_score_keeps_cap() {
     assign_mapq(&mut alns, 150, cfg(), None, 1);
     assert_eq!(alns[0].mapq, 60);
     assert_eq!(alns[0].xs_score, None);
+}
+
+#[test]
+fn opposite_strand_overlap_uses_original_query_coordinates() {
+    let primary = make_aln(300, 100, 300, 0);
+    let mut reverse = make_aln(280, 700, 900, 1);
+    reverse.is_rev = true;
+    let mut alns = vec![primary, reverse];
+    assign_mapq(&mut alns, 1000, cfg(), None, 1);
+    assert!(alns[1].is_secondary);
+    assert!(!alns[1].is_supplementary);
+}
+
+#[test]
+fn low_fastq_quality_caps_mapq() {
+    let mut alns = vec![make_aln(150, 0, 150, 0)];
+    let qual = vec![b'+'; 150]; // Phred Q10
+    assign_mapq_with_qual(&mut alns, 150, Some(&qual), cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 20);
+}
+
+#[test]
+fn paired_primary_lock_survives_higher_single_end_score() {
+    let locked = make_aln(140, 0, 150, 0);
+    let higher = make_aln(150, 0, 150, 1);
+    let mut alns = vec![locked, higher];
+    assign_mapq_preserving_primary(&mut alns, 150, None, cfg(), None, 1);
+    assert_eq!(alns[0].ref_id, 0);
+    assert!(!alns[0].is_secondary);
+    assert!(alns[1].is_secondary);
+}
+
+#[test]
+fn low_seed_copy_count_does_not_destroy_unique_mapq() {
+    let mut alns = vec![make_aln(150, 0, 150, 0)];
+    assign_mapq(&mut alns, 150, cfg(), None, 2);
+    assert_eq!(alns[0].mapq, 60);
+}
+
+#[test]
+fn highly_repetitive_seed_set_caps_mapq() {
+    let mut alns = vec![make_aln(150, 0, 150, 0)];
+    assign_mapq(&mut alns, 150, cfg(), None, 200);
+    assert_eq!(alns[0].mapq, 3);
 }
 
 fn pair_ctx() -> PairMapqContext {

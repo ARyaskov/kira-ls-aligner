@@ -37,7 +37,8 @@ impl ChunkWriter {
             debug_assert!(
                 read_global_idx > prev,
                 "ChunkWriter: read_global_idx must be strictly increasing (got {} after {})",
-                read_global_idx, prev
+                read_global_idx,
+                prev
             );
         }
         self.last_idx = Some(read_global_idx);

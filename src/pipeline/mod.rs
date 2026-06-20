@@ -111,10 +111,9 @@ pub struct Pipeline {
     pub junc_bed_tolerance: u32,
     /// Insert-size estimator.
     pub insert_estimator: Arc<RwLock<InsertEstimator>>,
-    /// Hybrid-aware executor. SIMD-heavy stages run on the P-pool;
-    /// light bookkeeping stages run on the E-pool. On homogeneous hosts
-    /// both lanes resolve to the same pool, so non-hybrid runs incur no
-    /// extra cost.
+    /// Hybrid-aware executor. The compute/light methods remain useful routing
+    /// labels, while both use the full selected worker set because stages are
+    /// executed serially.
     pub pool: Arc<DualPool>,
 }
 
@@ -149,11 +148,7 @@ impl Pipeline {
     }
 
     /// Attach a parsed junction annotation.
-    pub fn with_junctions(
-        mut self,
-        junctions: Option<Arc<JunctionIndex>>,
-        tolerance: u32,
-    ) -> Self {
+    pub fn with_junctions(mut self, junctions: Option<Arc<JunctionIndex>>, tolerance: u32) -> Self {
         self.junctions = junctions;
         self.junc_bed_tolerance = tolerance;
         self
@@ -161,9 +156,8 @@ impl Pipeline {
 
     /// Run only stages 1-4 (sketch → seed → chain → align).
     ///
-    /// Stage routing:
-    /// * AC batch, sketch, alignment → P-pool (SIMD-heavy hot paths).
-    /// * Seeding, chaining → E-pool (memory + scalar bookkeeping).
+    /// Stage routing labels distinguish compute-heavy and bookkeeping work;
+    /// both consume the complete configured pool.
     pub fn process_to_align_batch(
         &self,
         input: stage0_input::InputBatch,
@@ -256,7 +250,7 @@ impl Pipeline {
         let sketch_stats = sketch.stats;
         stages[0] = t0.elapsed();
 
-        // Stage 2 seeding — memory-bound hash lookups → E-pool.
+        // Stage 2 seeding — memory-bound hash lookups.
         let t1 = Instant::now();
         let seeds = self
             .pool
@@ -264,7 +258,7 @@ impl Pipeline {
         let seed_stats = seeds.stats.clone();
         stages[1] = t1.elapsed();
 
-        // Stage 3 chaining — scalar RMQ → E-pool.
+        // Stage 3 chaining — scalar predecessor DP.
         let t2 = Instant::now();
         let chains = self
             .pool
@@ -322,10 +316,11 @@ impl Pipeline {
 
         if std::env::var_os("KIRA_STATS").is_some() {
             eprintln!(
-                "[KIRA_AC] reads={} eligible={} resolved={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
+                "[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
                 ac_stats.n_reads,
                 ac_stats.reads_eligible,
                 ac_stats.reads_resolved,
+                ac_stats.reads_ambiguous,
                 ac_stats.fwd_hits,
                 ac_stats.rev_hits,
                 ac_stats.build_ms,
@@ -356,7 +351,7 @@ impl Pipeline {
             &align.reads,
             &mut align.alignments,
             &paired_cfg,
-            self.config.dp_topk.max(1),
+            self.config.dp_topk.max(2),
         );
         t_pair_rerank = tpr.elapsed();
 
@@ -414,24 +409,26 @@ impl Pipeline {
         } else {
             None
         };
-        // Stage 5 MAPQ — light scalar math → E-pool.
+        // Stage 5 MAPQ — light scalar math.
         let scored = self
             .pool
             .install_light(|| score_run(align, self.config.mapq, pair_ctx));
         let align_stats = scored.stats.clone();
         stages[4] = t4.elapsed();
 
-        // Stage 6 SAM emit — pure string formatting, fits the E-pool.
+        // Stage 6 SAM emit — pure string formatting.
         let t5 = Instant::now();
-        let sam_buf = self.pool.install_light(|| {
-            output_serialize(
-                scored,
-                formatter,
-                read_group,
-                self.config.output,
-                self.config.max_alignments,
-            )
-        });
+        // Keep the final aggregate buffer owned by the caller thread.  On
+        // Windows, repeatedly allocating it on a Rayon worker and freeing it
+        // on a writer thread makes the process retain roughly one SAM file's
+        // worth of heap across a long run.
+        let sam_buf = output_serialize(
+            scored,
+            formatter,
+            read_group,
+            self.config.output,
+            self.config.max_alignments,
+        );
         stages[5] = t5.elapsed();
 
         Ok(PipelineBatchOutput {
@@ -450,10 +447,7 @@ impl Pipeline {
 /// Move AC-stage alignments into the cascade output. Reads resolved by AC had
 /// their minimizers suppressed in stage 1, so their cascade slot is empty —
 /// we overwrite it with the perfect-match alignment(s) produced by AC.
-fn merge_ac_alignments(
-    cascade: &mut [Vec<crate::types::Alignment>],
-    mut ac: AcBatchOutput,
-) {
+fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], mut ac: AcBatchOutput) {
     debug_assert_eq!(cascade.len(), ac.alignments.len());
     for (dst, src) in cascade.iter_mut().zip(ac.alignments.iter_mut()) {
         if !src.is_empty() {

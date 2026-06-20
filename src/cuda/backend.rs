@@ -136,8 +136,7 @@ impl CudaBackend {
             let window_bytes = ref_bytes_per_window[i];
             for phase in 0..4usize {
                 let dst_lo = phase * total_ref_bytes_per_phase + offset_acc;
-                host_ref_flat[dst_lo..dst_lo + window_bytes]
-                    .copy_from_slice(&j.ref_shifted[phase]);
+                host_ref_flat[dst_lo..dst_lo + window_bytes].copy_from_slice(&j.ref_shifted[phase]);
             }
             host_ref_offsets.push(offset_acc as i32);
             host_ref_lens.push(j.ref_nucs as i32);
@@ -212,16 +211,8 @@ impl CudaBackend {
 
         let mut out_shifts: Vec<i32> = vec![0; n_reads];
         let mut out_mism: Vec<i32> = vec![0; n_reads];
-        let shifts_view = self
-            .out_shifts_buf
-            .as_ref()
-            .unwrap()
-            .slice(0..n_reads);
-        let mism_view = self
-            .out_mism_buf
-            .as_ref()
-            .unwrap()
-            .slice(0..n_reads);
+        let shifts_view = self.out_shifts_buf.as_ref().unwrap().slice(0..n_reads);
+        let mism_view = self.out_mism_buf.as_ref().unwrap().slice(0..n_reads);
         stream
             .memcpy_dtoh(&shifts_view, &mut out_shifts)
             .map_err(|e| CudaError::Runtime(e.to_string()))?;

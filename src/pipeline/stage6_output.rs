@@ -14,7 +14,13 @@ pub fn run(
     output_cfg: OutputConfig,
     max_alignments: usize,
 ) -> Result<()> {
-    let buf = serialize(input, writer.formatter(), read_group, output_cfg, max_alignments);
+    let buf = serialize(
+        input,
+        writer.formatter(),
+        read_group,
+        output_cfg,
+        max_alignments,
+    );
     writer.write_batch(&buf)
 }
 
@@ -32,19 +38,20 @@ pub fn serialize(
 
     if max_alignments > 0 {
         for alns in alignments.iter_mut() {
-            if alns.len() > max_alignments {
-                alns.truncate(max_alignments);
-            }
+            retain_reported_alignments(alns, max_alignments);
         }
     }
 
-    let triples: Vec<(ReadRecord, Vec<crate::types::Alignment>, Option<crate::types::MateInfo>)> =
-        reads
-            .into_iter()
-            .zip(alignments.into_iter())
-            .zip(unmapped_mate_info.into_iter())
-            .map(|((r, a), m)| (r, a, m))
-            .collect();
+    let triples: Vec<(
+        ReadRecord,
+        Vec<crate::types::Alignment>,
+        Option<crate::types::MateInfo>,
+    )> = reads
+        .into_iter()
+        .zip(alignments)
+        .zip(unmapped_mate_info)
+        .map(|((r, a), m)| (r, a, m))
+        .collect();
 
     let chunk_size: usize = 64;
 
@@ -86,12 +93,7 @@ pub fn serialize(
                             for (idx, aln) in alns.iter().enumerate() {
                                 let tags = if idx == 0 { extra } else { None };
                                 formatter.append_alignment(
-                                    &mut buf,
-                                    read,
-                                    aln,
-                                    read_group,
-                                    tags,
-                                    output_cfg,
+                                    &mut buf, read, aln, read_group, tags, output_cfg,
                                 );
                             }
                         }
@@ -113,4 +115,64 @@ pub fn serialize(
         out.extend_from_slice(&c);
     }
     out
+}
+
+fn retain_reported_alignments(
+    alignments: &mut Vec<crate::types::Alignment>,
+    max_alignments: usize,
+) {
+    let mut primary_or_secondary = 0usize;
+    alignments.retain(|aln| {
+        if aln.is_supplementary {
+            return true;
+        }
+        let keep = primary_or_secondary < max_alignments;
+        primary_or_secondary += 1;
+        keep
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo};
+
+    fn alignment(score: i32, supplementary: bool) -> Alignment {
+        Alignment {
+            kind: AlignmentKind::DpAligned,
+            ref_id: 0,
+            ref_start: 0,
+            ref_end: 10,
+            read_start: 0,
+            read_end: 10,
+            cigar: vec![CigarOp {
+                len: 10,
+                op: CigarKind::Match,
+            }],
+            score,
+            mapq: 0,
+            is_rev: false,
+            is_secondary: score < 100 && !supplementary,
+            is_supplementary: supplementary,
+            nm: 0,
+            md: "10".to_string(),
+            as_score: score,
+            xs_score: None,
+            xs_strand: None,
+            mate: MateInfo::default(),
+        }
+    }
+
+    #[test]
+    fn max_alignments_does_not_discard_supplementary_records() {
+        let mut alignments = vec![
+            alignment(100, false),
+            alignment(90, false),
+            alignment(80, true),
+        ];
+        retain_reported_alignments(&mut alignments, 1);
+        assert_eq!(alignments.len(), 2);
+        assert!(!alignments[0].is_supplementary);
+        assert!(alignments[1].is_supplementary);
+    }
 }

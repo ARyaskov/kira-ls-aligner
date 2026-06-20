@@ -8,7 +8,11 @@ use kira_ls_aligner::alignment::wfa::{WfaPenalties, wfa_align_semi_global};
 use kira_ls_aligner::types::{CigarKind, CigarOp};
 
 fn pen() -> WfaPenalties {
-    WfaPenalties { mismatch: 4, gap_open: 6, gap_extend: 1 }
+    WfaPenalties {
+        mismatch: 4,
+        gap_open: 6,
+        gap_extend: 1,
+    }
 }
 
 fn cigar_str(ops: &[CigarOp]) -> String {
@@ -135,7 +139,9 @@ fn replay_consistency_random() {
     let mut rng = 0xC0FFEEu64;
     for _ in 0..50 {
         let m = 20 + (xorshift(&mut rng) as usize % 80);
-        let pattern: Vec<u8> = (0..m).map(|_| bases[(xorshift(&mut rng) as usize) % 4]).collect();
+        let pattern: Vec<u8> = (0..m)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
         let mut text: Vec<u8> = pattern.clone();
         let num_errors = (xorshift(&mut rng) as usize) % 4;
         for _ in 0..num_errors {
@@ -161,7 +167,8 @@ fn replay_consistency_random() {
         let aln = wfa_align_semi_global(&pattern, &text, pen(), 80).expect("score within bound");
         let (replay_score, replay_text) = apply_cigar(&pattern, &text, &aln.cigar);
         assert_eq!(
-            replay_score, aln.score,
+            replay_score,
+            aln.score,
             "replay-score != reported-score for pattern={:?} text={:?} cigar={}",
             String::from_utf8_lossy(&pattern),
             String::from_utf8_lossy(&text),

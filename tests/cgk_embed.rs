@@ -17,7 +17,7 @@
 
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::alignment::cgk::{
-    CgkIndex, CgkRescue, DEFAULT_BANK_COUNT, FingerprintScheme, embed, EmbeddingAdvice,
+    CgkIndex, CgkRescue, DEFAULT_BANK_COUNT, EmbeddingAdvice, FingerprintScheme, embed,
 };
 use kira_ls_aligner::types::Strand;
 
@@ -120,7 +120,8 @@ fn cgk_index_recalls_indel_edited_reads() {
     // with indel-bearing copies of several known windows. Track recall.
     let scheme = FingerprintScheme::new(2024, 150, DEFAULT_BANK_COUNT);
     let ref_bases = random_dna(50_000, 12345);
-    let idx = CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
+    let idx =
+        CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
 
     let mut ins_hits = 0;
     let mut del_hits = 0;
@@ -132,10 +133,7 @@ fn cgk_index_recalls_indel_edited_reads() {
         // the window so the read still aligns naturally to the same
         // 150-byte slot. Padding with a constant ('A') would synthesise
         // an extra mismatch and turn this into a 2-edit case.
-        let next_base = ref_bases
-            .get(true_pos + 150)
-            .copied()
-            .unwrap_or(b'A');
+        let next_base = ref_bases.get(true_pos + 150).copied().unwrap_or(b'A');
         let del = apply_one_deletion(win, 60, next_base);
         let ins_cands = idx.query(&ins, 1);
         if ins_cands
@@ -181,7 +179,8 @@ fn rescue_finds_alignment_at_truth_position() {
     // the truth position with a sensible WFA score.
     let scheme = FingerprintScheme::new(0xDEADBEEF, 150, DEFAULT_BANK_COUNT);
     let ref_bases = random_dna(30_000, 42);
-    let index = CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
+    let index =
+        CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
 
     let cfg = AlignmentConfig {
         match_score: 1,

@@ -7,7 +7,7 @@ use crate::alignment::{AlignmentConfig, banded_sw_public};
 use crate::index::Index;
 use crate::seq::reverse_complement;
 use crate::types::{
-    Alignment, AlignmentKind, CigarKind, CigarOp, Chain, MateInfo, ReadRecord, Strand,
+    Alignment, AlignmentKind, Chain, CigarKind, CigarOp, MateInfo, ReadRecord, Strand,
 };
 
 /// Configuration for splice-aware alignment.
@@ -59,15 +59,13 @@ pub fn detect_splice_strand(donor: [u8; 2], acceptor: [u8; 2]) -> Option<Strand>
         acceptor[1].to_ascii_uppercase(),
     ];
     // Forward-strand canonical / near-canonical
-    let fwd_canonical = (&d, &a) == (b"GT", b"AG")
-        || (&d, &a) == (b"GC", b"AG")
-        || (&d, &a) == (b"AT", b"AC");
+    let fwd_canonical =
+        (&d, &a) == (b"GT", b"AG") || (&d, &a) == (b"GC", b"AG") || (&d, &a) == (b"AT", b"AC");
     if fwd_canonical {
         return Some(Strand::Forward);
     }
-    let rev_canonical = (&d, &a) == (b"CT", b"AC")
-        || (&d, &a) == (b"CT", b"GC")
-        || (&d, &a) == (b"GT", b"AT");
+    let rev_canonical =
+        (&d, &a) == (b"CT", b"AC") || (&d, &a) == (b"CT", b"GC") || (&d, &a) == (b"GT", b"AT");
     if rev_canonical {
         return Some(Strand::Reverse);
     }
@@ -139,17 +137,14 @@ fn refine_splice_boundary(
         if donor_pos + 2 > ref_len || acceptor_pos < 2 {
             continue;
         }
-        let donor = [
-            ref_seq[donor_pos as usize],
-            ref_seq[donor_pos as usize + 1],
-        ];
+        let donor = [ref_seq[donor_pos as usize], ref_seq[donor_pos as usize + 1]];
         let acceptor = [
             ref_seq[acceptor_pos as usize - 2],
             ref_seq[acceptor_pos as usize - 1],
         ];
         let signal_strand = detect_splice_strand(donor, acceptor);
-        let bed_strand = junctions
-            .and_then(|j| j.lookup(ref_id, donor_pos, acceptor_pos, junc_tolerance));
+        let bed_strand =
+            junctions.and_then(|j| j.lookup(ref_id, donor_pos, acceptor_pos, junc_tolerance));
 
         let confidence = if bed_strand.is_some() {
             JunctionConfidence::AnnotatedBed
@@ -363,9 +358,13 @@ pub fn align_spliced_chain(
                             r.confidence,
                             r.left_shift,
                         ),
-                        None => {
-                            (a.ref_end, next.ref_start, None, JunctionConfidence::NoSignal, 0)
-                        }
+                        None => (
+                            a.ref_end,
+                            next.ref_start,
+                            None,
+                            JunctionConfidence::NoSignal,
+                            0,
+                        ),
                     };
                 let want_n = match confidence {
                     JunctionConfidence::AnnotatedBed => true,
@@ -606,7 +605,10 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
                         ref_end = ref_end.saturating_sub(consume);
                     }
                     if remaining > 0 {
-                        tail_ops.push(CigarOp { len: remaining, op: op.op });
+                        tail_ops.push(CigarOp {
+                            len: remaining,
+                            op: op.op,
+                        });
                     }
                 }
                 CigarKind::Del | CigarKind::Skipped => {
@@ -630,7 +632,10 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
         // Coalesce trailing soft-clip with the polyA peel.
         let total_sc = tail_softclip;
         if total_sc > 0 {
-            new_cigar.push(CigarOp { len: total_sc, op: CigarKind::SoftClip });
+            new_cigar.push(CigarOp {
+                len: total_sc,
+                op: CigarKind::SoftClip,
+            });
         }
         // Adjust read_end.
         let _ = read_len;
@@ -669,7 +674,10 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
                         ref_start = ref_start.saturating_add(consume);
                     }
                     if remaining > 0 {
-                        head_ops.push(CigarOp { len: remaining, op: op.op });
+                        head_ops.push(CigarOp {
+                            len: remaining,
+                            op: op.op,
+                        });
                     }
                 }
                 CigarKind::Del | CigarKind::Skipped => {
@@ -682,7 +690,10 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
             }
         }
         if head_softclip > 0 {
-            new_cigar.push(CigarOp { len: head_softclip, op: CigarKind::SoftClip });
+            new_cigar.push(CigarOp {
+                len: head_softclip,
+                op: CigarKind::SoftClip,
+            });
         }
         new_cigar.extend(head_ops);
         read_start = read_start.saturating_add(run);

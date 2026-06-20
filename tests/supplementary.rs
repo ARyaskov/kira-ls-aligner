@@ -177,14 +177,22 @@ fn chimeric_read_emits_supplementary() {
     );
 
     let alns = &alignments[0];
-    assert_eq!(alns.len(), 2, "expected primary + 1 supplementary, got {}", alns.len());
+    assert_eq!(
+        alns.len(),
+        2,
+        "expected primary + 1 supplementary, got {}",
+        alns.len()
+    );
 
     // Slot 0 stays the primary (split-read pass is additive).
     assert!(!alns[0].is_supplementary);
 
     // The added record is on chrB and marked supplementary.
     let supp = &alns[1];
-    assert!(supp.is_supplementary, "second alignment should be is_supplementary = true");
+    assert!(
+        supp.is_supplementary,
+        "second alignment should be is_supplementary = true"
+    );
     assert_eq!(supp.ref_id, 1, "supplementary should map to chrB");
     // Read region of the supp should land in the second half (≈ [100..200])
     // — the SW kernel may shift by a few bases, so we just check the
@@ -243,10 +251,7 @@ fn no_supplementary_for_overlapping_chains() {
         repeat_min_occ: 1,
     };
     // Both chains cover read[0..100] — 100% overlap.
-    let chains = vec![vec![
-        chain(0, 100, 0, 300, 100),
-        chain(0, 100, 1, 500, 90),
-    ]];
+    let chains = vec![vec![chain(0, 100, 0, 300, 100), chain(0, 100, 1, 500, 90)]];
     let _ = b; // not used for content; the index already knows chrB exists
     let mut alignments: Vec<Vec<Alignment>> = vec![vec![primary_aln(0, 100, 0, 300)]];
 

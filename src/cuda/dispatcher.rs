@@ -4,14 +4,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use super::backend::{CudaBackend, CudaJob, CudaResult};
 use super::CudaError;
+use super::backend::{CudaBackend, CudaJob, CudaResult};
 
 /// One job submitted to the GPU worker: a batch of CudaJobs and a private reply channel for the.
-type Request = (
-    Vec<CudaJob>,
-    Sender<Result<Vec<CudaResult>, CudaError>>,
-);
+type Request = (Vec<CudaJob>, Sender<Result<Vec<CudaResult>, CudaError>>);
 
 struct DispatcherState {
     tx: Sender<Request>,

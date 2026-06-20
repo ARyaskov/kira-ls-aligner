@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use kira_ls_aligner::io::{OutputConfig, SamFormatter};
 use kira_ls_aligner::types::{
-    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases,
-    RefSeq, Reference,
+    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq,
+    Reference,
 };
 
 fn make_reference() -> Reference {
@@ -67,7 +67,10 @@ fn mk_aln(
 
 fn parse_paf(line: &[u8]) -> Vec<String> {
     let s = std::str::from_utf8(line).expect("utf-8");
-    s.trim_end_matches('\n').split('\t').map(String::from).collect()
+    s.trim_end_matches('\n')
+        .split('\t')
+        .map(String::from)
+        .collect()
 }
 
 #[test]
@@ -97,7 +100,10 @@ fn forward_primary_emits_12_cols_and_tags() {
     assert_eq!(cols[11], "60", "col 12: mapq");
     // Tags appear after col 12. Look for tp:A:P, NM:i:2, AS:i:142, dv:f:0.0133
     let tags: Vec<String> = cols.iter().skip(12).cloned().collect();
-    assert!(tags.contains(&"tp:A:P".to_string()), "tp:A:P missing in {tags:?}");
+    assert!(
+        tags.contains(&"tp:A:P".to_string()),
+        "tp:A:P missing in {tags:?}"
+    );
     assert!(tags.contains(&"NM:i:2".to_string()), "NM tag missing");
     assert!(
         tags.iter().any(|t| t.starts_with("AS:i:")),

@@ -36,3 +36,19 @@ fn paired_with_wrong_count_errors() {
     assert!(resolve_paired_mode(true, false, 1).is_err());
     assert!(resolve_paired_mode(true, false, 3).is_err());
 }
+
+#[test]
+fn full_output_defaults_to_accuracy_path() {
+    assert!(!resolve_accept_enable(None, false));
+}
+
+#[test]
+fn fast_output_defaults_to_ungapped_accept() {
+    assert!(resolve_accept_enable(None, true));
+}
+
+#[test]
+fn explicit_accept_setting_overrides_output_mode() {
+    assert!(resolve_accept_enable(Some(true), false));
+    assert!(!resolve_accept_enable(Some(false), true));
+}

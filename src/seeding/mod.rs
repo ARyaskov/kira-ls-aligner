@@ -10,6 +10,7 @@ use crate::types::{Anchor, Minimizer, ReadRecord, SeedHit, Strand};
 pub struct SeedingConfig {
     pub min_anchor_len: u32,
     pub max_occ: usize,
+    pub max_hits_per_minimizer: usize,
     pub long_read_threshold: usize,
 }
 

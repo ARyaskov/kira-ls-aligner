@@ -711,9 +711,9 @@ dependencies = [
 
 [[package]]
 name = "kira-bam"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f9b3c52fb4c07abf508d22ba1deb32c3ecdeb7bd3df055e2ba268ff98c6734d"
+checksum = "7ac51aa6f61bd3ae46885b70a9ba17274601906086dd1c1f7389960ec9c17cf9"
 dependencies = [
  "anyhow",
  "bstr",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "kira-ls-aligner"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -779,9 +779,9 @@ checksum = "02a7de5f0cf02d66f73b1b1289df74ad96b465546fe5a184d78e57fa6df608d3"
 
 [[package]]
 name = "kira_kv_engine"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d4d97ca4450ac077bc946f5038ef9f2e9006e16d5a3c39663cd301f57ca706f"
+checksum = "e9b57415f77269b4f54d9b974e8eef9e36dbe4d05477f4fa035a7ddbe7765e2b"
 dependencies = [
  "core_affinity",
  "hashbrown 0.16.1",

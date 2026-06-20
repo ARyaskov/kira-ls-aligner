@@ -166,7 +166,10 @@ fn observe_batch_requires_unique_alignment_slot() {
         }
     }
     let _ = est.observe_batch(&batch);
-    assert!(est.is_locked(), "should have collected enough unique-slot samples to lock in");
+    assert!(
+        est.is_locked(),
+        "should have collected enough unique-slot samples to lock in"
+    );
     let refined = est.current();
     assert_eq!(refined.insert_mean, 570);
 }

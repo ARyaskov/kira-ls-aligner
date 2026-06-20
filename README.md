@@ -11,7 +11,7 @@
 - Banded Smith-Waterman alignment with affine gaps.
 - SAM output compatible with bwa-mem pipelines (flags, MAPQ scale, CIGAR, tags).
 - AVX2/NEON runtime detection (scalar fallback).
-- Optional CUDA feature gate for future DP offload (future option).
+- Optional CUDA Spectral Sieve backend for batched short-read prefiltering.
 - mmap-based reading for FASTA/FASTQ and index I/O.
 
 ## Installation
@@ -81,12 +81,48 @@ KIRA_STATS=1 kira_ls_aligner mem ref.fa reads.fastq -o out.sam
 
 Auto mode selection is the default: the aligner classifies read length and quality on the first batch and chooses short/long/hybrid tuning automatically.
 
+### Short-read accuracy profiles
+
+Full SAM output defaults to the accuracy path and disables the ungapped ACCEPT
+shortcut. `--fast-output` enables ACCEPT by default; either behavior can be
+overridden explicitly with `--accept-enable true|false`.
+
+The recommended production accuracy profile is therefore the normal full-SAM
+command with the default occurrence cap:
+
+```powershell
+kira_ls_aligner mem --index ref.kiraidx ref.fa reads.fastq `
+  --accept-enable false -o out.sam
+```
+
+On the tested 4M-read hg38 dataset, disabling ACCEPT improved exact primary
+locus concordance with minimap2 by 0.49 percentage points and MAPQ-60
+concordance by 0.51 points. It cost 12.5% wall time and 2.9% CPU versus an
+ACCEPT-on control using the same binary. Use `--accept-enable true` when
+throughput is more important than full-SAM locus fidelity.
+
+An experimental maximum-accuracy profile is available:
+
+```powershell
+$env:KIRA_SHORT_DPTOPK = "3"
+kira_ls_aligner mem --index ref.kiraidx ref.fa reads.fastq `
+  --seed-occ-cap 32 --min-chain-ratio 0.2 --accept-enable false -o out.sam
+```
+
+It reduced unmapped reads by 6.1% and improved exact-locus concordance by 0.69
+points, but used 24.7 GiB peak working set and took 2.07x the wall time of the
+ACCEPT-on control. It is not the recommended default. These are concordance
+results, not truth-set SNP/INDEL F1 measurements.
+
 ## CLI Options (bwa-mem compatible subset)
 
 - `index REF` : Build a minimizer index.
 - `mem REF READS...` : Align reads to reference (one or more FASTQ/FASTA files).
 - `--index` : Use a prebuilt index file (REF is kept for bwa-mem compatibility).
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
+- `--accept-enable` : Override the ungapped ACCEPT shortcut.
+- `--seed-occ-cap` : Maximum reference occurrences retained per read minimizer.
+- `--min-chain-ratio` : Keep chains within this score ratio of the best chain.
 - `-t, --threads` : Number of threads.
 - `-k, --seed-len` : Seed length (overrides preset).
 - `-w, --window-len` : Minimizer window length (overrides preset).
@@ -111,7 +147,8 @@ Auto mode selection is the default: the aligner classifies read length and quali
 ## SIMD / CUDA Notes
 
 - SIMD dispatch is runtime-detected (AVX2 on x86_64, NEON on aarch64) with a scalar fallback.
-- CUDA is optional (`--features cuda`) and currently exposes a stub for future DP offload.
+- CUDA is optional (`--features cuda`) and accelerates the batched Spectral Sieve fast path.
+- Building a usable CUDA binary requires an NVIDIA toolkit with `nvcc` and a supported host C++ compiler. If kernel compilation fails, the build emits a visible warning and embeds a stub PTX that is rejected at runtime.
 
 ## Kira LS Aligner vs bwa-mem2 vs minimap2 vs bwa-mem2/mm2-fast
 
@@ -145,12 +182,18 @@ Auto mode selection is the default: the aligner classifies read length and quali
 
 ## Test Data / Provenance
 
-The repository contains small and large E. coli datasets for local benchmarking:
+The repository contains two reference FASTA files:
 
-- `GCF_000005845.2_ASM584v2_genomic.fna.gz`: NCBI RefSeq E. coli K-12 MG1655 reference (GCF_000005845.2).
-- `ecoli.fa`: extracted/normalized FASTA derived from the above RefSeq reference.
-- `SRR2584863_1.fastq`, `SRR2584863_2.fastq`: Illumina paired-end reads from NCBI SRA (SRR2584863).
-- `ref.fa`, `reads.fq`: tiny toy reference/reads for smoke testing.
+Regression and release benchmark comparisons should pass the versioned
+[benchmark gate](docs/benchmarking.md), which checks runtime together with SNP
+and INDEL F1 instead of accepting speed-only changes.
+
+- `ecoli.fa`: normalized E. coli K-12 MG1655 reference derived from NCBI RefSeq accession GCF_000005845.2.
+- `ref.fa`: tiny toy reference for smoke testing.
+
+Read sets, truth VCFs, and caller outputs are intentionally not versioned in
+this repository. Record their accession/checksum and exact preparation command
+next to every benchmark result.
 
 Licensing note: NCBI RefSeq and SRA datasets are generally in the public domain in the U.S. (NCBI data usage policies apply). If you redistribute or publish results, please follow NCBI's data usage and citation guidance for RefSeq/SRA.
 

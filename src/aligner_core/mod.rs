@@ -72,7 +72,7 @@ fn adjust_auto_params(
             && align.ungapped_identity_p90 >= 99.0
             && align.ungapped_mismatches_p95 <= 2
         {
-            cfg.accept_max_mismatches = (cfg.accept_max_mismatches + 1).min(4);
+            cfg.accept_max_mismatches = (cfg.accept_max_mismatches + 1).min(8);
         }
         if accept_rate > 0.6 && align.ungapped_identity_p90 < 98.5 {
             cfg.accept_min_identity = (cfg.accept_min_identity + 0.5).min(99.5);
@@ -82,9 +82,10 @@ fn adjust_auto_params(
 
 fn config_fingerprint(cfg: &PipelineConfig, threads: usize, batch_bases: usize) -> String {
     format!(
-        "threads={} batch_bases={} match={} mismatch={} gap_open={} gap_extend={} bandwidth={} xdrop={} dp_topk={} dp_abort_margin={} accept_enable={} accept_only_top1={} accept_span_slack={} accept_min_id={:.2} accept_max_mism={} accept_score_margin={} max_alignments={} min_chain_ratio={:.2} short_preset={} write_nm={} write_md={} write_as={} write_xs={} write_xa={} write_sa={}",
+        "threads={} batch_bases={} seed_occ_cap={} match={} mismatch={} gap_open={} gap_extend={} bandwidth={} xdrop={} dp_topk={} dp_abort_margin={} accept_enable={} accept_only_top1={} accept_span_slack={} accept_min_id={:.2} accept_max_mism={} accept_score_margin={} max_alignments={} min_chain_ratio={:.2} short_preset={} write_nm={} write_md={} write_as={} write_xs={} write_xa={} write_sa={}",
         threads,
         batch_bases,
+        cfg.seeding.max_hits_per_minimizer,
         cfg.alignment.match_score,
         cfg.alignment.mismatch,
         cfg.alignment.gap_open,
@@ -109,6 +110,49 @@ fn config_fingerprint(cfg: &PipelineConfig, threads: usize, batch_bases: usize) 
         cfg.output.write_xa,
         cfg.output.write_sa,
     )
+}
+
+fn mode_features_from_reads(reads: &[crate::types::ReadRecord]) -> ModeFeatures {
+    if reads.is_empty() {
+        return ModeFeatures::default();
+    }
+    let mut lengths: Vec<usize> = reads.iter().map(|r| r.seq.len()).collect();
+    lengths.sort_unstable();
+    let percentile = |pct: usize| {
+        let idx = ((lengths.len() - 1) * pct) / 100;
+        lengths[idx]
+    };
+    ModeFeatures {
+        read_len_p50: percentile(50),
+        read_len_p90: percentile(90),
+        ..ModeFeatures::default()
+    }
+}
+
+fn validate_index_compatibility(index: &Index, cfg: &PipelineConfig) -> Result<()> {
+    let expected = (
+        cfg.sketch.short_k,
+        cfg.sketch.short_w,
+        cfg.sketch.long_k,
+        cfg.sketch.long_w,
+    );
+    let actual = (index.short.k, index.short.w, index.long.k, index.long.w);
+    if expected != actual {
+        anyhow::bail!(
+            "index/sketch parameter mismatch: index short k/w={}/{}, long k/w={}/{}, \
+             runtime short k/w={}/{}, long k/w={}/{}. Rebuild the index or remove conflicting \
+             -k/-w/preset options",
+            actual.0,
+            actual.1,
+            actual.2,
+            actual.3,
+            expected.0,
+            expected.1,
+            expected.2,
+            expected.3,
+        );
+    }
+    Ok(())
 }
 
 impl Aligner {
@@ -154,6 +198,7 @@ impl Aligner {
     where
         R: AsRef<Path>,
     {
+        validate_index_compatibility(&index, &self.cfg.pipeline)?;
         let hot_n: usize = std::env::var("KIRA_HOT_CACHE_N")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -165,7 +210,9 @@ impl Aligner {
                 .unwrap_or(8_000_000);
             let mmap_bytes = index.mmap.as_deref().map(|m| &m[..]);
             index.short.build_hot_cache(mmap_bytes, hot_n, max_occs);
-            index.long.build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
+            index
+                .long
+                .build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
         }
 
         let stats_enabled = std::env::var_os("KIRA_STATS").is_some();
@@ -188,8 +235,7 @@ impl Aligner {
         };
 
         let mut writer = SamWriter::new(output_path, index.reference.clone())?;
-        let is_paf =
-            matches!(self.cfg.pipeline.output.format, crate::io::EmitFormat::Paf);
+        let is_paf = matches!(self.cfg.pipeline.output.format, crate::io::EmitFormat::Paf);
         if !is_paf {
             match &self.cfg.header {
                 Some(hdr) => writer.write_header_with_ctx(hdr)?,
@@ -198,18 +244,6 @@ impl Aligner {
         }
 
         let formatter = writer.formatter_handle();
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-        let writer_thread = std::thread::Builder::new()
-            .name("kira-sam-writer".to_string())
-            .spawn(move || -> Result<()> {
-                let mut writer = writer;
-                while let Ok(buf) = write_rx.recv() {
-                    writer.write_batch(&buf)?;
-                }
-                writer.flush()?;
-                Ok(())
-            })
-            .context("spawn writer thread")?;
 
         let pool = Arc::new(
             DualPool::new(DualPoolConfig {
@@ -274,6 +308,22 @@ impl Aligner {
                     None => break,
                 };
 
+                if let Some(profiles) = auto_profiles.as_mut() {
+                    if profiles.decided.is_none() {
+                        let features = mode_features_from_reads(&reads);
+                        let mode = classify(features);
+                        profiles.decided = Some(mode);
+                        mode_selected = Some((mode, features.read_len_p50));
+                        pipeline.config = profiles.select(mode);
+                        if stats_enabled {
+                            eprintln!(
+                                "[KIRA_MODE] selected={:?} p50={} p90={} before first alignment batch",
+                                mode, features.read_len_p50, features.read_len_p90
+                            );
+                        }
+                    }
+                }
+
                 let stage0_start = Instant::now();
                 let input = stage0_input::run(reads);
                 let stage0_time = fetch_time + stage0_start.elapsed();
@@ -285,40 +335,24 @@ impl Aligner {
                     self.cfg.read_group.as_deref(),
                 )?;
                 let batch_stats = batch_out.stats;
-                if write_tx.send(batch_out.sam_buf).is_err() {
-                    // Writer thread died — surface the error on next join.
-                    break;
-                }
+                writer.write_batch(&batch_out.sam_buf)?;
 
                 if let Some(profiles) = auto_profiles.as_mut() {
-                    if profiles.decided.is_none() {
-                        let features = ModeFeatures {
-                            read_len_p50: batch_stats.sketch.read_len_p50,
-                            read_len_p90: batch_stats.sketch.read_len_p90,
-                            avg_minimizers: batch_stats.sketch.avg_minimizers,
-                            ungapped_len_p95: batch_stats.align.ungapped_span_p95,
-                            ungapped_mism_p95: batch_stats.align.ungapped_mismatches_p95,
-                            ungapped_id_p90: batch_stats.align.ungapped_identity_p90,
-                            chains_per_read: if batch_stats.align.reads == 0 { 0.0 } else { batch_stats.align.chains_used as f32 / batch_stats.align.reads as f32 },
-                        };
-                        let mode = classify(features);
-                        profiles.decided = Some(mode);
-                        mode_selected = Some((mode, features.read_len_p50));
-                        let new_cfg = profiles.select(mode);
-                        pipeline.config = new_cfg;
-                        if stats_enabled {
-                            eprintln!("[KIRA_MODE] selected={:?} p50={} p90={} id_p90={:.2} chains_per_read={:.2}", mode, features.read_len_p50, features.read_len_p90, features.ungapped_id_p90, features.chains_per_read);
-                        }
-                    }
-
                     if profiles.decided.is_some() {
-                        adjust_auto_params(&mut pipeline.config, &batch_stats.align, &batch_stats.sketch);
+                        adjust_auto_params(
+                            &mut pipeline.config,
+                            &batch_stats.align,
+                            &batch_stats.sketch,
+                        );
                     }
                 }
 
                 if stats_enabled {
                     stage0_total += stage0_time;
-                    for (dst, src) in pipeline_totals.iter_mut().zip(batch_stats.times.stages.iter()) {
+                    for (dst, src) in pipeline_totals
+                        .iter_mut()
+                        .zip(batch_stats.times.stages.iter())
+                    {
                         *dst += *src;
                     }
                     total_batches += 1;
@@ -327,7 +361,13 @@ impl Aligner {
                     seed_total_after += batch_stats.seed.anchors_after_prune;
                     chain_total_used += batch_stats.chaining.anchors_used_for_chaining;
                     chain_total_pruned += batch_stats.chaining.chains_pruned_early;
-                    print_batch_stats(batch_idx, stage0_time, &batch_stats.times, &batch_stats.align, progress.as_ref());
+                    print_batch_stats(
+                        batch_idx,
+                        stage0_time,
+                        &batch_stats.times,
+                        &batch_stats.align,
+                        progress.as_ref(),
+                    );
                     print_algo_counters(&format!("batch {}", batch_idx), &batch_stats.align);
                     eprintln!(
                         "[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
@@ -337,12 +377,19 @@ impl Aligner {
                         batch_stats.chaining.anchors_used_for_chaining,
                         batch_stats.chaining.chains_pruned_early,
                     );
-                    let dp_rate = if batch_stats.align.dp_attempts == 0 { 0.0 } else { batch_stats.align.dp_early_abort as f32 * 100.0 / batch_stats.align.dp_attempts as f32 };
+                    let dp_rate = if batch_stats.align.dp_attempts == 0 {
+                        0.0
+                    } else {
+                        batch_stats.align.dp_early_abort as f32 * 100.0
+                            / batch_stats.align.dp_attempts as f32
+                    };
                     eprintln!(
                         "[KIRA_ALIGN_STATS] batch {}: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
                         batch_idx,
-                        (batch_stats.align.prefilter_accept as f32 * 100.0 / batch_stats.align.reads.max(1) as f32),
-                        (batch_stats.align.prefilter_fallback as f32 * 100.0 / batch_stats.align.reads.max(1) as f32),
+                        (batch_stats.align.prefilter_accept as f32 * 100.0
+                            / batch_stats.align.reads.max(1) as f32),
+                        (batch_stats.align.prefilter_fallback as f32 * 100.0
+                            / batch_stats.align.reads.max(1) as f32),
                         dp_rate
                     );
                     update_progress(
@@ -360,18 +407,7 @@ impl Aligner {
             Ok(())
         })();
         drive_result?;
-
-        drop(write_tx);
-        match writer_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e.context("SAM writer thread failed")),
-            Err(panic) => {
-                return Err(anyhow::anyhow!(
-                    "SAM writer thread panicked: {:?}",
-                    panic
-                ));
-            }
-        }
+        writer.flush()?;
 
         if stats_enabled {
             if let Some(pb) = progress.as_ref() {
@@ -420,6 +456,7 @@ impl Aligner {
         mut index: Index,
         reads_paths: &[std::path::PathBuf],
     ) -> Result<Vec<u8>> {
+        validate_index_compatibility(&index, &self.cfg.pipeline)?;
         let hot_n: usize = std::env::var("KIRA_HOT_CACHE_N")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -431,7 +468,9 @@ impl Aligner {
                 .unwrap_or(8_000_000);
             let mmap_bytes = index.mmap.as_deref().map(|m| &m[..]);
             index.short.build_hot_cache(mmap_bytes, hot_n, max_occs);
-            index.long.build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
+            index
+                .long
+                .build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
         }
 
         let pool = Arc::new(
@@ -444,8 +483,10 @@ impl Aligner {
         );
 
         let out = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let mut writer =
-            SamWriter::from_writer(Box::new(crate::io::VecSink(out.clone())), index.reference.clone());
+        let mut writer = SamWriter::from_writer(
+            Box::new(crate::io::VecSink(out.clone())),
+            index.reference.clone(),
+        );
         match &self.cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,
             None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
@@ -457,10 +498,19 @@ impl Aligner {
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
         )?;
-        let pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+        let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
+            if let Some(profiles) = auto_profiles.as_mut() {
+                if profiles.decided.is_none() {
+                    let features = mode_features_from_reads(&reads);
+                    let mode = classify(features);
+                    profiles.decided = Some(mode);
+                    pipeline.config = profiles.select(mode);
+                }
+            }
             let input = stage0_input::run(reads);
             let bo = pipeline.process_batch_serialized(
                 input,
@@ -468,6 +518,9 @@ impl Aligner {
                 &formatter,
                 self.cfg.read_group.as_deref(),
             )?;
+            if auto_profiles.as_ref().is_some_and(|p| p.decided.is_some()) {
+                adjust_auto_params(&mut pipeline.config, &bo.stats.align, &bo.stats.sketch);
+            }
             writer.write_batch(&bo.sam_buf)?;
         }
         writer.flush()?;
@@ -592,10 +645,14 @@ fn print_cascade_summary(stats: &AlignmentBatchStats) {
     let denom = total.max(1) as f64;
     eprintln!(
         "[CASCADE] spectral={} ({:.2}%) wfa={} ({:.2}%) sw={} ({:.2}%) unmapped={} ({:.2}%) (total={})",
-        spectral, spectral as f64 * 100.0 / denom,
-        wfa,      wfa      as f64 * 100.0 / denom,
-        sw,       sw       as f64 * 100.0 / denom,
-        unmapped, unmapped as f64 * 100.0 / denom,
+        spectral,
+        spectral as f64 * 100.0 / denom,
+        wfa,
+        wfa as f64 * 100.0 / denom,
+        sw,
+        sw as f64 * 100.0 / denom,
+        unmapped,
+        unmapped as f64 * 100.0 / denom,
         total,
     );
 }
@@ -613,20 +670,34 @@ fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
         "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
         label,
         stats.reads,
-        stats.exact_matches, pct(stats.exact_matches),
-        stats.prefilter_accept, pct(stats.prefilter_accept),
-        stats.packed_spectral_resolved, pct(stats.packed_spectral_resolved),
-        stats.spectral_sieve_resolved, pct(stats.spectral_sieve_resolved),
-        stats.gpu_spectral_resolved, pct(stats.gpu_spectral_resolved),
-        stats.wfa_resolved, pct(stats.wfa_resolved),
-        stats.lsh_rescue_resolved, pct(stats.lsh_rescue_resolved),
-        stats.cgk_rescue_resolved, pct(stats.cgk_rescue_resolved),
-        stats.dp_simd, pct(stats.dp_simd),
-        stats.dp_scalar, pct(stats.dp_scalar),
-        stats.unmapped, pct(stats.unmapped),
-        spectral_total, pct(spectral_total),
-        sw_total, pct(sw_total),
-        stats.wfa_resolved, pct(stats.wfa_resolved),
+        stats.exact_matches,
+        pct(stats.exact_matches),
+        stats.prefilter_accept,
+        pct(stats.prefilter_accept),
+        stats.packed_spectral_resolved,
+        pct(stats.packed_spectral_resolved),
+        stats.spectral_sieve_resolved,
+        pct(stats.spectral_sieve_resolved),
+        stats.gpu_spectral_resolved,
+        pct(stats.gpu_spectral_resolved),
+        stats.wfa_resolved,
+        pct(stats.wfa_resolved),
+        stats.lsh_rescue_resolved,
+        pct(stats.lsh_rescue_resolved),
+        stats.cgk_rescue_resolved,
+        pct(stats.cgk_rescue_resolved),
+        stats.dp_simd,
+        pct(stats.dp_simd),
+        stats.dp_scalar,
+        pct(stats.dp_scalar),
+        stats.unmapped,
+        pct(stats.unmapped),
+        spectral_total,
+        pct(spectral_total),
+        sw_total,
+        pct(sw_total),
+        stats.wfa_resolved,
+        pct(stats.wfa_resolved),
     );
 }
 

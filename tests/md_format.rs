@@ -7,9 +7,7 @@
 
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::alignment::AnchorSpan;
-use kira_ls_aligner::alignment::prefilter::{
-    PrefilterResult, prefilter_chain,
-};
+use kira_ls_aligner::alignment::prefilter::{PrefilterResult, prefilter_chain};
 use kira_ls_aligner::types::Strand;
 
 fn cfg() -> AlignmentConfig {

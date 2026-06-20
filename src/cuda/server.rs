@@ -7,15 +7,12 @@ use anyhow::{Context, Result};
 
 use crate::cli::MemArgs;
 
+use super::CudaError;
 use super::backend::CudaBackend;
 use super::dispatcher;
-use super::CudaError;
 
 /// Run the interactive GPU server.
-pub fn run_gpu_server(
-    default_threads: usize,
-    default_batch_bases: usize,
-) -> Result<(), CudaError> {
+pub fn run_gpu_server(default_threads: usize, default_batch_bases: usize) -> Result<(), CudaError> {
     eprintln!("[KIRA_GPU] Initializing CUDA backend...");
     let init_start = std::time::Instant::now();
     {
@@ -132,11 +129,14 @@ impl Session {
                 self.output = Some(PathBuf::from(value));
             }
             "threads" | "t" => {
-                self.threads = Some(value.parse().context("threads must be a positive integer")?);
+                self.threads = Some(
+                    value
+                        .parse()
+                        .context("threads must be a positive integer")?,
+                );
             }
             "batch" | "K" => {
-                self.batch_bases =
-                    Some(value.parse().context("batch must be a positive integer")?);
+                self.batch_bases = Some(value.parse().context("batch must be a positive integer")?);
             }
             "read-group" | "rg" | "R" => {
                 self.read_group = Some(value.to_string());
@@ -148,11 +148,7 @@ impl Session {
         Ok(())
     }
 
-    fn run(
-        &mut self,
-        default_threads: usize,
-        default_batch_bases: usize,
-    ) -> Result<()> {
+    fn run(&mut self, default_threads: usize, default_batch_bases: usize) -> Result<()> {
         let reference = self
             .reference
             .clone()

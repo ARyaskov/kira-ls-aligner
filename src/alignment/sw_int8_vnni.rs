@@ -29,8 +29,10 @@
 
 use std::arch::x86_64::*;
 
-use crate::alignment::{AlignmentConfig, BatchInput, SwResult, banded_sw_internal, push_cigar};
-use crate::types::CigarKind;
+use crate::alignment::{
+    AlignmentConfig, BatchInput, SwResult, TRACE_E_EXTEND, TRACE_F_EXTEND, banded_sw_internal,
+    traceback_interleaved,
+};
 
 /// Maximum H value the i8 kernel is willing to commit to without falling back.
 ///
@@ -128,8 +130,8 @@ pub(crate) unsafe fn sw_batch_int8(
         // SAFETY: caller enables avx2+avxvnni.
         unsafe {
             sw_batch_int8_inner(
-                inputs, cfg, lanes, q_len, r_len, prev_h, prev_e, cur_h, cur_e, trace,
-                read_cols, ref_cols,
+                inputs, cfg, lanes, q_len, r_len, prev_h, prev_e, cur_h, cur_e, trace, read_cols,
+                ref_cols,
             )
         }
     })
@@ -153,13 +155,15 @@ unsafe fn sw_batch_int8_inner(
 ) -> Vec<SwResult> {
     let v_zero = _mm256_setzero_si256();
     let v_neg = _mm256_set1_epi8(-100);
-    let v_go = _mm256_set1_epi8(-(cfg.gap_open as i8));
+    let v_go = _mm256_set1_epi8(-(cfg.gap_open.saturating_add(cfg.gap_extend) as i8));
     let v_ge = _mm256_set1_epi8(-(cfg.gap_extend as i8));
     let v_match = _mm256_set1_epi8(cfg.match_score as i8);
     let v_mism = _mm256_set1_epi8(-(cfg.mismatch as i8));
     let v_one = _mm256_set1_epi8(1);
     let v_two = _mm256_set1_epi8(2);
     let v_three = _mm256_set1_epi8(3);
+    let v_four = _mm256_set1_epi8(TRACE_E_EXTEND as i8);
+    let v_eight = _mm256_set1_epi8(TRACE_F_EXTEND as i8);
     let v_sat = _mm256_set1_epi8(INT8_SAFE_MAX_H as i8);
 
     let trace_w = r_len + 1;
@@ -217,10 +221,12 @@ unsafe fn sw_batch_int8_inner(
             let e_from_h = _mm256_adds_epi8(unsafe { *prev_h.get_unchecked(j) }, v_go);
             let e_from_e = _mm256_adds_epi8(unsafe { *prev_e.get_unchecked(j) }, v_ge);
             let e = _mm256_max_epi8(e_from_h, e_from_e);
+            let e_ext = _mm256_cmpgt_epi8(e_from_e, e_from_h);
 
             let f_from_h = _mm256_adds_epi8(unsafe { *cur_h.get_unchecked(j - 1) }, v_go);
             let f_from_f = _mm256_adds_epi8(cur_f, v_ge);
             let f = _mm256_max_epi8(f_from_h, f_from_f);
+            let f_ext = _mm256_cmpgt_epi8(f_from_f, f_from_h);
 
             let h_tmp = _mm256_max_epi8(h_match, e);
             let h_tmp = _mm256_max_epi8(h_tmp, f);
@@ -242,6 +248,8 @@ unsafe fn sw_batch_int8_inner(
             let tr = _mm256_blendv_epi8(v_three, v_two, is_e);
             let tr = _mm256_blendv_epi8(tr, v_one, is_match);
             let tr = _mm256_blendv_epi8(tr, v_zero, is_zero);
+            let tr = _mm256_or_si256(tr, _mm256_and_si256(e_ext, v_four));
+            let tr = _mm256_or_si256(tr, _mm256_and_si256(f_ext, v_eight));
 
             unsafe {
                 let dst = trace.as_mut_ptr().add((i * trace_w + j) * LANES) as *mut __m256i;
@@ -320,7 +328,10 @@ unsafe fn sw_batch_int8_inner(
     let mut sat_arr = [0u8; LANES];
     unsafe {
         _mm256_storeu_si256(best_score_arr.as_mut_ptr() as *mut __m256i, best_v);
-        _mm256_storeu_si256(best_qlen_score_arr.as_mut_ptr() as *mut __m256i, best_qlen_v);
+        _mm256_storeu_si256(
+            best_qlen_score_arr.as_mut_ptr() as *mut __m256i,
+            best_qlen_v,
+        );
         _mm256_storeu_si256(sat_arr.as_mut_ptr() as *mut __m256i, sat_v);
     }
 
@@ -343,45 +354,16 @@ unsafe fn sw_batch_int8_inner(
 
         let local_score = best_score_arr[k];
         let qlen_score = best_qlen_score_arr[k];
-        let (start_i, start_j, bs) = if qlen_score > 0
-            && qlen_score.saturating_add(clip_pen_i8) > local_score
-        {
-            (q_len as i32, best_qlen_j[k], qlen_score as i32)
-        } else {
-            (best_i[k], best_j[k], local_score as i32)
-        };
+        let (start_i, start_j, bs) =
+            if qlen_score > 0 && qlen_score.saturating_add(clip_pen_i8) > local_score {
+                (q_len as i32, best_qlen_j[k], qlen_score as i32)
+            } else {
+                (best_i[k], best_j[k], local_score as i32)
+            };
 
-        let mut cigar = Vec::new();
-        let mut i = start_i;
-        let mut j = start_j;
-        let read_end = i;
-        let ref_end = j as u32;
-
-        while i > 0 && j > 0 {
-            let idx = (i as usize * trace_w + j as usize) * LANES + k;
-            let tr = unsafe { *trace.get_unchecked(idx) };
-            if tr == 0 {
-                break;
-            }
-            match tr {
-                1 => {
-                    push_cigar(&mut cigar, CigarKind::Match, 1);
-                    i -= 1;
-                    j -= 1;
-                }
-                2 => {
-                    push_cigar(&mut cigar, CigarKind::Ins, 1);
-                    i -= 1;
-                }
-                3 => {
-                    push_cigar(&mut cigar, CigarKind::Del, 1);
-                    j -= 1;
-                }
-                _ => break,
-            }
-        }
-
-        cigar.reverse();
+        let read_end = start_i;
+        let ref_end = start_j as u32;
+        let (cigar, i, j) = traceback_interleaved(trace, trace_w, LANES, k, start_i, start_j);
         results.push(SwResult {
             ref_start: j as u32,
             ref_end,

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use kira_ls_aligner::io::{OutputConfig, SamFormatter};
 use kira_ls_aligner::types::{
-    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases,
-    RefSeq, Reference,
+    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq,
+    Reference,
 };
 
 fn make_reference() -> Reference {
@@ -90,16 +90,20 @@ fn parse_sam(line: &[u8]) -> (u32, String, u32, u32, String, String, u32, i32) {
     let s = std::str::from_utf8(line).expect("valid utf-8");
     let s = s.trim_end_matches('\n');
     let cols: Vec<&str> = s.split('\t').collect();
-    assert!(cols.len() >= 11, "expected ≥11 SAM columns, got {}", cols.len());
+    assert!(
+        cols.len() >= 11,
+        "expected ≥11 SAM columns, got {}",
+        cols.len()
+    );
     (
-        cols[1].parse().unwrap(),       // flag
-        cols[2].to_string(),            // rname
-        cols[3].parse().unwrap(),       // pos
-        cols[4].parse().unwrap(),       // mapq
-        cols[5].to_string(),            // cigar
-        cols[6].to_string(),            // rnext
-        cols[7].parse().unwrap(),       // pnext
-        cols[8].parse().unwrap(),       // tlen
+        cols[1].parse().unwrap(), // flag
+        cols[2].to_string(),      // rname
+        cols[3].parse().unwrap(), // pos
+        cols[4].parse().unwrap(), // mapq
+        cols[5].to_string(),      // cigar
+        cols[6].to_string(),      // rnext
+        cols[7].parse().unwrap(), // pnext
+        cols[8].parse().unwrap(), // tlen
     )
 }
 
@@ -204,6 +208,27 @@ fn paired_r2_reverse_sets_correct_bits_and_negative_tlen() {
 }
 
 #[test]
+fn reverse_alignment_emits_reverse_complemented_seq_and_reversed_qual() {
+    let fmt = SamFormatter::new(Arc::new(make_reference()));
+    let read = ReadRecord {
+        id: "reverse_payload".to_string(),
+        seq: b"AaCGTN".to_vec(),
+        qual: Some(b"ABCDEF".to_vec()),
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+    };
+    let mut aln = base_alignment(0, 100, 106, true);
+    aln.read_end = 6;
+    aln.cigar[0].len = 6;
+    let mut buf = Vec::new();
+    fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+    let line = std::str::from_utf8(&buf).unwrap().trim_end();
+    let cols: Vec<&str> = line.split('\t').collect();
+    assert_eq!(cols[9], "NACGtT");
+    assert_eq!(cols[10], "FEDCBA");
+}
+
+#[test]
 fn mate_on_different_ref_emits_full_rname() {
     let fmt = SamFormatter::new(Arc::new(make_reference()));
     let mut aln = base_alignment(0, 100, 250, false);
@@ -262,7 +287,10 @@ fn mate_unmapped_sets_0x8_and_uses_self_rname() {
     assert!(flag & 0x8 != 0, "0x8 mate unmapped");
     // SAM convention: RNEXT='=' so the mate can be re-paired at the same coord.
     assert_eq!(rnext, "=");
-    assert_eq!(pnext, pos, "PNEXT == POS when mate is at same coord placeholder");
+    assert_eq!(
+        pnext, pos,
+        "PNEXT == POS when mate is at same coord placeholder"
+    );
     assert_eq!(tlen, 0);
 }
 
@@ -300,7 +328,7 @@ fn unmapped_paired_record_has_full_flag_set() {
 #[test]
 fn supplementary_keeps_mapq_and_sets_0x800() {
     let fmt = SamFormatter::new(Arc::new(make_reference()));
-    let mut aln = base_alignment(0, 500, 800, false);
+    let mut aln = base_alignment(0, 500, 650, false);
     aln.is_supplementary = true;
     aln.mapq = 45;
     let mut buf = Vec::new();

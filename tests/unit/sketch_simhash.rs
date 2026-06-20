@@ -47,7 +47,10 @@ fn two_base_flips_stay_close() {
     let h0 = simhash_window(base).unwrap();
     let h1 = simhash_window(&mutated).unwrap();
     let d = hamming_distance(h0, h1);
-    assert!(d < 32, "two-base flip should leave most bits intact, got {d}");
+    assert!(
+        d < 32,
+        "two-base flip should leave most bits intact, got {d}"
+    );
 }
 
 #[test]
@@ -74,9 +77,13 @@ fn random_pair_distance_is_around_half() {
         let mut a = Vec::with_capacity(32);
         let mut b = Vec::with_capacity(32);
         for _ in 0..32 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             a.push(b"ACGT"[(state >> 56) as usize & 3]);
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             b.push(b"ACGT"[(state >> 56) as usize & 3]);
         }
         let ha = simhash_window(&a).unwrap();

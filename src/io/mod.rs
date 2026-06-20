@@ -7,7 +7,9 @@ use kira_fastq::FastqReader as KiraFastqReader;
 use memmap2::Mmap;
 use needletail::parse_fastx_reader;
 
-use crate::types::{Alignment, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq, Reference};
+use crate::types::{
+    Alignment, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq, Reference,
+};
 
 /// Load reference sequences from FASTA using mmap.
 pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
@@ -17,11 +19,17 @@ pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
         let record = record.context("read reference record")?;
         let raw = record.id();
         // SAM/BAM `SN:` forbids whitespace; trim defensively.
-        let trimmed = raw.split(|b: &u8| b.is_ascii_whitespace()).next().unwrap_or(raw);
+        let trimmed = raw
+            .split(|b: &u8| b.is_ascii_whitespace())
+            .next()
+            .unwrap_or(raw);
         let name = String::from_utf8_lossy(trimmed).to_string();
         let mut seq = record.seq().to_vec();
         normalize_bases(&mut seq);
-        sequences.push(RefSeq { name, bases: RefBases::Owned(seq) });
+        sequences.push(RefSeq {
+            name,
+            bases: RefBases::Owned(seq),
+        });
     }
     Ok(Reference { sequences })
 }
@@ -603,9 +611,14 @@ impl SamFormatter {
             buf.extend_from_slice(b"\t*\t0\t0\t");
         }
 
-        buf.extend_from_slice(&read.seq);
+        if aln.is_rev {
+            append_reverse_complement(buf, &read.seq);
+        } else {
+            buf.extend_from_slice(&read.seq);
+        }
         buf.push(b'\t');
         match read.qual.as_ref() {
+            Some(q) if aln.is_rev => buf.extend(q.iter().rev().copied()),
             Some(q) => buf.extend_from_slice(q),
             None => buf.push(b'*'),
         }
@@ -782,6 +795,20 @@ impl SamFormatter {
     }
 }
 
+fn append_reverse_complement(buf: &mut Vec<u8>, seq: &[u8]) {
+    buf.extend(seq.iter().rev().map(|&b| match b {
+        b'A' => b'T',
+        b'a' => b't',
+        b'C' => b'G',
+        b'c' => b'g',
+        b'G' => b'C',
+        b'g' => b'c',
+        b'T' | b'U' => b'A',
+        b't' | b'u' => b'a',
+        _ => b'N',
+    }));
+}
+
 /// SAM writer with minimal header support.
 pub struct SamWriter {
     writer: BufWriter<Box<dyn Write + Send>>,
@@ -943,35 +970,20 @@ fn cigar_query_consumed(ops: &[CigarOp]) -> u32 {
 }
 
 /// Emit a CIGAR that matches `seq_len` query bytes exactly.
+///
+/// CIGAR construction belongs to the aligner. The formatter must not hide an
+/// upstream accounting bug by appending an invented soft clip.
 fn append_cigar_for_seq(buf: &mut Vec<u8>, ops: &[CigarOp], seq_len: u32) {
     let consumed = cigar_query_consumed(ops);
     if consumed == seq_len {
         append_cigar(buf, ops);
         return;
     }
-    if consumed > seq_len {
-        buf.push(b'*');
-        return;
-    }
-    if ops.is_empty() {
-        // No ops at all and seq_len > 0 → emit single soft-clip of seq_len.
-        push_u32(buf, seq_len);
-        buf.push(b'S');
-        return;
-    }
-    for op in ops {
-        push_u32(buf, op.len);
-        buf.push(match op.op {
-            CigarKind::Match => b'M',
-            CigarKind::Ins => b'I',
-            CigarKind::Del => b'D',
-            CigarKind::SoftClip => b'S',
-            CigarKind::Skipped => b'N',
-        });
-    }
-    let pad = seq_len - consumed;
-    push_u32(buf, pad);
-    buf.push(b'S');
+    debug_assert_eq!(
+        consumed, seq_len,
+        "alignment CIGAR consumes {consumed} query bases, expected {seq_len}"
+    );
+    buf.push(b'*');
 }
 
 /// Build a SAM bitwise FLAG from an Alignment.

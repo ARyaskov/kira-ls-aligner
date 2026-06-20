@@ -1,12 +1,10 @@
-//! Two-pool rayon executor pinned to a hybrid CPU's P-cores and E-cores.
+//! Hybrid-aware rayon executor pinned to selected P-cores and E-cores.
 //!
-//! `DualPool` owns up to two `rayon::ThreadPool` instances:
-//!
-//! * `p_pool` — workers pinned to Performance cores, used by the SIMD-heavy
-//!   stages (Aho-Corasick batch scan, minimizer sketching, banded SW
-//!   alignment).
-//! * `e_pool` — workers pinned to Efficient cores, used by the lighter
-//!   structural stages (seeding, chaining, MAPQ scoring, SAM emit).
+//! Pipeline stages currently execute serially. A separate P-pool and E-pool
+//! therefore left one class of cores idle for every stage. `DualPool` keeps the
+//! routing API but uses one affinity-pinned pool containing the selected P and
+//! E logical CPUs, so each parallel stage can consume the complete thread
+//! budget.
 //!
 //! On homogeneous hosts (AMD, older Intel, unknown topology) the pool
 //! collapses to a single un-pinned rayon pool covering every logical CPU,
@@ -38,8 +36,7 @@ pub struct DualPoolConfig {
 
 enum Inner {
     Hybrid {
-        p_pool: ThreadPool,
-        e_pool: ThreadPool,
+        pool: ThreadPool,
         p_threads: usize,
         e_threads: usize,
     },
@@ -56,7 +53,7 @@ pub struct DualPool {
 impl DualPool {
     /// Auto-detect the host topology and build the appropriate pool layout.
     ///
-    /// * Hybrid host → two pinned pools sized from the detected P/E layout
+    /// * Hybrid host → one pinned pool sized from the detected P/E layout
     ///   (clamped by `cfg.p_threads` / `cfg.e_threads` when provided).
     /// * Homogeneous host → single unpinned pool sized by `cfg.total_threads`
     ///   (or every logical CPU when unset).
@@ -128,13 +125,13 @@ impl DualPool {
 
         let p_threads = p_ids.len();
         let e_threads = e_ids.len();
-        let p_pool = build_pinned_pool(&p_ids, "kira-p")?;
-        let e_pool = build_pinned_pool(&e_ids, "kira-e")?;
+        let mut logical_ids = p_ids;
+        logical_ids.extend(e_ids);
+        let pool = build_pinned_pool(&logical_ids, "kira-h")?;
 
         Ok(Self {
             inner: Inner::Hybrid {
-                p_pool,
-                e_pool,
+                pool,
                 p_threads,
                 e_threads,
             },
@@ -157,7 +154,7 @@ impl DualPool {
         })
     }
 
-    /// Number of workers on the P-pool. Equal to total threads on
+    /// Number of selected P-core workers. Equal to total threads on
     /// homogeneous hosts.
     pub fn p_threads(&self) -> usize {
         match &self.inner {
@@ -166,9 +163,7 @@ impl DualPool {
         }
     }
 
-    /// Number of workers on the E-pool. Zero on homogeneous hosts (caller
-    /// should route through `install_compute` exclusively in that case;
-    /// `install_light` transparently falls back to the same pool).
+    /// Number of selected E-core workers. Zero on homogeneous hosts.
     pub fn e_threads(&self) -> usize {
         match &self.inner {
             Inner::Hybrid { e_threads, .. } => *e_threads,
@@ -191,35 +186,31 @@ impl DualPool {
         matches!(self.inner, Inner::Hybrid { .. })
     }
 
-    /// Run `f` on the P-pool (SIMD-heavy stages). Falls back to the single
-    /// pool on homogeneous hosts.
+    /// Run a SIMD-heavy stage on the configured worker pool.
     pub fn install_compute<R, F>(&self, f: F) -> R
     where
         F: FnOnce() -> R + Send,
         R: Send,
     {
         match &self.inner {
-            Inner::Hybrid { p_pool, .. } => p_pool.install(f),
+            Inner::Hybrid { pool, .. } => pool.install(f),
             Inner::Homogeneous { pool, .. } => pool.install(f),
         }
     }
 
-    /// Run `f` on the E-pool (light bookkeeping stages). Falls back to the
-    /// single pool on homogeneous hosts.
+    /// Run a light bookkeeping stage on the configured worker pool.
     pub fn install_light<R, F>(&self, f: F) -> R
     where
         F: FnOnce() -> R + Send,
         R: Send,
     {
         match &self.inner {
-            Inner::Hybrid { e_pool, .. } => e_pool.install(f),
+            Inner::Hybrid { pool, .. } => pool.install(f),
             Inner::Homogeneous { pool, .. } => pool.install(f),
         }
     }
 
-    /// Used by drivers that want a single pool to install() the outer
-    /// batch loop on (the main aligner installs the loop on the P-pool so
-    /// any stray rayon::current_thread_index calls land on a compute lane).
+    /// Used by drivers that want a single pool to install() the outer batch loop.
     pub fn install_driver<R, F>(&self, f: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -305,12 +296,7 @@ fn pick_p_logical_ids(topo: &HybridTopology, target: usize) -> Vec<usize> {
     // Round 2..: add 2nd, 3rd, … sibling per physical core until we hit
     // the target. On Alder Lake P-cores there's exactly one SMT sibling,
     // so the loop terminates after round 2.
-    let max_round = topo
-        .p_physical
-        .iter()
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(1);
+    let max_round = topo.p_physical.iter().map(|s| s.len()).max().unwrap_or(1);
     for round in 1..max_round {
         for sibs in &topo.p_physical {
             if let Some(&id) = sibs.get(round) {
@@ -344,9 +330,7 @@ fn build_pinned_pool(logical_ids: &[usize], name_prefix: &str) -> Result<ThreadP
             }
         })
         .build()
-        .with_context(|| {
-            format!("build pinned thread pool '{name_prefix}' with {n} workers")
-        })?;
+        .with_context(|| format!("build pinned thread pool '{name_prefix}' with {n} workers"))?;
     Ok(pool)
 }
 

@@ -8,8 +8,8 @@ use kira_ls_aligner::index::{Index, IndexConfig};
 use kira_ls_aligner::io::IngestMode;
 use kira_ls_aligner::pipeline::pairing::{PairedConfig, RescueConfig, rescue_unmapped_mates};
 use kira_ls_aligner::types::{
-    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases,
-    RefSeq, Reference,
+    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq,
+    Reference,
 };
 
 /// Build a deterministic 4 kb reference whose first 2 kb is repeat-free
@@ -20,7 +20,9 @@ fn synth_reference() -> Reference {
     let mut buf = Vec::with_capacity(4000);
     let bases = b"ACGT";
     for _ in 0..4000 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         buf.push(bases[(seed >> 33) as usize & 3]);
     }
     Reference {
@@ -129,19 +131,12 @@ fn rescues_unmapped_r2_inside_insert_window() {
     }
 
     let reads = vec![
-        mk_paired_read(
-            "pair1",
-            ref_bytes[500..650].to_vec(),
-            PairRole::R1,
-        ),
+        mk_paired_read("pair1", ref_bytes[500..650].to_vec(), PairRole::R1),
         mk_paired_read("pair1", r2_seq_in_read, PairRole::R2),
     ];
 
     // R1 has a high-score primary; R2 has nothing (chaining failed).
-    let mut alignments: Vec<Vec<Alignment>> = vec![
-        vec![mk_aln(0, 500, 650, false, 150)],
-        vec![],
-    ];
+    let mut alignments: Vec<Vec<Alignment>> = vec![vec![mk_aln(0, 500, 650, false, 150)], vec![]];
 
     let mut paired_cfg = PairedConfig::default();
     paired_cfg.mode = IngestMode::TwoFile;
@@ -160,12 +155,12 @@ fn rescues_unmapped_r2_inside_insert_window() {
     // R2 must now have at least one alignment, on the reverse strand,
     // landing inside the rescue window [650, 650+1000).
     assert_eq!(alignments[0].len(), 1, "R1 unchanged");
-    assert!(
-        !alignments[1].is_empty(),
-        "R2 should be rescued, got empty"
-    );
+    assert!(!alignments[1].is_empty(), "R2 should be rescued, got empty");
     let r2_aln = &alignments[1][0];
-    assert!(r2_aln.is_rev, "rescued R2 must be on reverse strand (FR pair)");
+    assert!(
+        r2_aln.is_rev,
+        "rescued R2 must be on reverse strand (FR pair)"
+    );
     assert!(
         (r2_aln.ref_start as usize) >= 650
             && (r2_aln.ref_end as usize) <= 650 + paired_cfg.insert_max as usize,
@@ -333,14 +328,16 @@ fn locked_estimator_narrows_rescue_window_to_3sigma() {
         assert!(
             a.ref_start < r2_true_start as u32 || a.ref_end > r2_true_end as u32,
             "locked-rescue should not have reached the out-of-window true mate at {r2_true_start}..{r2_true_end}, got [{}, {})",
-            a.ref_start, a.ref_end
+            a.ref_start,
+            a.ref_end
         );
         // And whatever it found must lie inside the narrow window
         // [700, 1000] (allowing the off-by-one of partial alignment).
         assert!(
             a.ref_start >= 700 && a.ref_end <= 1000,
             "locked-rescue strayed outside the 3σ window: [{}, {})",
-            a.ref_start, a.ref_end
+            a.ref_start,
+            a.ref_end
         );
     }
 

@@ -57,15 +57,29 @@ pub fn emit_supplementary_alignments(
 }
 
 /// Pick chains worth running a supplementary SW for, given the primary alignment that stage 4.
-fn pick_supplementary_chains<'a>(
-    primary: &Alignment,
-    chains: &'a [Chain],
-) -> Vec<&'a Chain> {
+fn pick_supplementary_chains<'a>(primary: &Alignment, chains: &'a [Chain]) -> Vec<&'a Chain> {
     let primary_score = chains[0].score.max(1);
     let min_score = ((primary_score as f32) * SUPP_MIN_SCORE_RATIO).ceil() as i32;
 
-    let primary_rs = primary.read_start;
-    let primary_re = primary.read_end;
+    let read_len = primary
+        .cigar
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.op,
+                crate::types::CigarKind::Match
+                    | crate::types::CigarKind::Ins
+                    | crate::types::CigarKind::SoftClip
+            )
+        })
+        .map(|op| op.len)
+        .sum::<u32>();
+    let (primary_rs, primary_re) = original_interval(
+        primary.read_start,
+        primary.read_end,
+        primary.is_rev,
+        read_len,
+    );
 
     let mut picks: Vec<&Chain> = Vec::new();
     for chain in chains.iter().skip(1) {
@@ -78,18 +92,24 @@ fn pick_supplementary_chains<'a>(
             continue;
         }
         // Compete-vs-primary check: high read overlap → secondary, not supp.
-        let overlap_pp = read_overlap_pct(
-            primary_rs,
-            primary_re,
+        let (chain_rs, chain_re) = original_interval(
             chain.read_start,
             chain.read_end,
+            matches!(chain.strand, crate::types::Strand::Reverse),
+            read_len,
         );
+        let overlap_pp = read_overlap_pct(primary_rs, primary_re, chain_rs, chain_re);
         if overlap_pp > SUPP_MAX_OVERLAP_PCT {
             continue;
         }
         let dup = picks.iter().any(|c| {
-            read_overlap_pct(c.read_start, c.read_end, chain.read_start, chain.read_end)
-                > SUPP_MAX_OVERLAP_PCT
+            let (c_rs, c_re) = original_interval(
+                c.read_start,
+                c.read_end,
+                matches!(c.strand, crate::types::Strand::Reverse),
+                read_len,
+            );
+            read_overlap_pct(c_rs, c_re, chain_rs, chain_re) > SUPP_MAX_OVERLAP_PCT
         });
         if dup {
             continue;
@@ -100,6 +120,15 @@ fn pick_supplementary_chains<'a>(
         }
     }
     picks
+}
+
+#[inline]
+fn original_interval(start: u32, end: u32, is_rev: bool, read_len: u32) -> (u32, u32) {
+    if is_rev {
+        (read_len.saturating_sub(end), read_len.saturating_sub(start))
+    } else {
+        (start, end)
+    }
 }
 
 /// Percentage overlap between `[a_start..a_end)` and `[b_start..b_end)` as a share of the.

@@ -15,9 +15,7 @@ fn naive_semi_global(pattern: &[u8], text: &[u8]) -> (usize, usize) {
         cur[0] = i;
         for j in 1..=n {
             let cost = if pattern[i - 1] == text[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j - 1] + cost)
-                .min(prev[j] + 1)
-                .min(cur[j - 1] + 1);
+            cur[j] = (prev[j - 1] + cost).min(prev[j] + 1).min(cur[j - 1] + 1);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -151,9 +149,11 @@ fn random_corpus_matches_naive() {
             text[start..start + m].copy_from_slice(&pattern);
         }
         let (nd, _) = naive_semi_global(&pattern, &text);
-        let (d, end) = bounded_edit_distance(&pattern, &text, m).expect("max_k = m always succeeds");
+        let (d, end) =
+            bounded_edit_distance(&pattern, &text, m).expect("max_k = m always succeeds");
         assert_eq!(
-            d, nd,
+            d,
+            nd,
             "distance mismatch for m={m} n={n} pattern={:?} text={:?}",
             String::from_utf8_lossy(&pattern),
             String::from_utf8_lossy(&text)
@@ -161,6 +161,9 @@ fn random_corpus_matches_naive() {
         // Multiple text prefixes can tie on min distance; verify the
         // reported end-position genuinely reaches the minimum.
         let (d_at_end, _) = naive_semi_global(&pattern, &text[..end]);
-        assert_eq!(d_at_end, nd, "Myers end={end} does not reach min distance for m={m} n={n}");
+        assert_eq!(
+            d_at_end, nd,
+            "Myers end={end} does not reach min distance for m={m} n={n}"
+        );
     }
 }

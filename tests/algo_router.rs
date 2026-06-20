@@ -51,8 +51,18 @@ fn myers_bound_reasonable() {
 /// Build a 150 bp non-repetitive synthetic reference + chain anchor span
 /// at offset 2 (so the read sits at ref[2..152]). The 2 bp padding gives
 /// the fast-path window the slack it expects.
+fn synthetic_bases(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_u32;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b"ACGT"[((state >> 30) & 3) as usize]
+        })
+        .collect()
+}
+
 fn synthetic_fixture(read: Vec<u8>) -> (Vec<u8>, Vec<u8>, AnchorSpan) {
-    let base: Vec<u8> = (0..200).map(|i| b"CGTAGCAT"[i % 8]).collect();
+    let base = synthetic_bases(200);
     let mut reference: Vec<u8> = b"TT".to_vec();
     reference.extend_from_slice(&base);
     reference.extend_from_slice(b"TT");
@@ -84,7 +94,7 @@ fn default_cfg() -> AlignmentConfig {
 /// short reads and the only one that gets the SIMD popcount fast path.
 #[test]
 fn exact_match_resolves_via_packed_spectral() {
-    let base: Vec<u8> = (0..200).map(|i| b"CGTAGCAT"[i % 8]).collect();
+    let base = synthetic_bases(200);
     let read = base[..150].to_vec();
     let (reference, read, span) = synthetic_fixture(read);
     let cfg = default_cfg();
@@ -104,7 +114,7 @@ fn exact_match_resolves_via_packed_spectral() {
 /// be `Wfa` so the counter attributes correctly.
 #[test]
 fn single_insertion_resolves_via_wfa() {
-    let base: Vec<u8> = (0..200).map(|i| b"CGTAGCAT"[i % 8]).collect();
+    let base = synthetic_bases(200);
     // Read = ref[0..75] + 'G' (insertion) + ref[75..149]. Length stays 150.
     let mut read: Vec<u8> = base[..75].to_vec();
     read.push(b'G');

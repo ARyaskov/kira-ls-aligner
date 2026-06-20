@@ -302,7 +302,11 @@ pub(crate) fn min_len_required(
 static UNGAP_TAIL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[inline]
 fn tail_ext_enabled() -> bool {
-    *UNGAP_TAIL.get_or_init(|| std::env::var("KIRA_UNGAP_TAIL").map(|v| v != "0").unwrap_or(true))
+    *UNGAP_TAIL.get_or_init(|| {
+        std::env::var("KIRA_UNGAP_TAIL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 /// Optional override of the ungapped-accept identity floor (x10000). When set, divergent
 /// (variant-bearing) reads above this identity are accepted ungapped full-length instead of
@@ -310,7 +314,11 @@ fn tail_ext_enabled() -> bool {
 /// The hard mismatch cap still routes true indel reads (frameshift = many mismatches) to DP.
 fn ungap_min_id() -> Option<u16> {
     static V: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("KIRA_UNGAP_MINID").ok().and_then(|s| s.parse().ok()))
+    *V.get_or_init(|| {
+        std::env::var("KIRA_UNGAP_MINID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
 }
 fn ungapped_extend(
     read_seq: &[u8],

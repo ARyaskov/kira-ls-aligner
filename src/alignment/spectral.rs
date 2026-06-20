@@ -84,9 +84,7 @@ unsafe fn scan_avx2(
     n_shifts: usize,
     need_matches: usize,
 ) -> Option<SpectralHit> {
-    use std::arch::x86_64::{
-        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    };
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
     let r = read.len();
     let read_ptr = read.as_ptr();
@@ -102,10 +100,8 @@ unsafe fn scan_avx2(
         let mut abandoned = false;
         while i + 32 <= r {
             // SAFETY: bounded by loop condition; both pointers are valid for
-            let read_v =
-                unsafe { _mm256_loadu_si256(read_ptr.add(i) as *const __m256i) };
-            let ref_v =
-                unsafe { _mm256_loadu_si256(ref_ptr.add(t + i) as *const __m256i) };
+            let read_v = unsafe { _mm256_loadu_si256(read_ptr.add(i) as *const __m256i) };
+            let ref_v = unsafe { _mm256_loadu_si256(ref_ptr.add(t + i) as *const __m256i) };
             let eq = _mm256_cmpeq_epi8(read_v, ref_v);
             let mask = _mm256_movemask_epi8(eq) as u32;
             matches += mask.count_ones();
