@@ -50,9 +50,6 @@ pub fn is_available() -> bool {
 
 /// Stub for builds without `--features cuda`: never returns Ok.
 #[cfg(not(feature = "cuda"))]
-pub fn run_gpu_server(
-    _threads: usize,
-    _batch_bases: usize,
-) -> Result<(), CudaError> {
+pub fn run_gpu_server(_threads: usize, _batch_bases: usize) -> Result<(), CudaError> {
     Err(CudaError::NotBuilt)
 }

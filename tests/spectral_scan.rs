@@ -98,8 +98,12 @@ fn random_corpus_matches_naive() {
     for _ in 0..200 {
         let r = 16 + (xorshift(&mut rng) as usize % 200);
         let w = r + (xorshift(&mut rng) as usize % 100);
-        let read: Vec<u8> = (0..r).map(|_| bases[(xorshift(&mut rng) as usize) % 4]).collect();
-        let mut text: Vec<u8> = (0..w).map(|_| bases[(xorshift(&mut rng) as usize) % 4]).collect();
+        let read: Vec<u8> = (0..r)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
+        let mut text: Vec<u8> = (0..w)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
         if xorshift(&mut rng) % 2 == 0 && w >= r {
             let start = (xorshift(&mut rng) as usize) % (w - r + 1);
             text[start..start + r].copy_from_slice(&read);
@@ -109,7 +113,13 @@ fn random_corpus_matches_naive() {
         // Multiple shifts can tie; verify the reported shift achieves the
         // claimed Hamming distance and matches the naive optimum.
         let actual = (0..r).filter(|&i| read[i] != text[hit.shift + i]).count();
-        assert_eq!(hit.mismatches, actual, "Reported mismatches mismatched actual at r={r} w={w}");
-        assert_eq!(hit.mismatches, nh.mismatches, "Optimum mismatches differ from naive at r={r} w={w}");
+        assert_eq!(
+            hit.mismatches, actual,
+            "Reported mismatches mismatched actual at r={r} w={w}"
+        );
+        assert_eq!(
+            hit.mismatches, nh.mismatches,
+            "Optimum mismatches differ from naive at r={r} w={w}"
+        );
     }
 }

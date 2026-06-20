@@ -25,16 +25,16 @@ pub fn classify(features: ModeFeatures) -> ReadMode {
         0.0
     };
 
-    if p50 <= 300 {
+    if p50 <= 300 && p90 <= 400 {
         return ReadMode::Short;
     }
-    if p90 >= 1000 || p50 >= 1000 {
+    if p50 <= 400 && p90 >= 1000 {
+        return ReadMode::Hybrid;
+    }
+    if p50 >= 1000 || p90 >= 2000 {
         return ReadMode::Long;
     }
-    if p90 <= 300 && p50 <= 200 && err_rate <= 0.05 {
-        return ReadMode::Short;
-    }
-    if err_rate >= 0.1 || features.avg_minimizers < 5.0 {
+    if err_rate >= 0.1 || (features.avg_minimizers > 0.0 && features.avg_minimizers < 5.0) {
         return ReadMode::Long;
     }
 

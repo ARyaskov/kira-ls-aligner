@@ -112,8 +112,7 @@ mod windows {
     use std::mem::size_of;
     use windows_sys::Win32::System::SystemInformation::{
         GROUP_AFFINITY, GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP,
-        PROCESSOR_RELATIONSHIP, RelationProcessorCore,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        PROCESSOR_RELATIONSHIP, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
     pub fn detect() -> Option<HybridTopology> {
@@ -202,7 +201,10 @@ mod windows {
         if seen_eff_classes.len() < 2 {
             return None;
         }
-        Some(HybridTopology { p_physical, e_physical })
+        Some(HybridTopology {
+            p_physical,
+            e_physical,
+        })
     }
 }
 
@@ -222,8 +224,7 @@ mod linux {
                 continue;
             }
             if let Some((a, b)) = part.split_once('-') {
-                if let (Ok(lo), Ok(hi)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
-                {
+                if let (Ok(lo), Ok(hi)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
                     for v in lo..=hi {
                         out.push(v);
                     }

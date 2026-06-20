@@ -16,6 +16,38 @@ pub struct WfaPenalties {
     pub gap_extend: i32,
 }
 
+/// WFA2-style alignment options.
+#[derive(Clone, Copy, Debug)]
+pub struct WfaOptions {
+    /// Maximum total cost to explore before giving up (`None` ⇒ caller budget).
+    pub max_score: i32,
+    /// Adaptive wavefront pruning (WFA-adaptive heuristic). `Some(drop)` discards
+    /// diagonals lagging more than `drop` antidiagonals behind the furthest-
+    /// reaching point each step, bounding both the wavefront width (→ O(s·drop)
+    /// memory instead of O(s²)) and runtime on divergent/noisy reads. `None` is
+    /// the exact, unpruned algorithm. Heuristic: a `Some` result may be
+    /// cost ≥ the true optimum if the optimal path dipped below the drop band.
+    pub adaptive_drop: Option<i32>,
+    /// Ends-free: number of leading TEXT bases that may be skipped for free
+    /// (a free 5' gap on the reference). `0` reproduces the original
+    /// query-global / text-prefix semantics where the read must start at
+    /// `text[0]`. The trailing text gap is always free (semi-global).
+    pub text_begin_free: i32,
+}
+
+impl WfaOptions {
+    /// Exact (unpruned) semi-global options with the given cost ceiling — the
+    /// historical `wfa_align_semi_global` behaviour.
+    #[inline]
+    pub fn exact(max_score: i32) -> Self {
+        Self {
+            max_score,
+            adaptive_drop: None,
+            text_begin_free: 0,
+        }
+    }
+}
+
 /// Final alignment output.
 #[derive(Clone, Debug)]
 pub struct WfaAlignment {
@@ -91,7 +123,6 @@ impl WfaScratch {
             self.pool.push(wf.offsets);
         }
     }
-
 }
 
 thread_local! {
@@ -122,9 +153,7 @@ fn extend_diagonal_scalar(pattern: &[u8], text: &[u8], k: i32, mut offset: i32) 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn extend_diagonal_avx2(pattern: &[u8], text: &[u8], k: i32, offset: i32) -> i32 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    };
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
     let m = pattern.len() as i32;
     let n = text.len() as i32;
@@ -184,6 +213,65 @@ fn extend_wavefront(pattern: &[u8], text: &[u8], wf: &mut WaveFront) {
     }
 }
 
+/// Adaptive wavefront pruning (WFA-adaptive). Drops diagonals whose furthest
+/// cell lags more than `drop` antidiagonals (`i + j`) behind the global maximum,
+/// then compacts the offset range. Applied to the M wavefront after extension;
+/// the furthest-reaching diagonal — which is what `check_done` keys on — has the
+/// maximum antidiagonal and is therefore never pruned.
+fn prune_wavefront(wf: &mut WaveFront, drop: i32) {
+    if wf.is_empty() {
+        return;
+    }
+    // antidiagonal of diagonal k at offset o: i + j = o + (o + k) = 2o + k.
+    let mut max_ad = i32::MIN;
+    for k in wf.lo..=wf.hi {
+        let o = wf.offsets[(k - wf.lo) as usize];
+        if o != NONE_OFFSET {
+            max_ad = max_ad.max(2 * o + k);
+        }
+    }
+    if max_ad == i32::MIN {
+        return; // all-empty
+    }
+    let thresh = max_ad - drop;
+    // Tighten the live range and null interior laggards.
+    let mut new_lo = wf.lo;
+    while new_lo <= wf.hi {
+        let o = wf.offsets[(new_lo - wf.lo) as usize];
+        if o != NONE_OFFSET && 2 * o + new_lo >= thresh {
+            break;
+        }
+        new_lo += 1;
+    }
+    let mut new_hi = wf.hi;
+    while new_hi >= new_lo {
+        let o = wf.offsets[(new_hi - wf.lo) as usize];
+        if o != NONE_OFFSET && 2 * o + new_hi >= thresh {
+            break;
+        }
+        new_hi -= 1;
+    }
+    if new_lo > new_hi {
+        *wf = WaveFront::empty();
+        return;
+    }
+    for k in new_lo..=new_hi {
+        let idx = (k - wf.lo) as usize;
+        let o = wf.offsets[idx];
+        if o != NONE_OFFSET && 2 * o + k < thresh {
+            wf.offsets[idx] = NONE_OFFSET;
+        }
+    }
+    if new_lo != wf.lo || new_hi != wf.hi {
+        let start = (new_lo - wf.lo) as usize;
+        let len = (new_hi - new_lo + 1) as usize;
+        wf.offsets.copy_within(start..start + len, 0);
+        wf.offsets.truncate(len);
+        wf.lo = new_lo;
+        wf.hi = new_hi;
+    }
+}
+
 /// Check whether the pattern has been fully consumed on any diagonal in `wf`.
 fn check_done(wf: &WaveFront, pattern_len: i32) -> Option<i32> {
     for k in wf.lo..=wf.hi {
@@ -218,7 +306,6 @@ fn step(
     d_hist: &History,
     pool: &mut Vec<Vec<i32>>,
 ) -> (WaveFront, WaveFront, WaveFront) {
-
     let s_x = s - pen.mismatch;
     let s_oe = s - pen.gap_open - pen.gap_extend;
     let s_e = s - pen.gap_extend;
@@ -359,13 +446,29 @@ fn step(
 }
 
 /// Align `pattern` to a prefix of `text` (semi-global) under affine-gap WFA.
+///
+/// Back-compat wrapper: exact (unpruned), read starts at `text[0]`.
+#[inline]
 pub fn wfa_align_semi_global(
     pattern: &[u8],
     text: &[u8],
     pen: WfaPenalties,
     max_score: i32,
 ) -> Option<WfaAlignment> {
+    wfa_align(pattern, text, pen, WfaOptions::exact(max_score))
+}
+
+/// Align `pattern` against `text` under affine-gap WFA with WFA2 options
+/// (adaptive pruning, ends-free leading text). The trailing text gap is always
+/// free. Returns the lowest-cost alignment whose cost ≤ `opts.max_score`.
+pub fn wfa_align(
+    pattern: &[u8],
+    text: &[u8],
+    pen: WfaPenalties,
+    opts: WfaOptions,
+) -> Option<WfaAlignment> {
     let m = pattern.len() as i32;
+    let n = text.len() as i32;
     if m == 0 {
         return Some(WfaAlignment {
             score: 0,
@@ -374,6 +477,9 @@ pub fn wfa_align_semi_global(
             text_end: 0,
         });
     }
+    let max_score = opts.max_score;
+    // Free leading-text diagonals 0..=tbf (clamped to the text length).
+    let tbf = opts.text_begin_free.max(0).min((n - 1).max(0));
 
     WFA_SCRATCH.with(|scratch_cell| {
         let mut scratch = scratch_cell.borrow_mut();
@@ -388,24 +494,28 @@ pub fn wfa_align_semi_global(
 
         let mut m0_offsets = pool.pop().unwrap_or_default();
         m0_offsets.clear();
-        m0_offsets.push(0);
+        m0_offsets.resize((tbf + 1) as usize, 0);
         let mut m0 = WaveFront {
             lo: 0,
-            hi: 0,
+            hi: tbf,
             offsets: m0_offsets,
         };
         extend_wavefront(pattern, text, &mut m0);
+        if let Some(drop) = opts.adaptive_drop {
+            prune_wavefront(&mut m0, drop);
+        }
 
         if let Some(k_end) = check_done(&m0, m) {
             // Store m0 so build_cigar can read it.
             ensure_score_capacity(m_hist, 0);
             m_hist[0] = m0;
-            let cigar = build_cigar(pattern, text, m_hist, i_hist, d_hist, 0, k_end, pen);
+            let (cigar, k_start) =
+                build_cigar(pattern, text, m_hist, i_hist, d_hist, 0, k_end, pen);
             let end_text = m + k_end;
             return Some(WfaAlignment {
                 score: 0,
                 cigar,
-                text_start: 0,
+                text_start: k_start.max(0) as usize,
                 text_end: end_text as usize,
             });
         }
@@ -415,6 +525,9 @@ pub fn wfa_align_semi_global(
         for s in 1..=max_score {
             let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool);
             extend_wavefront(pattern, text, &mut new_m);
+            if let Some(drop) = opts.adaptive_drop {
+                prune_wavefront(&mut new_m, drop);
+            }
 
             if let Some(k_end) = check_done(&new_m, m) {
                 ensure_score_capacity(m_hist, s as usize);
@@ -424,11 +537,12 @@ pub fn wfa_align_semi_global(
                 i_hist[s as usize] = new_i;
                 d_hist[s as usize] = new_d;
                 let end_text = m + k_end;
-                let cigar = build_cigar(pattern, text, m_hist, i_hist, d_hist, s, k_end, pen);
+                let (cigar, k_start) =
+                    build_cigar(pattern, text, m_hist, i_hist, d_hist, s, k_end, pen);
                 return Some(WfaAlignment {
                     score: s,
                     cigar,
-                    text_start: 0,
+                    text_start: k_start.max(0) as usize,
                     text_end: end_text as usize,
                 });
             }
@@ -441,6 +555,102 @@ pub fn wfa_align_semi_global(
             d_hist[s as usize] = new_d;
         }
 
+        None
+    })
+}
+
+/// Retire a score layer once it falls outside the recurrence look-back window,
+/// recycling its offset buffer to the pool so peak memory stays bounded.
+#[inline]
+fn retire_layer(hist: &mut History, pool: &mut Vec<Vec<i32>>, s: usize) {
+    if s < hist.len() {
+        let wf = std::mem::replace(&mut hist[s], WaveFront::empty());
+        if !wf.offsets.is_empty() {
+            pool.push(wf.offsets);
+        }
+    }
+}
+
+/// Exact optimal semi-global WFA **cost** in O(width · penalty-depth) memory.
+///
+/// This is a forward, linear-history WFA engine: it runs the same M/I/D
+/// recurrence as [`wfa_align`] but, because no traceback is needed,
+/// it retires score layers as soon as they fall outside the recurrence
+/// look-back window (`max(mismatch, gap_open+gap_extend)`), recycling their
+/// offset buffers. Peak heavy memory is therefore bounded by a constant number
+/// of wavefronts rather than the full O(s²) history, making it a cheap,
+/// memory-flat acceptance/cost pre-check. Returns the optimal cost, or `None`
+/// if no alignment exists within `opts.max_score`.
+pub fn wfa_score_only(
+    pattern: &[u8],
+    text: &[u8],
+    pen: WfaPenalties,
+    opts: WfaOptions,
+) -> Option<i32> {
+    let m = pattern.len() as i32;
+    let n = text.len() as i32;
+    if m == 0 {
+        return Some(0);
+    }
+    let max_score = opts.max_score;
+    let tbf = opts.text_begin_free.max(0).min((n - 1).max(0));
+    let lookback = pen
+        .mismatch
+        .max(pen.gap_open + pen.gap_extend)
+        .max(pen.gap_extend);
+
+    WFA_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        scratch.reset();
+        let WfaScratch {
+            m_hist,
+            i_hist,
+            d_hist,
+            pool,
+        } = &mut *scratch;
+
+        let mut m0_offsets = pool.pop().unwrap_or_default();
+        m0_offsets.clear();
+        m0_offsets.resize((tbf + 1) as usize, 0);
+        let mut m0 = WaveFront {
+            lo: 0,
+            hi: tbf,
+            offsets: m0_offsets,
+        };
+        extend_wavefront(pattern, text, &mut m0);
+        if let Some(drop) = opts.adaptive_drop {
+            prune_wavefront(&mut m0, drop);
+        }
+        if check_done(&m0, m).is_some() {
+            return Some(0);
+        }
+        ensure_score_capacity(m_hist, 0);
+        m_hist[0] = m0;
+
+        for s in 1..=max_score {
+            let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool);
+            extend_wavefront(pattern, text, &mut new_m);
+            if let Some(drop) = opts.adaptive_drop {
+                prune_wavefront(&mut new_m, drop);
+            }
+            let done = check_done(&new_m, m).is_some();
+            ensure_score_capacity(m_hist, s as usize);
+            ensure_score_capacity(i_hist, s as usize);
+            ensure_score_capacity(d_hist, s as usize);
+            m_hist[s as usize] = new_m;
+            i_hist[s as usize] = new_i;
+            d_hist[s as usize] = new_d;
+            if done {
+                return Some(s);
+            }
+            // Retire the layer that just fell outside the look-back window.
+            let retire = s - lookback - 1;
+            if retire >= 0 {
+                retire_layer(m_hist, pool, retire as usize);
+                retire_layer(i_hist, pool, retire as usize);
+                retire_layer(d_hist, pool, retire as usize);
+            }
+        }
         None
     })
 }
@@ -464,7 +674,7 @@ fn build_cigar(
     s_final: i32,
     k_final: i32,
     pen: WfaPenalties,
-) -> Vec<CigarOp> {
+) -> (Vec<CigarOp>, i32) {
     let m_len = pattern.len() as i32;
 
     let mut ops: Vec<CigarOp> = Vec::new();
@@ -483,11 +693,7 @@ fn build_cigar(
             return NONE_OFFSET;
         }
         let w = &hist[score as usize];
-        if w.is_empty() {
-            NONE_OFFSET
-        } else {
-            w.get(k)
-        }
+        if w.is_empty() { NONE_OFFSET } else { w.get(k) }
     };
 
     // Helper to push a matching/diag run starting at offset, ending at target_offset.
@@ -501,7 +707,6 @@ fn build_cigar(
     while !(s == 0 && layer == Layer::M && offset == 0) {
         match layer {
             Layer::M => {
-
                 let mut walk = offset;
                 loop {
                     if walk == 0 {
@@ -638,7 +843,9 @@ fn build_cigar(
     }
 
     ops.reverse();
-    ops
+    // At termination `k` is the diagonal of the alignment start; with
+    // `text_begin_free` seeding, the start text position is exactly this `k`.
+    (ops, k)
 }
 
 fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {

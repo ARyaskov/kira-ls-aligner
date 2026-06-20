@@ -7,12 +7,10 @@
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::index::{Index, IndexConfig};
 use kira_ls_aligner::io::IngestMode;
-use kira_ls_aligner::pipeline::pairing::{
-    PairedConfig, RescueConfig, rescue_discordant_pairs,
-};
+use kira_ls_aligner::pipeline::pairing::{PairedConfig, RescueConfig, rescue_discordant_pairs};
 use kira_ls_aligner::types::{
-    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases,
-    RefSeq, Reference,
+    Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq,
+    Reference,
 };
 
 fn synth_reference() -> Reference {
@@ -20,7 +18,9 @@ fn synth_reference() -> Reference {
     let mut buf = Vec::with_capacity(100_000);
     let bases = b"ACGT";
     for _ in 0..100_000 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         buf.push(bases[(seed >> 33) as usize & 3]);
     }
     Reference {
@@ -188,14 +188,19 @@ fn rescues_discordant_r2_into_insert_window() {
     assert!(
         r2_primary.ref_start >= lo && r2_primary.ref_end <= hi,
         "rescued R2 ref [{}, {}) outside expected window [{}, {})",
-        r2_primary.ref_start, r2_primary.ref_end, lo, hi
+        r2_primary.ref_start,
+        r2_primary.ref_end,
+        lo,
+        hi
     );
     // And it should land at the true insert site.
     assert!(
-        r2_primary.ref_start <= r2_true_end as u32
-            && r2_primary.ref_end >= r2_true_start as u32,
+        r2_primary.ref_start <= r2_true_end as u32 && r2_primary.ref_end >= r2_true_start as u32,
         "rescued region [{}, {}) didn't overlap true site [{}, {})",
-        r2_primary.ref_start, r2_primary.ref_end, r2_true_start, r2_true_end
+        r2_primary.ref_start,
+        r2_primary.ref_end,
+        r2_true_start,
+        r2_true_end
     );
     // The old discordant placement (at 50000) should still be in the vec
     // but at slot 1 (rescue inserts new at slot 0).

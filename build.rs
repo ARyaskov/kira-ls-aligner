@@ -50,12 +50,7 @@ mod cuda_build {
         );
     }
 
-    fn compile_one(
-        nvcc: &PathBuf,
-        src: &PathBuf,
-        ptx_path: &PathBuf,
-        env_var: &str,
-    ) {
+    fn compile_one(nvcc: &PathBuf, src: &PathBuf, ptx_path: &PathBuf, env_var: &str) {
         let mut cmd = Command::new(nvcc);
         cmd.args([
             "-ptx",
@@ -103,7 +98,16 @@ mod cuda_build {
                         println!("cargo:warning=  nvcc: {line}");
                     }
                 }
-                let hint = if cfg!(target_os = "windows") {
+                let compiler_mismatch = [stdout.as_ref(), stderr.as_ref()].iter().any(|output| {
+                    output.contains("Unexpected compiler version")
+                        || output.contains("unsupported Microsoft Visual Studio version")
+                        || output.contains("unsupported host compiler")
+                });
+                let hint = if cfg!(target_os = "windows") && compiler_mismatch {
+                    "The installed CUDA toolkit is incompatible with this MSVC/STL version. \
+                     Install a CUDA-supported MSVC toolset and point CUDAHOSTCXX at its cl.exe, \
+                     or upgrade the CUDA toolkit."
+                } else if cfg!(target_os = "windows") {
                     "If nvcc complains about cl.exe: run cargo from an x64 Native \
                      Tools Command Prompt for VS, OR pass --ccbin to nvcc, OR set \
                      CUDAHOSTCXX env var to the cl.exe full path."
@@ -186,8 +190,12 @@ mod cuda_build {
         }
         // 3. VCINSTALLDIR (set by vcvars*.bat).
         if let Ok(vc) = std::env::var("VCINSTALLDIR") {
-            let candidate = PathBuf::from(vc).join("bin").join("Hostx64").join("x64");
+            let vc = PathBuf::from(vc);
+            let candidate = vc.join("bin").join("Hostx64").join("x64");
             if candidate.join("cl.exe").is_file() {
+                return Some(candidate);
+            }
+            if let Some(candidate) = newest_msvc_toolset(&vc.join("Tools").join("MSVC")) {
                 return Some(candidate);
             }
         }
@@ -219,8 +227,7 @@ mod cuda_build {
                                 entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
                             versions.sort();
                             for v in versions.iter().rev() {
-                                let candidate =
-                                    v.join("bin").join("Hostx64").join("x64");
+                                let candidate = v.join("bin").join("Hostx64").join("x64");
                                 if candidate.join("cl.exe").is_file() {
                                     return Some(candidate);
                                 }
@@ -230,7 +237,49 @@ mod cuda_build {
                 }
             }
         }
+        // 5. Preview/Insiders installs may not be registered in the stable
+        // Visual Studio Installer database, so vswhere can return no rows
+        // even though a complete toolset exists. Probe the documented layout
+        // under both Program Files roots without recursively walking them.
+        for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            let Some(program_files) = std::env::var_os(env_name) else {
+                continue;
+            };
+            let vs_root = PathBuf::from(program_files).join("Microsoft Visual Studio");
+            let Ok(version_dirs) = std::fs::read_dir(vs_root) else {
+                continue;
+            };
+            let mut installations = Vec::new();
+            for version_dir in version_dirs.filter_map(Result::ok) {
+                let Ok(editions) = std::fs::read_dir(version_dir.path()) else {
+                    continue;
+                };
+                installations.extend(editions.filter_map(Result::ok).map(|entry| entry.path()));
+            }
+            installations.sort();
+            for installation in installations.iter().rev() {
+                if let Some(candidate) =
+                    newest_msvc_toolset(&installation.join("VC").join("Tools").join("MSVC"))
+                {
+                    return Some(candidate);
+                }
+            }
+        }
         None
+    }
+
+    #[cfg(target_os = "windows")]
+    fn newest_msvc_toolset(msvc_root: &std::path::Path) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(msvc_root).ok()?;
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        versions.sort();
+        versions.into_iter().rev().find_map(|version| {
+            let candidate = version.join("bin").join("Hostx64").join("x64");
+            candidate.join("cl.exe").is_file().then_some(candidate)
+        })
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -44,7 +44,12 @@ fn insert_spec_parses_2_and_4_field_forms() {
 
     cfg.apply_insert_spec("0,1500,300,40").unwrap();
     assert_eq!(
-        (cfg.insert_min, cfg.insert_max, cfg.insert_mean, cfg.insert_sd),
+        (
+            cfg.insert_min,
+            cfg.insert_max,
+            cfg.insert_mean,
+            cfg.insert_sd
+        ),
         (0, 1500, 300, 40)
     );
 
@@ -82,10 +87,7 @@ fn proper_pair_fr_orientation_in_window() {
 fn not_proper_when_different_refs() {
     let mut cfg = PairedConfig::default();
     cfg.mode = IngestMode::TwoFile;
-    let reads = vec![
-        dummy_read("x", PairRole::R1),
-        dummy_read("x", PairRole::R2),
-    ];
+    let reads = vec![dummy_read("x", PairRole::R1), dummy_read("x", PairRole::R2)];
     let mut alns = vec![
         vec![dummy_aln(0, 100, 250, false)],
         vec![dummy_aln(1, 100, 250, true)],
@@ -101,10 +103,7 @@ fn not_proper_when_different_refs() {
 fn mate_unmapped_marks_correct_bit() {
     let mut cfg = PairedConfig::default();
     cfg.mode = IngestMode::TwoFile;
-    let reads = vec![
-        dummy_read("x", PairRole::R1),
-        dummy_read("x", PairRole::R2),
-    ];
+    let reads = vec![dummy_read("x", PairRole::R1), dummy_read("x", PairRole::R2)];
     let mut alns = vec![vec![dummy_aln(0, 100, 250, false)], vec![]];
     let mut umi = vec![None; reads.len()];
     apply_pairing(&reads, &mut alns, &mut umi, &cfg);
@@ -143,10 +142,7 @@ fn rerank_keeps_concordant_pair_at_slot_0() {
     cfg.mode = IngestMode::TwoFile;
     cfg.insert_mean = 400;
     cfg.insert_sd = 100;
-    let reads = vec![
-        dummy_read("r", PairRole::R1),
-        dummy_read("r", PairRole::R2),
-    ];
+    let reads = vec![dummy_read("r", PairRole::R1), dummy_read("r", PairRole::R2)];
     let mut alns = vec![
         vec![
             dummy_aln_score(0, 100, 250, false, 150),
@@ -166,10 +162,7 @@ fn rerank_promotes_pair_consistent_alternative() {
     cfg.mode = IngestMode::TwoFile;
     cfg.insert_mean = 400;
     cfg.insert_sd = 100;
-    let reads = vec![
-        dummy_read("r", PairRole::R1),
-        dummy_read("r", PairRole::R2),
-    ];
+    let reads = vec![dummy_read("r", PairRole::R1), dummy_read("r", PairRole::R2)];
     let mut alns = vec![
         vec![
             dummy_aln_score(1, 50_000, 50_150, false, 200),
@@ -200,10 +193,7 @@ fn rerank_no_bonus_when_all_combos_discordant() {
     cfg.mode = IngestMode::TwoFile;
     cfg.insert_mean = 400;
     cfg.insert_sd = 100;
-    let reads = vec![
-        dummy_read("r", PairRole::R1),
-        dummy_read("r", PairRole::R2),
-    ];
+    let reads = vec![dummy_read("r", PairRole::R1), dummy_read("r", PairRole::R2)];
     let r1_orig = 150;
     let r2_orig = 140;
     let mut alns = vec![

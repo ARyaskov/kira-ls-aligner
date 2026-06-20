@@ -2,19 +2,17 @@
 //! MAPQ score boost, polyA trimming.
 
 use kira_ls_aligner::alignment::AlignmentConfig;
-use kira_ls_aligner::alignment::splice::{
-    SpliceConfig, SpliceStrandPolicy, align_spliced_chain,
-};
-use kira_ls_aligner::types::{
-    Anchor, Chain, CigarKind, PairRole, ReadRecord, Strand,
-};
+use kira_ls_aligner::alignment::splice::{SpliceConfig, SpliceStrandPolicy, align_spliced_chain};
+use kira_ls_aligner::types::{Anchor, Chain, CigarKind, PairRole, ReadRecord, Strand};
 
 fn synth_dna(seed: u64, len: usize) -> Vec<u8> {
     let mut s = seed;
     let bases = b"ACGT";
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(bases[(s >> 33) as usize & 3]);
     }
     out
@@ -112,8 +110,16 @@ fn refinement_slides_boundary_to_canonical_signal() {
         ref_end: 1800,
     };
 
-    let aln = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg_default(), None, 2)
-        .expect("alignment should succeed");
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .expect("alignment should succeed");
 
     // The refined intron should be 1501 - 1003 = 498 bp (not 1501 - 1000 = 501).
     let n_lengths: Vec<u32> = aln
@@ -193,9 +199,16 @@ fn canonical_signal_boosts_score_over_non_canonical() {
         ref_end: 2900,
     };
 
-    let aln_canon =
-        align_spliced_chain(&chain, &read, &ref_canon, align_cfg(), splice_cfg_default(), None, 2)
-            .unwrap();
+    let aln_canon = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_canon,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .unwrap();
     // For nc, the per-exon SW score may differ because the underlying ref
     // bases differ — adjust read to match nc's exon bodies for a fair
     // comparison.
@@ -283,8 +296,16 @@ fn polya_tail_is_soft_clipped() {
         ref_end: 2900,
     };
 
-    let aln = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg_default(), None, 2)
-        .unwrap();
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .unwrap();
 
     // Trailing soft-clip should include the 50 bp polyA.
     let last_op = aln.cigar.last().expect("non-empty cigar");

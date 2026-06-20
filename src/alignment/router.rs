@@ -70,8 +70,8 @@ pub const DEFAULT_MYERS_BOUND_FLOOR: u32 = 4;
 /// below floor) still accept reads sitting on a het site plus 1–2 sequencing
 /// errors. Percent unchanged (8 % of read_len). Override with
 /// `KIRA_SPECTRAL_MISM_PCT` / `KIRA_SPECTRAL_MISM_FLOOR`.
-pub const DEFAULT_SPECTRAL_MISM_PCT: u32 = 8;
-pub const DEFAULT_SPECTRAL_MISM_FLOOR: u32 = 8;
+pub const DEFAULT_SPECTRAL_MISM_PCT: u32 = 3;
+pub const DEFAULT_SPECTRAL_MISM_FLOOR: u32 = 2;
 
 fn env_u32(name: &'static str, default: u32) -> u32 {
     static CELLS: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, u32>>> =
@@ -111,6 +111,29 @@ pub fn myers_bound_pct() -> u32 {
 #[inline]
 pub fn myers_bound_floor() -> u32 {
     env_u32("KIRA_MYERS_BOUND_FLOOR", DEFAULT_MYERS_BOUND_FLOOR)
+}
+
+/// WFA-adaptive pruning drop, from `KIRA_WFA_ADAPTIVE` (antidiagonals).
+///
+/// `Some(d)` for `d > 0` enables the WFA2 adaptive heuristic — bounding the
+/// wavefront width to ~`2d`, giving O(s·d) memory and near-linear time on
+/// similar sequences at the cost of exactness. Unset / `0` ⇒ `None` (exact).
+#[inline]
+pub fn wfa_adaptive_drop() -> Option<i32> {
+    static CELL: OnceLock<Option<i32>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_WFA_ADAPTIVE")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
+/// Free leading-reference bases for ends-free WFA, from `KIRA_WFA_ENDS_FREE`.
+/// `0` (default) keeps the read pinned to the window start.
+#[inline]
+pub fn wfa_ends_free() -> i32 {
+    env_u32("KIRA_WFA_ENDS_FREE", 0) as i32
 }
 
 /// Choose the preferred aligner for a read of the given length.

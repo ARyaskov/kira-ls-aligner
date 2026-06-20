@@ -35,26 +35,76 @@ pub fn assign_mapq(
     pair_ctx: Option<PairMapqContext>,
     repeat_min_occ: u32,
 ) {
+    assign_mapq_with_qual(alignments, read_len, None, cfg, pair_ctx, repeat_min_occ);
+}
+
+/// Assign MAPQ using FASTQ qualities when they are available.
+pub fn assign_mapq_with_qual(
+    alignments: &mut [Alignment],
+    read_len: usize,
+    qual: Option<&[u8]>,
+    cfg: MapqConfig,
+    pair_ctx: Option<PairMapqContext>,
+    repeat_min_occ: u32,
+) {
+    assign_mapq_impl(
+        alignments,
+        read_len,
+        qual,
+        cfg,
+        pair_ctx,
+        repeat_min_occ,
+        false,
+    );
+}
+
+/// Assign MAPQ while preserving a primary selected by joint paired-end
+/// scoring and mate rescue.
+pub fn assign_mapq_preserving_primary(
+    alignments: &mut [Alignment],
+    read_len: usize,
+    qual: Option<&[u8]>,
+    cfg: MapqConfig,
+    pair_ctx: Option<PairMapqContext>,
+    repeat_min_occ: u32,
+) {
+    assign_mapq_impl(
+        alignments,
+        read_len,
+        qual,
+        cfg,
+        pair_ctx,
+        repeat_min_occ,
+        true,
+    );
+}
+
+fn assign_mapq_impl(
+    alignments: &mut [Alignment],
+    read_len: usize,
+    qual: Option<&[u8]>,
+    cfg: MapqConfig,
+    pair_ctx: Option<PairMapqContext>,
+    repeat_min_occ: u32,
+    preserve_primary: bool,
+) {
     if alignments.is_empty() {
         return;
     }
-    alignments.sort_by_key(|a| std::cmp::Reverse(a.score));
+    if !preserve_primary {
+        alignments.sort_by_key(|a| std::cmp::Reverse(a.score));
+    }
     let best = alignments[0].score.max(1);
-    let primary_read_start = alignments[0].read_start;
-    let primary_read_end = alignments[0].read_end;
-    let sub_real = alignments.iter().skip(1).find_map(|a| {
-        if read_overlap_pct(
-            primary_read_start,
-            primary_read_end,
-            a.read_start,
-            a.read_end,
-        ) >= 50
-        {
-            Some(a.score)
-        } else {
-            None
-        }
-    });
+    let (primary_read_start, primary_read_end) = original_read_interval(&alignments[0], read_len);
+    let sub_real = alignments
+        .iter()
+        .skip(1)
+        .filter_map(|a| {
+            let (read_start, read_end) = original_read_interval(a, read_len);
+            (read_overlap_pct(primary_read_start, primary_read_end, read_start, read_end) >= 50)
+                .then_some(a.score)
+        })
+        .max();
     let sub = sub_real.unwrap_or_else(|| alignments[0].xs_score.unwrap_or(0));
 
     let cap = if read_len <= cfg.short_read_len {
@@ -65,7 +115,11 @@ pub fn assign_mapq(
 
     let occ_cap = repeat_occ_cap(repeat_min_occ) as i32;
     let id_cap = identity_mapq_cap(&alignments[0], read_len) as i32;
-    let primary_mapq = compute_mapq(best, sub, cap).min(occ_cap).min(id_cap);
+    let qual_cap = quality_mapq_cap(qual) as i32;
+    let primary_mapq = compute_mapq(best, sub, cap, read_len)
+        .min(occ_cap)
+        .min(id_cap)
+        .min(qual_cap);
 
     alignments[0].mapq = primary_mapq as u8;
     alignments[0].xs_score = if sub > 0 { Some(sub) } else { None };
@@ -74,13 +128,16 @@ pub fn assign_mapq(
     apply_discordant_cap(&mut alignments[0], pair_ctx);
 
     for aln in alignments.iter_mut().skip(1) {
+        let (read_start, read_end) = original_read_interval(aln, read_len);
         let overlap_pct =
-            read_overlap_pct(primary_read_start, primary_read_end, aln.read_start, aln.read_end);
+            read_overlap_pct(primary_read_start, primary_read_end, read_start, read_end);
         if overlap_pct < 50 {
             aln.is_supplementary = true;
             aln.is_secondary = false;
             let s_id_cap = identity_mapq_cap(aln, read_len) as i32;
-            aln.mapq = compute_mapq(aln.score.max(1), 0, cap).min(occ_cap).min(s_id_cap) as u8;
+            // A supplementary segment is part of the same placement decision;
+            // it must not become more confident than the primary.
+            aln.mapq = primary_mapq.min(occ_cap).min(s_id_cap).min(qual_cap) as u8;
             aln.xs_score = None;
             apply_discordant_cap(aln, pair_ctx);
         } else {
@@ -100,7 +157,9 @@ fn apply_discordant_cap(aln: &mut Alignment, ctx: Option<PairMapqContext>) {
     if !m.is_paired || m.mate_is_unmapped {
         return;
     }
-    let Some(mate_ref) = m.mate_ref_id else { return };
+    let Some(mate_ref) = m.mate_ref_id else {
+        return;
+    };
     if mate_ref != aln.ref_id {
         return;
     }
@@ -123,28 +182,30 @@ fn apply_discordant_cap(aln: &mut Alignment, ctx: Option<PairMapqContext>) {
 
 /// MAPQ ceiling implied by a read's seed copy-number (`repeat_min_occ`).
 ///
-/// `occ == 1` (a uniquely-placeable seed exists) imposes no cap. `occ >= 2`
-/// means every seed also occurs elsewhere, so the read maps to ~`occ` loci and
-/// its placement is a guess — bwa-style, such reads get near-zero MAPQ. This is
-/// the fix for confident paralog/repeat mismapping (the dominant SNP false-positive
-/// source). Disabled with `KIRA_REPEAT_MAPQ=0`.
+/// A small per-seed copy count does not prove that the full read is ambiguous:
+/// the intersection of several 2-copy seeds can still identify one locus.
+/// Real close competitors are handled by the best/sub score model. This cap is
+/// therefore conservative until every usable seed is highly repetitive.
+/// Disabled with `KIRA_REPEAT_MAPQ=0`.
 fn repeat_occ_cap(occ: u32) -> u8 {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
-        // Default OFF: the seed-occurrence MAPQ cap did not improve F1 in validation
-        // (the FP-causing reads are min_occ=1). Opt in with KIRA_REPEAT_MAPQ=1.
+        // Enabled by default. `repeat_min_occ=0` means unknown/no usable seed
+        // and imposes no cap.
         std::env::var("KIRA_REPEAT_MAPQ")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     });
     if !enabled || occ <= 1 {
         return 60;
     }
     match occ {
-        2 => 3,
-        3 => 2,
-        _ => 0,
+        0..=4 => 60,
+        5..=16 => 40,
+        17..=64 => 20,
+        65..=128 => 10,
+        _ => 3,
     }
 }
 
@@ -195,7 +256,7 @@ fn identity_mapq_cap(aln: &Alignment, _read_len: usize) -> u8 {
 const SUB_FLOOR_DIVISOR: i32 = 2;
 
 /// Compute MAPQ from a best/sub score pair under a cap.
-fn compute_mapq(best: i32, sub: i32, cap: i32) -> i32 {
+fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize) -> i32 {
     let best = best.max(1);
     let floor = best / SUB_FLOOR_DIVISOR;
     if sub < floor {
@@ -204,9 +265,13 @@ fn compute_mapq(best: i32, sub: i32, cap: i32) -> i32 {
     if sub >= best {
         return 0;
     }
-    let span = (best - floor).max(1);
-    let diff = best - sub;
-    (diff * cap / span).clamp(0, cap)
+    let relative_gap = (best - sub) as f64 / best as f64;
+    let length_scale = ((read_len.max(1) as f64) / 100.0).sqrt().clamp(0.75, 3.0);
+    // Approximate posterior error from score separation. The constants are
+    // intentionally conservative and must be recalibrated by the benchmark
+    // reliability gate when truth-labelled data changes.
+    let p_error = (-22.5 * relative_gap * length_scale).exp().clamp(1e-6, 1.0);
+    (-10.0 * p_error.log10()).round().clamp(0.0, cap as f64) as i32
 }
 
 /// Percentage overlap between `[a_start..a_end)` and `[b_start..b_end)` as a share of the.
@@ -222,7 +287,35 @@ fn read_overlap_pct(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> u32 {
         return 0;
     }
     let overlap = overlap_end - overlap_start;
-    (overlap.saturating_mul(100)) / a_len
+    (overlap.saturating_mul(100)) / a_len.min(b_len)
+}
+
+#[inline]
+fn original_read_interval(aln: &Alignment, read_len: usize) -> (u32, u32) {
+    let len = u32::try_from(read_len).unwrap_or(u32::MAX);
+    if aln.is_rev {
+        (
+            len.saturating_sub(aln.read_end),
+            len.saturating_sub(aln.read_start),
+        )
+    } else {
+        (aln.read_start, aln.read_end)
+    }
+}
+
+/// Low-quality reads cannot support a highly confident placement even when the
+/// candidate search found no close competitor. FASTQ qualities are Phred+33;
+/// Q30 and above leave the standard MAPQ-60 ceiling unchanged.
+fn quality_mapq_cap(qual: Option<&[u8]>) -> u8 {
+    let Some(qual) = qual.filter(|q| !q.is_empty()) else {
+        return 60;
+    };
+    let sum: u64 = qual
+        .iter()
+        .map(|&q| q.saturating_sub(33).min(60) as u64)
+        .sum();
+    let mean_q = (sum / qual.len() as u64) as u8;
+    mean_q.saturating_mul(2).min(60)
 }
 
 #[cfg(test)]

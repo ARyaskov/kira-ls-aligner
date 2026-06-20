@@ -1,7 +1,9 @@
 use rayon::prelude::*;
 
-use crate::mapq::{MapqConfig, PairMapqContext, assign_mapq};
-use crate::types::{Alignment, MateInfo};
+use crate::mapq::{
+    MapqConfig, PairMapqContext, assign_mapq_preserving_primary, assign_mapq_with_qual,
+};
+use crate::types::{Alignment, MateInfo, PairRole};
 
 use super::stage4_alignment::{AlignBatch, AlignmentBatchStats};
 
@@ -25,7 +27,25 @@ pub fn run(input: AlignBatch, cfg: MapqConfig, pair_ctx: Option<PairMapqContext>
         .par_iter_mut()
         .zip(reads.par_iter())
         .for_each(|(alns, read)| {
-            assign_mapq(alns, read.seq.len(), cfg, pair_ctx, read.repeat_min_occ);
+            if read.pair_role == PairRole::Unpaired {
+                assign_mapq_with_qual(
+                    alns,
+                    read.seq.len(),
+                    read.qual.as_deref(),
+                    cfg,
+                    pair_ctx,
+                    read.repeat_min_occ,
+                );
+            } else {
+                assign_mapq_preserving_primary(
+                    alns,
+                    read.seq.len(),
+                    read.qual.as_deref(),
+                    cfg,
+                    pair_ctx,
+                    read.repeat_min_occ,
+                );
+            }
         });
 
     ScoredBatch {

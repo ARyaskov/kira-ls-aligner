@@ -221,11 +221,8 @@ fn fingerprint_changes_on_substitution_at_probe_pos() {
 fn index_recalls_inserted_window() {
     let scheme = FingerprintScheme::new(2024, 150, 16);
     let ref_bases = random_dna(10_000, 42);
-    let idx = CgkIndex::build_from_sequences(
-        scheme,
-        30,
-        std::iter::once((0u32, ref_bases.as_slice())),
-    );
+    let idx =
+        CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
     let win = &ref_bases[300..450];
     let candidates = idx.query(win, 1);
     assert!(
@@ -239,13 +236,16 @@ fn index_recalls_inserted_window() {
 fn index_recalls_indel_variant_window() {
     let scheme = FingerprintScheme::new(2024, 150, 16);
     let ref_bases = random_dna(20_000, 99);
-    let idx = CgkIndex::build_from_sequences(
-        scheme,
-        30,
-        std::iter::once((0u32, ref_bases.as_slice())),
-    );
+    let idx =
+        CgkIndex::build_from_sequences(scheme, 30, std::iter::once((0u32, ref_bases.as_slice())));
     let mut hits = 0;
-    let trials = [(600usize, 75usize), (900, 30), (1200, 100), (1500, 60), (1800, 90)];
+    let trials = [
+        (600usize, 75usize),
+        (900, 30),
+        (1200, 100),
+        (1500, 60),
+        (1800, 90),
+    ];
     for &(true_pos, edit_pos) in &trials {
         let win = &ref_bases[true_pos..true_pos + 150];
         let edited = apply_one_insertion(win, edit_pos, b'C');

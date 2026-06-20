@@ -2,8 +2,8 @@ pub mod lsh;
 pub mod tiling;
 
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -182,13 +182,23 @@ impl OccStorage {
                 let data = mmap.expect("mmap required for mmap occs");
                 let base = *offset + idx * OCC_DISK_SIZE;
                 let ref_id = u32::from_le_bytes([
-                    data[base], data[base + 1], data[base + 2], data[base + 3],
+                    data[base],
+                    data[base + 1],
+                    data[base + 2],
+                    data[base + 3],
                 ]);
                 let pos = u32::from_le_bytes([
-                    data[base + 4], data[base + 5], data[base + 6], data[base + 7],
+                    data[base + 4],
+                    data[base + 5],
+                    data[base + 6],
+                    data[base + 7],
                 ]);
                 let strand = u8_to_strand(data[base + 8]);
-                Occ { ref_id, pos, strand }
+                Occ {
+                    ref_id,
+                    pos,
+                    strand,
+                }
             }
         }
     }
@@ -211,6 +221,14 @@ impl MinimizerIndex {
         let n_seqs = reference.sequences.len();
         let total_bp: usize = reference.sequences.iter().map(|s| s.len(None)).sum();
         let bytes_per_min = std::mem::size_of::<crate::types::Minimizer>();
+        // Tied minima in low-complexity sequence can emit almost one
+        // minimizer per base. Average-density estimates (~2/w) are unsafe for
+        // deciding whether the all-in-memory sort can fit.
+        let estimated_mins = total_bp;
+        let estimated_flat_bytes = estimated_mins.saturating_mul(std::mem::size_of::<FlatMin>());
+        if estimated_flat_bytes > ram_budget_bytes / 3 {
+            return Self::build_external(reference, cfg, k, w, max_occ, ram_budget_bytes);
+        }
 
         // Per-chunk peak buffer fits in 1/8 of the RAM budget.
         let chunk_byte_budget = (ram_budget_bytes / 8).max(64 * 1024 * 1024);
@@ -315,7 +333,10 @@ impl MinimizerIndex {
             while j < flat.len() && flat[j].hash == h {
                 j += 1;
             }
-            bucket_lens.push((j - i) as u32);
+            let retained = (j - i).min(max_occ.saturating_add(1));
+            bucket_lens.push(
+                u32::try_from(retained).expect("retained minimizer bucket length exceeds u32"),
+            );
             i = j;
         }
         let t_group_dur = t_group.elapsed();
@@ -330,8 +351,7 @@ impl MinimizerIndex {
             .map(|v| v.trim() != "0")
             .unwrap_or(true);
         let t_lookup = Instant::now();
-        let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph
-        {
+        let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph {
             eprintln!(
                 "[KIRA_INDEX] (k={k} w={w}) phase D: building PtrHash25 over {:.1}M keys \
                  (no progress output; expect ~30s/100M keys on modern CPUs). \
@@ -339,8 +359,7 @@ impl MinimizerIndex {
                  ~5× slower per lookup).",
                 unique_hashes.len() as f64 / 1e6,
             );
-            let keys_bytes: Vec<[u8; 8]> =
-                unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
+            let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
             let mph = kira_kv_engine::IndexBuilder::new()
                 .with_parallel_build(true)
                 .with_build_fast_profile(true)
@@ -370,7 +389,11 @@ impl MinimizerIndex {
                 unique_hashes.len() as f64 / 1e6,
             );
             let n = unique_hashes.len();
-            (HashLookup::Sorted(std::mem::take(&mut unique_hashes)), n, None)
+            (
+                HashLookup::Sorted(std::mem::take(&mut unique_hashes)),
+                n,
+                None,
+            )
         };
         let t_lookup_dur = t_lookup.elapsed();
 
@@ -379,7 +402,8 @@ impl MinimizerIndex {
             "[KIRA_INDEX] (k={k} w={w}) phase E: allocating final layout \
              (offsets={:.2} MB, occs={:.2} GB)...",
             ((n_slots + 1) * 4) as f64 / (1u64 << 20) as f64,
-            (flat.len() * OCC_DISK_SIZE) as f64 / (1u64 << 30) as f64,
+            (bucket_lens.iter().map(|&n| n as usize).sum::<usize>() * OCC_DISK_SIZE) as f64
+                / (1u64 << 30) as f64,
         );
         let mut final_offsets: Vec<u32> = vec![0u32; n_slots + 1];
 
@@ -395,12 +419,20 @@ impl MinimizerIndex {
         }
         // Prefix sum → start offsets.
         for k_idx in 1..=n_slots {
-            final_offsets[k_idx] += final_offsets[k_idx - 1];
+            final_offsets[k_idx] = final_offsets[k_idx]
+                .checked_add(final_offsets[k_idx - 1])
+                .expect("index occurrence offsets exceed u32; split/tile the reference");
         }
 
-        let mut final_flat_occs: Vec<Occ> = Vec::with_capacity(flat.len());
-        // SAFETY: every slot is overwritten by the loop below. The writes
-        unsafe { final_flat_occs.set_len(flat.len()) };
+        let stored_occurrences = final_offsets[n_slots] as usize;
+        let mut final_flat_occs = vec![
+            Occ {
+                ref_id: 0,
+                pos: 0,
+                strand: Strand::Forward,
+            };
+            stored_occurrences
+        ];
         let mut unique_idx = 0usize;
         let mut fi = 0usize;
         while fi < flat.len() {
@@ -414,7 +446,8 @@ impl MinimizerIndex {
                 None => unique_idx,
             };
             let dst_start = final_offsets[id] as usize;
-            for (off, src_idx) in (fi..fj).enumerate() {
+            let retain_end = fi + (fj - fi).min(max_occ.saturating_add(1));
+            for (off, src_idx) in (fi..retain_end).enumerate() {
                 final_flat_occs[dst_start + off] = flat[src_idx].to_occ();
             }
             unique_idx += 1;
@@ -452,13 +485,228 @@ impl MinimizerIndex {
         }
     }
 
+    fn build_external(
+        reference: &Reference,
+        cfg: MinimizerConfig,
+        k: usize,
+        w: usize,
+        max_occ: usize,
+        ram_budget_bytes: usize,
+    ) -> Self {
+        let run_bytes = (ram_budget_bytes / 8).max(16 * 1024 * 1024);
+        let segment_bp = (run_bytes.saturating_mul(w.max(1))
+            / std::mem::size_of::<crate::types::Minimizer>())
+        .max(1_000_000);
+        let temp_parent = std::env::var_os("KIRA_INDEX_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = tempfile::Builder::new()
+            .prefix("kira-index-")
+            .tempdir_in(&temp_parent)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "create external-index temp directory in {}: {e}",
+                    temp_parent.display()
+                )
+            });
+        eprintln!(
+            "[KIRA_INDEX] (k={k} w={w}) estimated occurrence stream exceeds RAM budget; \
+             spilling sorted {:.1} Mbp segments to {}",
+            segment_bp as f64 / 1e6,
+            temp.path().display()
+        );
+
+        let flank = k.saturating_add(w).max(1);
+        let mut run_paths = Vec::new();
+        let mut total_mins = 0usize;
+        for (ref_id, seq) in reference.sequences.iter().enumerate() {
+            let bases = seq.bases(None);
+            let mut owned_start = 0usize;
+            while owned_start < bases.len() {
+                let owned_end = owned_start.saturating_add(segment_bp).min(bases.len());
+                let slice_start = owned_start.saturating_sub(flank);
+                let slice_end = owned_end.saturating_add(flank).min(bases.len());
+                let mins = minimizers(&bases[slice_start..slice_end], &cfg);
+                let mut run = Vec::with_capacity(mins.len());
+                for m in mins {
+                    let global_pos = slice_start.saturating_add(m.pos as usize);
+                    if global_pos >= owned_start && global_pos < owned_end {
+                        let pos = u32::try_from(global_pos)
+                            .expect("reference coordinate exceeds u32 index format");
+                        run.push(FlatMin::pack(
+                            m.hash,
+                            u32::try_from(ref_id).expect("reference id exceeds u32"),
+                            pos,
+                            m.strand,
+                        ));
+                    }
+                }
+                total_mins += run.len();
+                run.par_sort_unstable_by_key(|m| (m.hash, m.ref_strand, m.pos));
+                let path = temp.path().join(format!("run-{:06}.bin", run_paths.len()));
+                let file = File::create(&path).expect("create external-index run");
+                let mut writer = BufWriter::new(file);
+                for item in &run {
+                    write_flat_min(&mut writer, *item).expect("write external-index run");
+                }
+                writer.flush().expect("flush external-index run");
+                run_paths.push(path);
+                owned_start = owned_end;
+            }
+        }
+
+        let mut readers: Vec<BufReader<File>> = run_paths
+            .iter()
+            .map(|p| BufReader::new(File::open(p).expect("open external-index run")))
+            .collect();
+        let mut heap =
+            std::collections::BinaryHeap::<std::cmp::Reverse<(u64, u32, u32, usize)>>::new();
+        for (run_idx, reader) in readers.iter_mut().enumerate() {
+            if let Some(item) = read_flat_min(reader).expect("read external-index run") {
+                heap.push(std::cmp::Reverse((
+                    item.hash,
+                    item.ref_strand,
+                    item.pos,
+                    run_idx,
+                )));
+            }
+        }
+
+        let grouped_path = temp.path().join("grouped.bin");
+        let mut grouped_writer =
+            BufWriter::new(File::create(&grouped_path).expect("create grouped index stream"));
+        let mut unique_hashes = Vec::<u64>::new();
+        let mut bucket_lens = Vec::<u32>::new();
+        let retain_limit = max_occ.saturating_add(1);
+        while let Some(std::cmp::Reverse((hash, ref_strand, pos, run_idx))) = heap.pop() {
+            let mut retained = Vec::with_capacity(retain_limit.min(1024));
+            retained.push(FlatMin {
+                hash,
+                ref_strand,
+                pos,
+            });
+            refill_run_heap(&mut readers, &mut heap, run_idx);
+            while heap.peek().is_some_and(|next| next.0.0 == hash) {
+                let std::cmp::Reverse((_, ref_strand, pos, run_idx)) = heap.pop().unwrap();
+                if retained.len() < retain_limit {
+                    retained.push(FlatMin {
+                        hash,
+                        ref_strand,
+                        pos,
+                    });
+                }
+                refill_run_heap(&mut readers, &mut heap, run_idx);
+            }
+            unique_hashes.push(hash);
+            let count = u32::try_from(retained.len()).expect("retained bucket exceeds u32");
+            bucket_lens.push(count);
+            grouped_writer
+                .write_all(&hash.to_le_bytes())
+                .expect("write grouped hash");
+            grouped_writer
+                .write_all(&count.to_le_bytes())
+                .expect("write grouped count");
+            for item in retained {
+                grouped_writer
+                    .write_all(&item.ref_strand.to_le_bytes())
+                    .and_then(|_| grouped_writer.write_all(&item.pos.to_le_bytes()))
+                    .expect("write grouped occurrence");
+            }
+        }
+        grouped_writer.flush().expect("flush grouped index stream");
+        if unique_hashes.is_empty() {
+            return empty_minimizer_index(k, w, max_occ);
+        }
+
+        let use_mph = std::env::var("KIRA_INDEX_USE_MPH")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph {
+            let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
+            let mph = kira_kv_engine::IndexBuilder::new()
+                .with_parallel_build(true)
+                .with_build_fast_profile(true)
+                .build_index(keys_bytes)
+                .expect("PtrHash25 build");
+            let assigned: Vec<u32> = unique_hashes
+                .iter()
+                .map(|h| {
+                    u32::try_from(
+                        mph.lookup_u64(*h)
+                            .expect("PtrHash25 hash present in build set"),
+                    )
+                    .expect("MPH slot exceeds u32")
+                })
+                .collect();
+            let n_slots = assigned.iter().copied().max().unwrap_or(0) as usize + 1;
+            (HashLookup::Mph(mph), n_slots, Some(assigned))
+        } else {
+            let n = unique_hashes.len();
+            (HashLookup::Sorted(unique_hashes), n, None)
+        };
+
+        let mut offsets = vec![0u32; n_slots + 1];
+        if let Some(assigned) = assigned_ids.as_ref() {
+            for (i, &id) in assigned.iter().enumerate() {
+                offsets[id as usize + 1] = bucket_lens[i];
+            }
+        } else {
+            offsets[1..].copy_from_slice(&bucket_lens);
+        }
+        for i in 1..offsets.len() {
+            offsets[i] = offsets[i]
+                .checked_add(offsets[i - 1])
+                .expect("index occurrence offsets exceed u32; split/tile the reference");
+        }
+
+        let mut occurrences = vec![
+            Occ {
+                ref_id: 0,
+                pos: 0,
+                strand: Strand::Forward,
+            };
+            offsets[n_slots] as usize
+        ];
+        let mut reader =
+            BufReader::new(File::open(&grouped_path).expect("open grouped index stream"));
+        for unique_idx in 0..bucket_lens.len() {
+            let hash = read_u64_io(&mut reader).expect("read grouped hash");
+            let count = read_u32_io(&mut reader).expect("read grouped count") as usize;
+            let slot = assigned_ids
+                .as_ref()
+                .map_or(unique_idx, |ids| ids[unique_idx] as usize);
+            let dst = offsets[slot] as usize;
+            for off in 0..count {
+                let ref_strand = read_u32_io(&mut reader).expect("read grouped ref/strand");
+                let pos = read_u32_io(&mut reader).expect("read grouped position");
+                occurrences[dst + off] = FlatMin {
+                    hash,
+                    ref_strand,
+                    pos,
+                }
+                .to_occ();
+            }
+        }
+        eprintln!(
+            "[KIRA_INDEX] (k={k} w={w}) external build complete: {:.1}M minimizers, \
+             {:.1}M buckets, {:.1}M retained occurrences",
+            total_mins as f64 / 1e6,
+            bucket_lens.len() as f64 / 1e6,
+            occurrences.len() as f64 / 1e6,
+        );
+        Self {
+            k,
+            w,
+            max_occ,
+            hash_lookup: Some(lookup),
+            hot_cache: None,
+            bucket_offsets: OffsetStorage::Owned(offsets),
+            flat_occs: OccStorage::Owned(occurrences),
+        }
+    }
+
     /// Build the hot-bucket cache.
-    pub fn build_hot_cache(
-        &mut self,
-        mmap: Option<&[u8]>,
-        top_n: usize,
-        max_total_occs: usize,
-    ) {
+    pub fn build_hot_cache(&mut self, mmap: Option<&[u8]>, top_n: usize, max_total_occs: usize) {
         use rustc_hash::FxHashMap;
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
@@ -502,7 +750,7 @@ impl MinimizerIndex {
         }
 
         let mut sel: Vec<(usize, u32)> = top.into_iter().map(|Reverse(t)| t).collect();
-        sel.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        sel.sort_unstable_by_key(|&(len, _)| Reverse(len));
 
         let mut cache: FxHashMap<u32, HotBucketEntry> = FxHashMap::default();
         let mut total_occs = 0usize;
@@ -600,36 +848,95 @@ impl MinimizerIndex {
 #[repr(C)]
 struct FlatMin {
     hash: u64,
-    ref_id: u32,
-    pos_strand: u32,
+    ref_strand: u32,
+    pos: u32,
 }
 
 const STRAND_MASK: u32 = 1 << 31;
-const POS_MASK: u32 = !STRAND_MASK;
+const REF_ID_MASK: u32 = !STRAND_MASK;
 
 impl FlatMin {
     #[inline]
     fn pack(hash: u64, ref_id: u32, pos: u32, strand: Strand) -> Self {
-        debug_assert!(pos & STRAND_MASK == 0, "pos must fit in 31 bits");
-        let pos_strand = pos | match strand {
-            Strand::Forward => 0,
-            Strand::Reverse => STRAND_MASK,
-        };
-        Self { hash, ref_id, pos_strand }
+        assert!(
+            ref_id & STRAND_MASK == 0,
+            "reference id must fit in 31 bits"
+        );
+        let ref_strand = ref_id
+            | match strand {
+                Strand::Forward => 0,
+                Strand::Reverse => STRAND_MASK,
+            };
+        Self {
+            hash,
+            ref_strand,
+            pos,
+        }
     }
 
     #[inline]
     fn to_occ(self) -> Occ {
         Occ {
-            ref_id: self.ref_id,
-            pos: self.pos_strand & POS_MASK,
-            strand: if self.pos_strand & STRAND_MASK != 0 {
+            ref_id: self.ref_strand & REF_ID_MASK,
+            pos: self.pos,
+            strand: if self.ref_strand & STRAND_MASK != 0 {
                 Strand::Reverse
             } else {
                 Strand::Forward
             },
         }
     }
+}
+
+fn write_flat_min(writer: &mut impl Write, item: FlatMin) -> std::io::Result<()> {
+    writer.write_all(&item.hash.to_le_bytes())?;
+    writer.write_all(&item.ref_strand.to_le_bytes())?;
+    writer.write_all(&item.pos.to_le_bytes())
+}
+
+fn read_flat_min(reader: &mut impl Read) -> std::io::Result<Option<FlatMin>> {
+    let mut hash = [0u8; 8];
+    match reader.read_exact(&mut hash) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let mut ref_strand = [0u8; 4];
+    let mut pos = [0u8; 4];
+    reader.read_exact(&mut ref_strand)?;
+    reader.read_exact(&mut pos)?;
+    Ok(Some(FlatMin {
+        hash: u64::from_le_bytes(hash),
+        ref_strand: u32::from_le_bytes(ref_strand),
+        pos: u32::from_le_bytes(pos),
+    }))
+}
+
+fn refill_run_heap(
+    readers: &mut [BufReader<File>],
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32, u32, usize)>>,
+    run_idx: usize,
+) {
+    if let Some(item) = read_flat_min(&mut readers[run_idx]).expect("read external-index run") {
+        heap.push(std::cmp::Reverse((
+            item.hash,
+            item.ref_strand,
+            item.pos,
+            run_idx,
+        )));
+    }
+}
+
+fn read_u32_io(reader: &mut impl Read) -> std::io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_io(reader: &mut impl Read) -> std::io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// Multi-resolution index for short and long reads.
@@ -695,13 +1002,7 @@ impl Index {
         ids_scratch: &mut [Option<usize>],
         out: &mut [Option<(usize, usize)>],
     ) {
-        table.bucket_batch_into(
-            self.mmap_bytes(),
-            hashes,
-            canon_scratch,
-            ids_scratch,
-            out,
-        )
+        table.bucket_batch_into(self.mmap_bytes(), hashes, canon_scratch, ids_scratch, out)
     }
 
     /// Fetch a single `Occ` record from a bucket slice.
@@ -888,6 +1189,7 @@ impl Index {
         let file = File::open(path.as_ref()).context("open index file")?;
         let mmap = Arc::new(unsafe { Mmap::map(&file).context("mmap index for read")? });
         let mut cursor = Cursor::new(&mmap[..]);
+        let file_len = mmap.len() as u64;
 
         let mut magic = [0u8; 8];
         cursor.read_exact(&mut magic).context("read index magic")?;
@@ -917,12 +1219,17 @@ impl Index {
         }
 
         let seq_count = read_u32(&mut cursor)? as usize;
+        if seq_count > mmap.len() / 8 {
+            anyhow::bail!("invalid index: sequence count {seq_count} exceeds file bounds");
+        }
         let mut sequences = Vec::with_capacity(seq_count);
         for _ in 0..seq_count {
-            let name = String::from_utf8(read_bytes(&mut cursor)?).context("decode seq name")?;
+            let name =
+                String::from_utf8(read_bytes_bounded(&mut cursor, file_len, "sequence name")?)
+                    .context("decode seq name")?;
             let bases_len = read_u32(&mut cursor)? as usize;
             let bases_offset = cursor.position() as usize;
-            cursor.set_position(cursor.position() + bases_len as u64);
+            checked_advance(&mut cursor, bases_len, file_len, "reference bases")?;
             sequences.push(RefSeq {
                 name,
                 bases: RefBases::Mmap {
@@ -933,8 +1240,14 @@ impl Index {
         }
 
         let reference = Reference { sequences };
-        let short = read_minimizer_index_mmap(&mut cursor)?;
-        let long = read_minimizer_index_mmap(&mut cursor)?;
+        let short = read_minimizer_index_mmap(&mut cursor, file_len)?;
+        let long = read_minimizer_index_mmap(&mut cursor, file_len)?;
+        if cursor.position() != file_len {
+            anyhow::bail!(
+                "invalid index: {} trailing byte(s)",
+                file_len.saturating_sub(cursor.position())
+            );
+        }
         Ok(Self {
             reference,
             short,
@@ -1057,16 +1370,23 @@ fn write_minimizer_index<W: Write>(
     Ok(())
 }
 
-fn read_minimizer_index_mmap<R: Read + Seek>(reader: &mut R) -> Result<MinimizerIndex> {
+fn read_minimizer_index_mmap<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+) -> Result<MinimizerIndex> {
     let k = read_u32(reader)? as usize;
     let w = read_u32(reader)? as usize;
     let max_occ = read_u32(reader)? as usize;
+    if k == 0 || k >= 32 || w == 0 {
+        anyhow::bail!("invalid minimizer parameters in index: k={k}, w={w}");
+    }
 
     let lookup_kind = read_u32(reader)?;
     let hash_lookup = match lookup_kind {
         LOOKUP_KIND_NONE => None,
         LOOKUP_KIND_MPH => {
             let blob_len = read_u64(reader)? as usize;
+            ensure_remaining(reader, blob_len, file_len, "MPH blob")?;
             let mut blob = vec![0u8; blob_len];
             reader.read_exact(&mut blob).context("read MPH blob")?;
             Some(HashLookup::Mph(
@@ -1076,6 +1396,10 @@ fn read_minimizer_index_mmap<R: Read + Seek>(reader: &mut R) -> Result<Minimizer
         }
         LOOKUP_KIND_SORTED => {
             let n_keys = read_u64(reader)? as usize;
+            let key_bytes = n_keys
+                .checked_mul(8)
+                .ok_or_else(|| anyhow::anyhow!("sorted hash table size overflow"))?;
+            ensure_remaining(reader, key_bytes, file_len, "sorted hash table")?;
             let mut arr = Vec::with_capacity(n_keys);
             let mut buf = [0u8; 8];
             for _ in 0..n_keys {
@@ -1088,16 +1412,43 @@ fn read_minimizer_index_mmap<R: Read + Seek>(reader: &mut R) -> Result<Minimizer
     };
 
     let n_offsets = read_u64(reader)? as usize;
+    if n_offsets == 0 {
+        anyhow::bail!("invalid index: minimizer offset table is empty");
+    }
+    let offsets_bytes = n_offsets
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("minimizer offset table size overflow"))?;
+    ensure_remaining(reader, offsets_bytes, file_len, "minimizer offsets")?;
     let off_offset = reader.stream_position()? as usize;
-    reader.seek(SeekFrom::Current((n_offsets * 4) as i64))?;
+    let mut previous = 0u32;
+    for i in 0..n_offsets {
+        let offset = read_u32(reader)?;
+        if i == 0 && offset != 0 {
+            anyhow::bail!("invalid index: first minimizer offset is {offset}, expected 0");
+        }
+        if offset < previous {
+            anyhow::bail!("invalid index: minimizer offsets are not monotonic");
+        }
+        previous = offset;
+    }
     let bucket_offsets = OffsetStorage::Mmap {
         offset: off_offset,
         len: n_offsets,
     };
 
     let n_occs = read_u64(reader)? as usize;
+    if previous as usize != n_occs {
+        anyhow::bail!(
+            "invalid index: final bucket offset {} does not equal occurrence count {n_occs}",
+            previous
+        );
+    }
+    let occ_bytes = n_occs
+        .checked_mul(OCC_DISK_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("occurrence table size overflow"))?;
+    ensure_remaining(reader, occ_bytes, file_len, "occurrence table")?;
     let occ_offset = reader.stream_position()? as usize;
-    reader.seek(SeekFrom::Current((n_occs * OCC_DISK_SIZE) as i64))?;
+    checked_advance(reader, occ_bytes, file_len, "occurrence table")?;
     let flat_occs = OccStorage::Mmap { offset: occ_offset };
 
     Ok(MinimizerIndex {
@@ -1109,6 +1460,51 @@ fn read_minimizer_index_mmap<R: Read + Seek>(reader: &mut R) -> Result<Minimizer
         bucket_offsets,
         flat_occs,
     })
+}
+
+fn ensure_remaining<R: Seek>(
+    reader: &mut R,
+    bytes: usize,
+    file_len: u64,
+    label: &str,
+) -> Result<()> {
+    let start = reader.stream_position()?;
+    let end = start
+        .checked_add(bytes as u64)
+        .ok_or_else(|| anyhow::anyhow!("invalid index: {label} range overflow"))?;
+    if end > file_len {
+        anyhow::bail!("invalid index: {label} ends at byte {end}, file has {file_len} bytes");
+    }
+    Ok(())
+}
+
+fn checked_advance<R: Seek>(
+    reader: &mut R,
+    bytes: usize,
+    file_len: u64,
+    label: &str,
+) -> Result<()> {
+    ensure_remaining(reader, bytes, file_len, label)?;
+    let end = reader
+        .stream_position()?
+        .checked_add(bytes as u64)
+        .ok_or_else(|| anyhow::anyhow!("invalid index: {label} range overflow"))?;
+    reader.seek(SeekFrom::Start(end))?;
+    Ok(())
+}
+
+fn read_bytes_bounded<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let len = read_u32(reader)? as usize;
+    ensure_remaining(reader, len, file_len, label)?;
+    let mut buf = vec![0u8; len];
+    reader
+        .read_exact(&mut buf)
+        .with_context(|| format!("read {label}"))?;
+    Ok(buf)
 }
 
 /// Half of the physical RAM, in bytes — the cap we let the chunked index builder spend on its.
@@ -1144,7 +1540,10 @@ fn log_memory_state(label: &str) {
         "[KIRA_INDEX] mem [{label}]: used={}MB / total={}MB ({}%)",
         used_mb,
         total_mb,
-        if total_mb == 0 { 0 } else { 100 * used_mb / total_mb }
+        used_mb
+            .saturating_mul(100)
+            .checked_div(total_mb)
+            .unwrap_or(0)
     );
 }
 
@@ -1185,13 +1584,6 @@ fn write_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
-    let len = read_u32(reader)? as usize;
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).context("read bytes")?;
-    Ok(buf)
-}
-
 fn strand_to_u8(strand: Strand) -> u8 {
     match strand {
         Strand::Forward => 0,
@@ -1204,5 +1596,74 @@ fn u8_to_strand(v: u8) -> Strand {
         Strand::Forward
     } else {
         Strand::Reverse
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference(seq: &[u8]) -> Reference {
+        Reference {
+            sequences: vec![RefSeq {
+                name: "chr1".to_string(),
+                bases: RefBases::Owned(seq.to_vec()),
+            }],
+        }
+    }
+
+    fn occurrences(index: &MinimizerIndex, hash: u64) -> Vec<(u32, u32, u8)> {
+        let mut out = Vec::new();
+        index.for_each_occ(None, hash, &mut |occ| {
+            out.push((
+                occ.ref_id,
+                occ.pos,
+                u8::from(matches!(occ.strand, Strand::Reverse)),
+            ));
+        });
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn repetitive_bucket_retains_only_cap_plus_sentinel() {
+        let reference = reference(b"AAAAAAAAAAAAAAAA");
+        let index = MinimizerIndex::build_with_budget(&reference, 3, 2, 3, usize::MAX);
+        let hash = minimizers(
+            reference.sequences[0].bases(None),
+            &MinimizerConfig { k: 3, w: 2 },
+        )[0]
+        .hash;
+        assert_eq!(index.bucket_len(None, hash), Some(4));
+    }
+
+    #[test]
+    fn flat_min_preserves_full_u32_coordinate() {
+        let packed = FlatMin::pack(7, 123, u32::MAX, Strand::Reverse);
+        let occ = packed.to_occ();
+        assert_eq!(occ.ref_id, 123);
+        assert_eq!(occ.pos, u32::MAX);
+        assert!(matches!(occ.strand, Strand::Reverse));
+    }
+
+    #[test]
+    fn external_builder_matches_in_memory_buckets() {
+        let reference = reference(b"ACGTTGCATGTCGCATGATGCATGAGAGCTACGTTGCATGTCGCATGATG");
+        let cfg = MinimizerConfig { k: 5, w: 4 };
+        let in_memory = MinimizerIndex::build_with_budget(&reference, cfg.k, cfg.w, 4, usize::MAX);
+        let external = MinimizerIndex::build_external(&reference, cfg, cfg.k, cfg.w, 4, 1);
+        let mut hashes: Vec<u64> = minimizers(reference.sequences[0].bases(None), &cfg)
+            .into_iter()
+            .map(|m| m.hash)
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        for hash in hashes {
+            assert_eq!(
+                occurrences(&external, hash),
+                occurrences(&in_memory, hash),
+                "hash {hash}"
+            );
+        }
     }
 }

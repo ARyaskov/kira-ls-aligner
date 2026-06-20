@@ -34,11 +34,7 @@ fn build_peq(pattern: &[u8]) -> [Vec<u64>; 4] {
 }
 
 /// Compute the (semi-global) bounded edit distance between `pattern` and the best matching.
-pub fn bounded_edit_distance(
-    pattern: &[u8],
-    text: &[u8],
-    max_k: usize,
-) -> Option<(usize, usize)> {
+pub fn bounded_edit_distance(pattern: &[u8], text: &[u8], max_k: usize) -> Option<(usize, usize)> {
     let m = pattern.len();
     let n = text.len();
     if m == 0 {

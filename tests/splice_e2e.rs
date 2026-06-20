@@ -17,16 +17,16 @@ use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::alignment::splice::{
     SpliceConfig, SpliceStrandPolicy, align_spliced_chain, detect_splice_strand,
 };
-use kira_ls_aligner::types::{
-    Anchor, Chain, CigarKind, PairRole, ReadRecord, Strand,
-};
+use kira_ls_aligner::types::{Anchor, Chain, CigarKind, PairRole, ReadRecord, Strand};
 
 fn synth_dna(seed: u64, len: usize) -> Vec<u8> {
     let mut s = seed;
     let bases = b"ACGT";
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(bases[(s >> 33) as usize & 3]);
     }
     out
@@ -216,8 +216,8 @@ fn small_gap_below_min_intron_stays_as_d_op() {
         min_exon_len: 15,
         polya_min_len: 10,
     };
-    let aln = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2)
-        .unwrap();
+    let aln =
+        align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2).unwrap();
 
     let has_n = aln.cigar.iter().any(|op| op.op == CigarKind::Skipped);
     assert!(
@@ -292,8 +292,8 @@ fn non_canonical_signal_with_require_emits_d_not_n() {
         min_exon_len: 15,
         polya_min_len: 10,
     };
-    let aln = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2)
-        .unwrap();
+    let aln =
+        align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2).unwrap();
     let has_n = aln.cigar.iter().any(|op| op.op == CigarKind::Skipped);
     assert!(
         !has_n,

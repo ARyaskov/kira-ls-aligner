@@ -64,7 +64,10 @@ impl LshIndex {
     where
         I: IntoIterator<Item = (u32, &'a [u8])>,
     {
-        assert!(top_bits > 0 && top_bits <= 32, "top_bits must be in (0, 32]");
+        assert!(
+            top_bits > 0 && top_bits <= 32,
+            "top_bits must be in (0, 32]"
+        );
         assert!(window_len > 0, "window_len must be positive");
         assert!(stride > 0, "stride must be positive");
         let shift = 64 - top_bits;
@@ -89,7 +92,10 @@ impl LshIndex {
         stride: usize,
         top_bits: u32,
     ) -> Self {
-        assert!(top_bits > 0 && top_bits <= 32, "top_bits must be in (0, 32]");
+        assert!(
+            top_bits > 0 && top_bits <= 32,
+            "top_bits must be in (0, 32]"
+        );
         assert!(window_len > 0, "window_len must be positive");
         assert!(stride > 0, "stride must be positive");
         let shift = 64 - top_bits;

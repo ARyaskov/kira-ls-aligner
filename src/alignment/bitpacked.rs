@@ -26,6 +26,10 @@ pub struct PackedDna {
     pub bits: Vec<u8>,
     /// Number of nucleotides actually represented.
     pub len: usize,
+    /// False when the input contained anything outside A/C/G/T. The 2-bit
+    /// representation cannot distinguish those symbols from A, so callers
+    /// must not use it as an exact mismatch certificate in that case.
+    pub valid: bool,
 }
 
 impl PackedDna {
@@ -33,12 +37,15 @@ impl PackedDna {
     pub fn pack(seq: &[u8]) -> Self {
         let bytes = seq.len().div_ceil(4);
         let mut bits = vec![0u8; bytes];
+        let mut valid = true;
         for (i, &b) in seq.iter().enumerate() {
+            valid &= matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't');
             bits[i / 4] |= encode_base(b) << ((i % 4) * 2);
         }
         Self {
             bits,
             len: seq.len(),
+            valid,
         }
     }
 
@@ -79,46 +86,23 @@ pub fn scan(
     ref_len: usize,
     max_mismatches: usize,
 ) -> Option<PackedHit> {
-    let r = read_packed.len;
-    if r == 0 || ref_len < r {
+    if !read_packed.valid {
         return None;
     }
-    let n_shifts = ref_len - r + 1;
-    let need_matches = r.saturating_sub(max_mismatches);
-    let read_bytes = read_packed.bits.len();
-
-    for t in 0..n_shifts {
-        let phase = t % 4;
-        let byte_off = t / 4;
-        let ref_buf = &ref_pre_shifted[phase];
-        if byte_off + read_bytes > ref_buf.len() {
-            continue;
-        }
-        let mismatches = mismatch_count(
-            &read_packed.bits,
-            &ref_buf[byte_off..byte_off + read_bytes],
-            r,
-        );
-        let matches = r - mismatches;
-        if matches >= need_matches {
-            return Some(PackedHit {
-                shift: t,
-                mismatches,
-                matches,
-            });
-        }
-    }
-    None
+    let hit = scan_best(read_packed, ref_pre_shifted, ref_len)?;
+    (hit.mismatches <= max_mismatches).then_some(hit)
 }
 
-/// Exhaustive variant of [`scan`] — returns the shift with the **minimum** mismatch count across.
-pub fn scan_best(
+/// Exhaustive best/second-best mismatch counts. The second value is the best
+/// count at a distinct shift and is used to reject locally ambiguous ungapped
+/// placements.
+pub fn scan_best_with_second(
     read_packed: &PackedDna,
     ref_pre_shifted: &[Vec<u8>; 4],
     ref_len: usize,
-) -> Option<PackedHit> {
+) -> Option<(PackedHit, Option<usize>)> {
     let r = read_packed.len;
-    if r == 0 || ref_len < r {
+    if r == 0 || ref_len < r || !read_packed.valid {
         return None;
     }
     let n_shifts = ref_len - r + 1;
@@ -126,6 +110,7 @@ pub fn scan_best(
 
     let mut best_shift = 0usize;
     let mut best_mism = usize::MAX;
+    let mut second_mism = usize::MAX;
     for t in 0..n_shifts {
         let phase = t % 4;
         let byte_off = t / 4;
@@ -139,23 +124,34 @@ pub fn scan_best(
             r,
         );
         if mismatches < best_mism {
+            second_mism = best_mism;
             best_mism = mismatches;
             best_shift = t;
-            // Perfect hit — no possible improvement, stop early.
-            if best_mism == 0 {
-                break;
-            }
+        } else if mismatches < second_mism {
+            second_mism = mismatches;
         }
     }
     if best_mism == usize::MAX {
         None
     } else {
-        Some(PackedHit {
-            shift: best_shift,
-            mismatches: best_mism,
-            matches: r - best_mism,
-        })
+        Some((
+            PackedHit {
+                shift: best_shift,
+                mismatches: best_mism,
+                matches: r - best_mism,
+            },
+            (second_mism != usize::MAX).then_some(second_mism),
+        ))
     }
+}
+
+/// Exhaustive variant of [`scan`] — returns the shift with the **minimum** mismatch count across.
+pub fn scan_best(
+    read_packed: &PackedDna,
+    ref_pre_shifted: &[Vec<u8>; 4],
+    ref_len: usize,
+) -> Option<PackedHit> {
+    scan_best_with_second(read_packed, ref_pre_shifted, ref_len).map(|(best, _)| best)
 }
 
 /// Count mismatched nucleotide pairs between two 2-bit packed buffers of equal byte length.
@@ -201,11 +197,7 @@ fn mismatch_count_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn mismatch_count_avx2(
-    read: &[u8],
-    ref_packed: &[u8],
-    n_nucleotides: usize,
-) -> usize {
+unsafe fn mismatch_count_avx2(read: &[u8], ref_packed: &[u8], n_nucleotides: usize) -> usize {
     use std::arch::x86_64::{
         __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_or_si256, _mm256_set1_epi8,
         _mm256_srli_epi64, _mm256_storeu_si256, _mm256_xor_si256,

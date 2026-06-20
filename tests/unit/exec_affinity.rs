@@ -10,7 +10,10 @@ fn detection_returns_consistent_shape() {
         let p_logical = t.p_logical();
         let e_logical = t.e_logical();
         for p in &p_logical {
-            assert!(!e_logical.contains(p), "logical CPU {p} appears in both pools");
+            assert!(
+                !e_logical.contains(p),
+                "logical CPU {p} appears in both pools"
+            );
         }
         // p_primary is a subset of p_logical (same for E).
         for p in t.p_primary() {

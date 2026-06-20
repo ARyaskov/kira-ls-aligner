@@ -27,9 +27,7 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         "long" => (false, true),
         "both" | "" => (true, true),
         other => {
-            anyhow::bail!(
-                "--only must be one of `both`, `short`, `long` (got `{other}`)"
-            );
+            anyhow::bail!("--only must be one of `both`, `short`, `long` (got `{other}`)");
         }
     };
 

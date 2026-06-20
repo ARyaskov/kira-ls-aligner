@@ -99,7 +99,7 @@ pub struct MemArgs {
     pub num_e_threads: Option<usize>,
 
     /// Batch size in bases.
-    #[arg(short = 'K', long = "batch", default_value_t = 1_000_000)]
+    #[arg(short = 'K', long = "batch", default_value_t = 4_000_000)]
     pub batch_bases: usize,
 
     /// Preset: short, long, or auto.
@@ -113,6 +113,10 @@ pub struct MemArgs {
     /// Minimizer window size (overrides preset for both short and long indices).
     #[arg(short = 'w', long = "window-len")]
     pub window_len: Option<usize>,
+
+    /// Maximum reference occurrences retained per read minimizer.
+    #[arg(long = "seed-occ-cap", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
+    pub seed_occ_cap: u32,
 
     /// Long-read threshold (bp).
     #[arg(long = "long-threshold", default_value_t = 500)]
@@ -263,6 +267,7 @@ impl MemArgs {
             preset: "auto".to_string(),
             seed_len: None,
             window_len: None,
+            seed_occ_cap: 16,
             long_read_threshold: 500,
             match_score: 1,
             mismatch_penalty: 4,

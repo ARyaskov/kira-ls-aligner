@@ -26,12 +26,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use kira_ls_aligner::alignment::AlignmentConfig;
+use kira_ls_aligner::alignment::splice::SpliceConfig;
 use kira_ls_aligner::chaining::ChainingConfig;
 use kira_ls_aligner::index::IndexConfig;
 use kira_ls_aligner::index::tiling::plan_tiles;
 use kira_ls_aligner::io::{HeaderConfig, IngestMode, OutputConfig};
 use kira_ls_aligner::mapq::MapqConfig;
-use kira_ls_aligner::alignment::splice::SpliceConfig;
 use kira_ls_aligner::pipeline::PipelineConfig;
 use kira_ls_aligner::pipeline::pairing::PairedConfig;
 use kira_ls_aligner::pipeline::stage1_sketch::SketchConfig;
@@ -44,7 +44,9 @@ fn synth_dna(seed: u64, len: usize) -> Vec<u8> {
     let bases = b"ACGT";
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(bases[(s >> 33) as usize & 3]);
     }
     out
@@ -98,6 +100,7 @@ fn full_pipeline_cfg() -> PipelineConfig {
         seeding: SeedingConfig {
             min_anchor_len: 20,
             max_occ: 500,
+            max_hits_per_minimizer: 16,
             long_read_threshold: 500,
         },
         chaining: ChainingConfig {
@@ -180,14 +183,9 @@ fn tiled_alignment_recovers_reads_across_tiles() {
 
     let r1_path = write_fastq("r1", &[("pair1/1", r1_seq)]);
     let r2_path = write_fastq("r2", &[("pair1/2", &r2_seq)]);
-    let out_path = std::env::temp_dir().join(format!(
-        "kira-split-{}-out.sam",
-        std::process::id()
-    ));
-    let prefix_path = std::env::temp_dir().join(format!(
-        "kira-split-{}-prefix",
-        std::process::id()
-    ));
+    let out_path = std::env::temp_dir().join(format!("kira-split-{}-out.sam", std::process::id()));
+    let prefix_path =
+        std::env::temp_dir().join(format!("kira-split-{}-prefix", std::process::id()));
 
     // Force one contig per tile: each contig is 2000 bytes; cap at 1500.
     let tile_plan = plan_tiles(&reference, 1500);
@@ -274,14 +272,9 @@ fn tiled_single_tile_is_trivial_and_still_works() {
     let (reference, c0, _c1) = build_reference();
     let r1 = &c0[100..250];
     let r1_path = write_fastq("solo-r1", &[("read1", r1)]);
-    let out_path = std::env::temp_dir().join(format!(
-        "kira-split-{}-solo.sam",
-        std::process::id()
-    ));
-    let prefix_path = std::env::temp_dir().join(format!(
-        "kira-split-{}-solo-prefix",
-        std::process::id()
-    ));
+    let out_path = std::env::temp_dir().join(format!("kira-split-{}-solo.sam", std::process::id()));
+    let prefix_path =
+        std::env::temp_dir().join(format!("kira-split-{}-solo-prefix", std::process::id()));
 
     // Huge tile budget → 1 tile.
     let tile_plan = plan_tiles(&reference, 100_000_000);

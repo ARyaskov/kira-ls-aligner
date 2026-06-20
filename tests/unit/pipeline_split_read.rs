@@ -43,10 +43,7 @@ fn make_aln(read_start: u32, read_end: u32) -> Alignment {
 #[test]
 fn picks_disjoint_high_score_chain_as_supp_candidate() {
     let primary = make_aln(0, 80);
-    let chains = vec![
-        make_chain(100, 0, 80, 0),
-        make_chain(70, 80, 150, 1),
-    ];
+    let chains = vec![make_chain(100, 0, 80, 0), make_chain(70, 80, 150, 1)];
     let picks = pick_supplementary_chains(&primary, &chains);
     assert_eq!(picks.len(), 1);
     assert_eq!(picks[0].read_start, 80);
@@ -55,10 +52,7 @@ fn picks_disjoint_high_score_chain_as_supp_candidate() {
 #[test]
 fn rejects_overlapping_chain() {
     let primary = make_aln(0, 150);
-    let chains = vec![
-        make_chain(100, 0, 150, 0),
-        make_chain(90, 10, 150, 1),
-    ];
+    let chains = vec![make_chain(100, 0, 150, 0), make_chain(90, 10, 150, 1)];
     let picks = pick_supplementary_chains(&primary, &chains);
     assert!(picks.is_empty());
 }
@@ -79,10 +73,7 @@ fn rejects_low_score_chain() {
 fn rejects_short_chain() {
     // Disjoint, high-score, but span 30 bp < 50 bp threshold.
     let primary = make_aln(0, 80);
-    let chains = vec![
-        make_chain(100, 0, 80, 0),
-        make_chain(80, 100, 130, 1),
-    ];
+    let chains = vec![make_chain(100, 0, 80, 0), make_chain(80, 100, 130, 1)];
     let picks = pick_supplementary_chains(&primary, &chains);
     assert!(picks.is_empty());
 }

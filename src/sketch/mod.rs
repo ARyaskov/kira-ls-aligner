@@ -42,7 +42,10 @@ pub fn minimizers(seq: &[u8], cfg: &MinimizerConfig) -> Vec<Minimizer> {
                     (hash64(rkmer), Strand::Reverse)
                 };
                 while let Some(back) = deque.back() {
-                    if back.0 <= hash {
+                    // Keep the rightmost representative of equal minima.
+                    // Emitting every tied k-mer makes low-complexity windows
+                    // produce O(w) redundant seeds per position.
+                    if back.0 < hash {
                         break;
                     }
                     deque.pop_back();
@@ -59,7 +62,7 @@ pub fn minimizers(seq: &[u8], cfg: &MinimizerConfig) -> Vec<Minimizer> {
 
                 if kmer_index + 1 >= w {
                     if let Some(front) = deque.front() {
-                        if last_out.map_or(true, |last| last.0 != front.0 || last.1 != front.2) {
+                        if last_out.is_none_or(|last| last.0 != front.0 || last.1 != front.2) {
                             mins.push(Minimizer {
                                 hash: front.0,
                                 pos: front.2,
@@ -78,6 +81,7 @@ pub fn minimizers(seq: &[u8], cfg: &MinimizerConfig) -> Vec<Minimizer> {
             valid_len = 0;
             kmer_index = 0;
             deque.clear();
+            last_out = None;
         }
     }
 

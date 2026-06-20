@@ -118,8 +118,12 @@ fn random_corpus_self_consistent() {
     for _ in 0..200 {
         let r = 16 + (xorshift(&mut rng) as usize % 180);
         let w = r + (xorshift(&mut rng) as usize % 100);
-        let read: Vec<u8> = (0..r).map(|_| bases[(xorshift(&mut rng) as usize) % 4]).collect();
-        let mut text: Vec<u8> = (0..w).map(|_| bases[(xorshift(&mut rng) as usize) % 4]).collect();
+        let read: Vec<u8> = (0..r)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
+        let mut text: Vec<u8> = (0..w)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
         if xorshift(&mut rng) % 2 == 0 && w >= r {
             let start = (xorshift(&mut rng) as usize) % (w - r + 1);
             text[start..start + r].copy_from_slice(&read);

@@ -13,3 +13,10 @@ fn minimizers_are_deterministic() {
             .all(|(x, y)| x.hash == y.hash && x.pos == y.pos)
     );
 }
+
+#[test]
+fn tied_minima_are_emitted_without_leftmost_bias() {
+    let mins = minimizers(b"AAAAA", &MinimizerConfig { k: 2, w: 2 });
+    let positions: Vec<u32> = mins.iter().map(|m| m.pos).collect();
+    assert_eq!(positions, vec![1, 2, 3]);
+}

@@ -173,7 +173,9 @@ impl JunctionIndex {
                     continue;
                 }
                 for k in 0..block_count - 1 {
-                    let donor = chrom_start.saturating_add(starts[k]).saturating_add(sizes[k]);
+                    let donor = chrom_start
+                        .saturating_add(starts[k])
+                        .saturating_add(sizes[k]);
                     let acceptor = chrom_start.saturating_add(starts[k + 1]);
                     if acceptor <= donor {
                         // Defensive: overlapping/zero-length intron skip.

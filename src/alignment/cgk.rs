@@ -142,11 +142,7 @@ pub fn embed(input: &[u8], advice: &EmbeddingAdvice, output: &mut [u64]) {
             set_output_bit(output, j_out);
         }
         let r_bit = advice.get(j_out);
-        let advance = if j_in < n_in_bits {
-            r_bit ^ x_bit
-        } else {
-            1
-        };
+        let advance = if j_in < n_in_bits { r_bit ^ x_bit } else { 1 };
         j_in += advance as usize;
     }
 }
@@ -436,12 +432,8 @@ impl CgkRescue {
         };
         let read_len = read_seq.len();
         let pad = self.cfg.bandwidth.max(1) as usize;
-        let budget = super::router::wfa_score_budget(
-            read_len,
-            pen.mismatch,
-            pen.gap_open,
-            pen.gap_extend,
-        );
+        let budget =
+            super::router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
 
         let is_rev = matches!(strand, Strand::Reverse);
         let mut best: Option<Alignment> = None;

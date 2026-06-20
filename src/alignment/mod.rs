@@ -106,12 +106,15 @@ pub fn try_fast_dp_alignment(
     cfg: AlignmentConfig,
     is_rev: bool,
 ) -> Option<(Alignment, FastPathKind)> {
-    let result =
-        try_fast_dp_alignment_inner(read_seq, ref_seq, chain, chain_score, cfg, is_rev);
+    let result = try_fast_dp_alignment_inner(read_seq, ref_seq, chain, chain_score, cfg, is_rev);
     if result.is_some() {
         return result;
     }
-    let strand = if is_rev { Strand::Reverse } else { Strand::Forward };
+    let strand = if is_rev {
+        Strand::Reverse
+    } else {
+        Strand::Forward
+    };
     // SimHash-LSH is mismatch-only and cheaper to verify than CGK's WFA
     // candidate scan, so probe it first; CGK still picks up indel-bearing
     // reads after.
@@ -164,30 +167,24 @@ fn try_fast_dp_alignment_inner(
     }
     let text = &ref_seq[win_start..win_start + text_len];
 
-    if matches!(kind, router::AlignerKind::PackedSpectral) {
-        if let Some(aln) =
+    if matches!(kind, router::AlignerKind::PackedSpectral)
+        && let Some(aln) =
             try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
-        {
-            return Some((aln, FastPathKind::PackedSpectral));
-        }
+    {
+        return Some((aln, FastPathKind::PackedSpectral));
     }
 
     if matches!(
         kind,
         router::AlignerKind::PackedSpectral | router::AlignerKind::SpectralSieve
-    ) {
-        if let Some(aln) =
-            try_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
-        {
-            return Some((aln, FastPathKind::SpectralSieve));
-        }
-        // Spectral didn't apply (indel suspected) — fall through to WFA below.
+    ) && let Some(aln) = try_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
+    {
+        return Some((aln, FastPathKind::SpectralSieve));
     }
+    // Spectral didn't apply (indel suspected) — fall through to WFA below.
 
     let myers_k = router::myers_reject_bound(read_len);
-    if myers::bounded_edit_distance(read_seq, text, myers_k).is_none() {
-        return None;
-    }
+    myers::bounded_edit_distance(read_seq, text, myers_k)?;
 
     let pen = wfa::WfaPenalties {
         mismatch: cfg.mismatch,
@@ -195,9 +192,22 @@ fn try_fast_dp_alignment_inner(
         gap_extend: cfg.gap_extend,
     };
     let budget = router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
-    let wfa_aln = wfa::wfa_align_semi_global(read_seq, text, pen, budget)?;
+    let opts = wfa::WfaOptions {
+        max_score: budget,
+        adaptive_drop: router::wfa_adaptive_drop(),
+        text_begin_free: router::wfa_ends_free(),
+    };
+    let wfa_aln = wfa::wfa_align(read_seq, text, pen, opts)?;
 
-    let aln = wfa_result_to_alignment(read_seq, text, win_start, chain.ref_id, wfa_aln, cfg, is_rev)?;
+    let aln = wfa_result_to_alignment(
+        read_seq,
+        text,
+        win_start,
+        chain.ref_id,
+        wfa_aln,
+        cfg,
+        is_rev,
+    )?;
     Some((aln, FastPathKind::Wfa))
 }
 
@@ -221,7 +231,10 @@ pub fn wfa_result_to_alignment(
             CigarKind::Del | CigarKind::Skipped => (r + l, q),
         }
     });
-    if cigar_ref > text.len() || cigar_query > read_seq.len() {
+    if wfa_aln.text_start.saturating_add(cigar_ref) > text.len()
+        || cigar_query > read_seq.len()
+        || wfa_aln.text_end > text.len()
+    {
         return None;
     }
     let mut sw_score: i32 = 0;
@@ -229,7 +242,7 @@ pub fn wfa_result_to_alignment(
     let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
     let mut match_run: u32 = 0;
     let mut qi = 0usize;
-    let mut ti = 0usize;
+    let mut ti = wfa_aln.text_start;
     for op in &cigar {
         match op.op {
             CigarKind::Match => {
@@ -280,12 +293,15 @@ pub fn wfa_result_to_alignment(
     // SAFETY: only ASCII digits, ACGTN and '^' were pushed.
     let md = unsafe { String::from_utf8_unchecked(md_bytes) };
 
+    // `text_start` is 0 unless ends-free leading text was enabled; honoring it
+    // keeps ref_start correct when the read aligns past the window start.
+    let ref_start_global = win_start_global + wfa_aln.text_start;
     let ref_end_global = win_start_global + wfa_aln.text_end;
 
     Some(Alignment {
         kind: AlignmentKind::DpAligned,
         ref_id,
-        ref_start: win_start_global as u32,
+        ref_start: ref_start_global as u32,
         ref_end: ref_end_global as u32,
         read_start: 0,
         read_end: read_len as u32,
@@ -318,16 +334,23 @@ fn try_packed_spectral_alignment(
 
     let read_packed = bitpacked::PackedDna::pack(read_seq);
     let ref_packed = bitpacked::PackedDna::pack(text);
+    if !read_packed.valid || !ref_packed.valid {
+        return None;
+    }
     let ref_shifted = ref_packed.pre_shifted_window();
 
-    let hit = bitpacked::scan(&read_packed, &ref_shifted, text.len(), max_mism)?;
+    let (hit, second_mismatches) =
+        bitpacked::scan_best_with_second(&read_packed, &ref_shifted, text.len())?;
+    let ref_aligned = &text[hit.shift..hit.shift + read_len];
+    if !spectral_hit_is_certified(read_seq, ref_aligned, &hit, second_mismatches, max_mism) {
+        return None;
+    }
 
     let cigar = vec![CigarOp {
         len: read_len as u32,
         op: CigarKind::Match,
     }];
 
-    let ref_aligned = &text[hit.shift..hit.shift + read_len];
     let mut nm: u32 = 0;
     let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
     let mut match_run: u32 = 0;
@@ -383,63 +406,83 @@ fn try_spectral_alignment(
     cfg: AlignmentConfig,
     is_rev: bool,
 ) -> Option<Alignment> {
-    let read_len = read_seq.len();
-    let max_mism = router::spectral_max_mismatches(read_len);
-    let hit = spectral::scan(read_seq, text, max_mism)?;
+    try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
+}
 
-    // Build CIGAR: one big M (no internal soft-clip; the entire read aligns).
-    let cigar = vec![CigarOp {
-        len: read_len as u32,
-        op: CigarKind::Match,
-    }];
-
-    // NM / MD from the chosen shift.
-    let ref_aligned = &text[hit.shift..hit.shift + read_len];
-    let mut nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
-    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
-        if qb == rb {
-            match_run += 1;
-        } else {
-            nm += 1;
-            push_u32_decimal(&mut md_bytes, match_run);
-            md_bytes.push(*rb);
-            match_run = 0;
+fn spectral_hit_is_certified(
+    read: &[u8],
+    reference: &[u8],
+    hit: &bitpacked::PackedHit,
+    second_mismatches: Option<usize>,
+    max_mismatches: usize,
+) -> bool {
+    if read.len() != reference.len()
+        || hit.mismatches > max_mismatches
+        || second_mismatches.is_some_and(|second| second <= hit.mismatches.saturating_add(1))
+    {
+        return false;
+    }
+    if hit.mismatches == 0 {
+        return true;
+    }
+    // The ungapped path is a certificate, not a heuristic aligner. More than
+    // two residual differences, terminal differences, or a compact mismatch
+    // cluster are cheap signals that a small indel is being represented as M.
+    if hit.mismatches > 2 {
+        return false;
+    }
+    let mut mismatch_pos = [usize::MAX; 2];
+    let mut n = 0usize;
+    for (i, (&q, &r)) in read.iter().zip(reference).enumerate() {
+        if q != r {
+            if n < mismatch_pos.len() {
+                mismatch_pos[n] = i;
+            }
+            n += 1;
         }
     }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: only ASCII digits and ACGTN bases were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+    if n != hit.mismatches {
+        return false;
+    }
+    let edge = read.len().min(8);
+    if mismatch_pos[..n]
+        .iter()
+        .any(|&p| p < edge || p.saturating_add(edge) >= read.len())
+    {
+        return false;
+    }
+    if n == 2 && mismatch_pos[1].saturating_sub(mismatch_pos[0]) <= 4 {
+        return false;
+    }
 
-    // SW-style score: matches reward, mismatches penalty (no gap cost — ungapped).
-    let matches = hit.matches as i32;
-    let mismatches = hit.mismatches as i32;
-    let sw_score = matches * cfg.match_score - mismatches * cfg.mismatch;
+    // If deleting one base from either sequence after the first mismatch makes
+    // the remaining suffix nearly exact, the Hamming hit is an indel proxy.
+    let p = mismatch_pos[0];
+    let suffix_len = read.len().saturating_sub(p + 1);
+    if suffix_len >= 8 {
+        let read_insertion_like =
+            bounded_hamming(&read[p + 1..], &reference[p..reference.len() - 1], 1) <= 1;
+        let ref_insertion_like =
+            bounded_hamming(&read[p..read.len() - 1], &reference[p + 1..], 1) <= 1;
+        if read_insertion_like || ref_insertion_like {
+            return false;
+        }
+    }
+    true
+}
 
-    let ref_start_global = win_start + hit.shift;
-    let ref_end_global = ref_start_global + read_len;
-
-    Some(Alignment {
-        kind: AlignmentKind::DpAligned,
-        ref_id: chain.ref_id,
-        ref_start: ref_start_global as u32,
-        ref_end: ref_end_global as u32,
-        read_start: 0,
-        read_end: read_len as u32,
-        cigar,
-        score: sw_score,
-        mapq: 0,
-        is_rev,
-        is_secondary: false,
-        is_supplementary: false,
-        nm,
-        md,
-        as_score: sw_score,
-        xs_score: None,
-        xs_strand: None,
-        mate: MateInfo::default(),
-    })
+fn bounded_hamming(a: &[u8], b: &[u8], limit: usize) -> usize {
+    if a.len() != b.len() {
+        return limit + 1;
+    }
+    let mut mismatches = 0usize;
+    for (&x, &y) in a.iter().zip(b) {
+        mismatches += usize::from(x != y);
+        if mismatches > limit {
+            break;
+        }
+    }
+    mismatches
 }
 
 /// Attempt fast exact-match alignment (no DP).
@@ -602,53 +645,53 @@ pub fn align_in_window(
 
     let read_packed = bitpacked::PackedDna::pack(read_seq);
     let ref_packed = bitpacked::PackedDna::pack(ref_window);
-    let ref_shifted = ref_packed.pre_shifted_window();
-    let best = match bitpacked::scan_best(&read_packed, &ref_shifted, ref_window.len()) {
-        Some(h) => h,
-        None => return None,
-    };
-    let max_mism = router::spectral_max_mismatches(read_len);
+    if read_packed.valid && ref_packed.valid {
+        let ref_shifted = ref_packed.pre_shifted_window();
+        if let Some((best, second)) =
+            bitpacked::scan_best_with_second(&read_packed, &ref_shifted, ref_window.len())
+        {
+            let max_mism = router::spectral_max_mismatches(read_len);
+            let target = &ref_window[best.shift..best.shift + read_len];
+            if spectral_hit_is_certified(read_seq, target, &best, second, max_mism) {
+                if let Some(aln) = build_spectral_alignment(
+                    read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score, &best,
+                ) {
+                    return Some(aln);
+                }
+            }
 
-    // Case 1 — ungapped accept.
-    if best.mismatches <= max_mism {
-        if let Some(aln) = build_spectral_alignment(
-            read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score, &best,
-        ) {
-            return Some(aln);
+            let band = cfg.bandwidth.max(20);
+            let mut narrow_cfg = cfg;
+            narrow_cfg.bandwidth = band;
+            let sw = banded_sw(
+                read_seq,
+                ref_window,
+                best.shift as i32,
+                narrow_cfg,
+                i32::MIN / 8,
+            );
+            if sw.score >= min_score {
+                let chain = AnchorSpan {
+                    ref_id,
+                    ref_start: win_start + sw.ref_start,
+                    ref_end: win_start + sw.ref_end,
+                    read_start: sw.read_start.max(0) as u32,
+                    read_end: sw.read_end.max(0) as u32,
+                    strand: if is_rev {
+                        crate::types::Strand::Reverse
+                    } else {
+                        crate::types::Strand::Forward
+                    },
+                };
+                return Some(build_alignment(
+                    read_seq, ref_window, win_start, &chain, is_rev, sw,
+                ));
+            }
         }
     }
-
-    let hopeless_threshold = read_len / 2;
-    if best.mismatches >= hopeless_threshold {
-        return None;
-    }
-
-    let band = cfg.bandwidth.max(20);
-    let mut narrow_cfg = cfg;
-    narrow_cfg.bandwidth = band;
-    let sw = banded_sw(
-        read_seq,
-        ref_window,
-        best.shift as i32,
-        narrow_cfg,
-        i32::MIN / 8,
-    );
-    if sw.score < min_score {
-        return None;
-    }
-    let chain = AnchorSpan {
-        ref_id,
-        ref_start: win_start + sw.ref_start as u32,
-        ref_end: win_start + sw.ref_end as u32,
-        read_start: sw.read_start.max(0) as u32,
-        read_end: sw.read_end.max(0) as u32,
-        strand: if is_rev {
-            crate::types::Strand::Reverse
-        } else {
-            crate::types::Strand::Forward
-        },
-    };
-    Some(build_alignment(read_seq, ref_window, win_start, &chain, is_rev, sw))
+    align_in_window_wide_sw(
+        read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score,
+    )
 }
 
 /// Wide-band SW path — the original `align_in_window` body.
@@ -669,8 +712,8 @@ fn align_in_window_wide_sw(
     }
     let chain = AnchorSpan {
         ref_id,
-        ref_start: win_start + sw.ref_start as u32,
-        ref_end: win_start + sw.ref_end as u32,
+        ref_start: win_start + sw.ref_start,
+        ref_end: win_start + sw.ref_end,
         read_start: sw.read_start.max(0) as u32,
         read_end: sw.read_end.max(0) as u32,
         strand: if is_rev {
@@ -679,7 +722,9 @@ fn align_in_window_wide_sw(
             crate::types::Strand::Forward
         },
     };
-    Some(build_alignment(read_seq, ref_window, win_start, &chain, is_rev, sw))
+    Some(build_alignment(
+        read_seq, ref_window, win_start, &chain, is_rev, sw,
+    ))
 }
 
 /// Helper that builds an ungapped `Alignment` from a `PackedHit`.
@@ -858,16 +903,12 @@ fn build_alignment(
         });
     }
 
-    let ref_start = win_start + sw.ref_start as u32;
-    let ref_end = win_start + sw.ref_end as u32;
+    let ref_start = win_start + sw.ref_start;
+    let ref_end = win_start + sw.ref_end;
 
-    let (nm, md) = compute_nm_md(
-        read_seq,
-        ref_window,
-        sw.read_start as usize,
-        sw.ref_start as usize,
-        &cigar,
-    );
+    // `cigar` already contains leading soft clips, so replay starts at query
+    // position zero. Starting at `sw.read_start` would count the clip twice.
+    let (nm, md) = compute_nm_md(read_seq, ref_window, 0, sw.ref_start as usize, &cigar);
 
     Alignment {
         kind: AlignmentKind::DpAligned,
@@ -902,12 +943,76 @@ pub(crate) fn banded_sw_internal(
     banded_sw(read, reference, offset, cfg, abort_score)
 }
 
+/// Whether the banded DP re-centers its band on the running-max column of the
+/// previous row (Suzuki–Kasahara / libgaba-style *adaptive* banding) instead of
+/// pinning it to the static seed diagonal `i + offset`.
+///
+/// A fixed band loses indels that push the optimal path off the seed diagonal —
+/// the classic "indel near the read end is modelled as mismatches and clipped"
+/// failure. The adaptive band follows the score frontier, so an indel mid-read
+/// shifts the band and the post-indel bases stay inside it. For a gapless
+/// alignment the adaptive centre equals `i + offset`, so this is a strict
+/// superset of the previous behaviour. Kill-switch: `KIRA_ADAPTIVE_BAND=0`.
+#[inline]
+fn adaptive_band_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_ADAPTIVE_BAND")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v != 0)
+            .unwrap_or(true)
+    })
+}
+
+/// Maximum the adaptive band centre may deviate from the static seed diagonal
+/// (`KIRA_ADAPTIVE_MAX_DRIFT`, default 16). Unbounded re-centering chases
+/// spurious matches across long non-matching stretches (e.g. the wrong half of
+/// a chimeric read), so the drift is capped. The band's own half-width is still
+/// added around the (clamped) centre, so the reachable diagonal range is
+/// `±(band + max_drift)` — ample for real read-end/mid-read indels while
+/// keeping the band anchored to the seed.
+#[inline]
+fn adaptive_max_drift() -> i32 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<i32> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_ADAPTIVE_MAX_DRIFT")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| v >= 0)
+            .unwrap_or(16)
+    })
+}
+
 fn banded_sw(
     read: &[u8],
     reference: &[u8],
     offset: i32,
     cfg: AlignmentConfig,
     abort_score: i32,
+) -> SwResult {
+    banded_sw_with(
+        read,
+        reference,
+        offset,
+        cfg,
+        abort_score,
+        adaptive_band_enabled(),
+    )
+}
+
+/// Core banded DP. `adaptive` selects Suzuki–Kasahara band re-centering vs the
+/// static seed-diagonal band; split out so tests can exercise both modes in one
+/// process (the public `banded_sw` reads the choice once from the environment).
+fn banded_sw_with(
+    read: &[u8],
+    reference: &[u8],
+    offset: i32,
+    cfg: AlignmentConfig,
+    abort_score: i32,
+    adaptive: bool,
 ) -> SwResult {
     let q_len = read.len();
     let r_len = reference.len();
@@ -928,8 +1033,20 @@ fn banded_sw(
 
     let mut early_abort = false;
 
+    // Column the next row's band is centred on. For row 1 this is the static
+    // seed diagonal; thereafter it tracks the previous row's best-scoring column
+    // (+1 to advance one step down the diagonal) so the band follows indel drift,
+    // but is clamped to within `max_drift` of the static diagonal.
+    let max_drift = if adaptive { adaptive_max_drift() } else { 0 };
+    let mut adaptive_center = 1i32 + offset;
+
     for i in 1..=q_len {
-        let center = i as i32 + offset;
+        let static_center = i as i32 + offset;
+        let center = if adaptive {
+            adaptive_center.clamp(static_center - max_drift, static_center + max_drift)
+        } else {
+            static_center
+        };
         let j_start = (center - band).max(1);
         let j_end = (center + band).min(r_len as i32);
         if j_start > j_end {
@@ -948,6 +1065,9 @@ fn banded_sw(
         let mut cur_f = vec![i32::MIN / 4; row_len];
         let mut trace = vec![0u8; row_len];
         let mut row_best = 0i32;
+        // Column of this row's best-scoring cell (-1 if no positive cell), used
+        // to re-centre the adaptive band for the next row.
+        let mut row_best_j = -1i32;
 
         for j in j_start..=j_end {
             let idx = (j - j_start) as usize;
@@ -959,19 +1079,24 @@ fn banded_sw(
                 };
             let h_match = h_diag + score_diag;
 
-            let e = prev_cell(j, prev_start, &prev_h)
-                .map(|v| {
-                    (v - cfg.gap_open).max(
-                        prev_cell(j, prev_start, &prev_e).unwrap_or(i32::MIN / 4) - cfg.gap_extend,
-                    )
-                })
+            let gap_open_first = cfg.gap_open.saturating_add(cfg.gap_extend);
+            let e_from_h = prev_cell(j, prev_start, &prev_h)
+                .map(|v| v - gap_open_first)
                 .unwrap_or(i32::MIN / 4);
+            let e_from_e = prev_cell(j, prev_start, &prev_e)
+                .map(|v| v - cfg.gap_extend)
+                .unwrap_or(i32::MIN / 4);
+            let e = e_from_h.max(e_from_e);
 
-            let f = if idx > 0 {
-                (cur_h[idx - 1] - cfg.gap_open).max(cur_f[idx - 1] - cfg.gap_extend)
+            let (f_from_h, f_from_f) = if idx > 0 {
+                (
+                    cur_h[idx - 1] - gap_open_first,
+                    cur_f[idx - 1] - cfg.gap_extend,
+                )
             } else {
-                i32::MIN / 4
+                (i32::MIN / 4, i32::MIN / 4)
             };
+            let f = f_from_h.max(f_from_f);
             cur_e[idx] = e;
             cur_f[idx] = f;
 
@@ -989,8 +1114,17 @@ fn banded_sw(
             }
 
             cur_h[idx] = h;
+            if e_from_e > e_from_h {
+                tr |= TRACE_E_EXTEND;
+            }
+            if f_from_f > f_from_h {
+                tr |= TRACE_F_EXTEND;
+            }
             trace[idx] = tr;
-            row_best = row_best.max(h);
+            if h > row_best {
+                row_best = h;
+                row_best_j = j;
+            }
 
             if h > best_score {
                 best_score = h;
@@ -1008,6 +1142,21 @@ fn banded_sw(
         prev_e = cur_e;
         prev_start = j_start;
 
+        if adaptive {
+            // Track the score frontier: centre next row on this row's best
+            // column (advanced one step). If the row had no positive cell, keep
+            // marching the band diagonally so it never stalls. Clamp to within
+            // `max_drift` of the next row's static diagonal so spurious matches
+            // in a non-matching stretch can't drag the band away from the seed.
+            let raw = if row_best_j >= 0 {
+                row_best_j + 1
+            } else {
+                adaptive_center + 1
+            };
+            let static_next = (i as i32 + 1) + offset;
+            adaptive_center = raw.clamp(static_next - max_drift, static_next + max_drift);
+        }
+
         if cfg.xdrop > 0 && best_score - row_best > cfg.xdrop {
             early_abort = true;
             break;
@@ -1022,9 +1171,7 @@ fn banded_sw(
         }
     }
 
-    if best_qlen_score > 0
-        && best_qlen_score.saturating_add(cfg.clip_penalty) > best_score
-    {
+    if best_qlen_score > 0 && best_qlen_score.saturating_add(cfg.clip_penalty) > best_score {
         best_score = best_qlen_score;
         best_i = q_len;
         best_j = best_qlen_j;
@@ -1036,6 +1183,7 @@ fn banded_sw(
     let read_end = i;
     let ref_end = j as u32;
 
+    let mut state = TraceState::H;
     while i > 0 && j > 0 {
         let row_start = row_starts[i as usize];
         let idx = (j - row_start) as usize;
@@ -1043,24 +1191,36 @@ fn banded_sw(
             break;
         }
         let tr = trace_rows[i as usize][idx];
-        if tr == 0 {
-            break;
-        }
-        match tr {
-            1 => {
-                push_cigar(&mut cigar, CigarKind::Match, 1);
-                i -= 1;
-                j -= 1;
-            }
-            2 => {
+        match state {
+            TraceState::H => match tr & TRACE_DIR_MASK {
+                TRACE_STOP => break,
+                TRACE_DIAG => {
+                    push_cigar(&mut cigar, CigarKind::Match, 1);
+                    i -= 1;
+                    j -= 1;
+                }
+                TRACE_E => state = TraceState::E,
+                TRACE_F => state = TraceState::F,
+                _ => break,
+            },
+            TraceState::E => {
                 push_cigar(&mut cigar, CigarKind::Ins, 1);
                 i -= 1;
+                state = if tr & TRACE_E_EXTEND != 0 {
+                    TraceState::E
+                } else {
+                    TraceState::H
+                };
             }
-            3 => {
+            TraceState::F => {
                 push_cigar(&mut cigar, CigarKind::Del, 1);
                 j -= 1;
+                state = if tr & TRACE_F_EXTEND != 0 {
+                    TraceState::F
+                } else {
+                    TraceState::H
+                };
             }
-            _ => break,
         }
     }
 
@@ -1074,6 +1234,77 @@ fn banded_sw(
         cigar,
         early_abort,
     }
+}
+
+pub(crate) const TRACE_STOP: u8 = 0;
+pub(crate) const TRACE_DIAG: u8 = 1;
+pub(crate) const TRACE_E: u8 = 2;
+pub(crate) const TRACE_F: u8 = 3;
+pub(crate) const TRACE_DIR_MASK: u8 = 0x03;
+pub(crate) const TRACE_E_EXTEND: u8 = 0x04;
+pub(crate) const TRACE_F_EXTEND: u8 = 0x08;
+
+#[derive(Clone, Copy)]
+enum TraceState {
+    H,
+    E,
+    F,
+}
+
+pub(crate) fn traceback_interleaved(
+    trace: &[u8],
+    trace_width: usize,
+    lane_stride: usize,
+    lane: usize,
+    mut i: i32,
+    mut j: i32,
+) -> (Vec<CigarOp>, i32, i32) {
+    let mut cigar = Vec::new();
+    let mut state = TraceState::H;
+    while i > 0 && j > 0 {
+        let idx = (i as usize * trace_width + j as usize) * lane_stride + lane;
+        let Some(&tr) = trace.get(idx) else {
+            break;
+        };
+        match state {
+            TraceState::H => match tr & TRACE_DIR_MASK {
+                TRACE_STOP => break,
+                TRACE_DIAG => {
+                    push_cigar(&mut cigar, CigarKind::Match, 1);
+                    i -= 1;
+                    j -= 1;
+                }
+                TRACE_E => state = TraceState::E,
+                TRACE_F => state = TraceState::F,
+                _ => break,
+            },
+            TraceState::E => {
+                push_cigar(&mut cigar, CigarKind::Ins, 1);
+                i -= 1;
+                state = if tr & TRACE_E_EXTEND != 0 {
+                    TraceState::E
+                } else {
+                    TraceState::H
+                };
+            }
+            TraceState::F => {
+                push_cigar(&mut cigar, CigarKind::Del, 1);
+                j -= 1;
+                state = if tr & TRACE_F_EXTEND != 0 {
+                    TraceState::F
+                } else {
+                    TraceState::H
+                };
+            }
+        }
+    }
+    cigar.reverse();
+    (cigar, i, j)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn traceback_dense(trace: &[u8], trace_width: usize, i: i32, j: i32) -> (Vec<CigarOp>, i32, i32) {
+    traceback_interleaved(trace, trace_width, 1, 0, i, j)
 }
 
 fn prev_cell(j: i32, prev_start: i32, row: &[i32]) -> Option<i32> {
@@ -1252,9 +1483,7 @@ unsafe fn sw_dispatch_avx_vnni(
     cfg: AlignmentConfig,
     read_len: usize,
 ) -> Vec<SwResult> {
-    if sw_int8_vnni::int8_path_viable(read_len, cfg)
-        && inputs.len() <= sw_int8_vnni::LANES
-    {
+    if sw_int8_vnni::int8_path_viable(read_len, cfg) && inputs.len() <= sw_int8_vnni::LANES {
         // SAFETY: target_feature on this function already enabled avx2+avxvnni.
         return unsafe { sw_int8_vnni::sw_batch_int8(inputs, cfg) };
     }
@@ -1313,8 +1542,8 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
         // SAFETY: this caller already has AVX2 enabled via target_feature.
         unsafe {
             sw_batch_avx2_inner(
-                inputs, cfg, lanes, q_len, r_len, prev_h, prev_e, cur_h, cur_e, trace,
-                read_cols, ref_cols,
+                inputs, cfg, lanes, q_len, r_len, prev_h, prev_e, cur_h, cur_e, trace, read_cols,
+                ref_cols,
             )
         }
     })
@@ -1338,23 +1567,25 @@ unsafe fn sw_batch_avx2_inner(
     ref_cols: &mut [u8],
 ) -> Vec<SwResult> {
     use std::arch::x86_64::{
-        __m128i, __m256i, _mm256_adds_epi16, _mm256_andnot_si256, _mm256_blendv_epi8,
-        _mm256_castsi256_si128, _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_cvtepi8_epi16,
-        _mm256_max_epi16, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16,
-        _mm256_setzero_si256, _mm256_storeu_si256, _mm_cmpeq_epi8, _mm_loadu_si128,
-        _mm_storeu_si128,
+        __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_storeu_si128, _mm256_adds_epi16,
+        _mm256_and_si256, _mm256_andnot_si256, _mm256_blendv_epi8, _mm256_castsi256_si128,
+        _mm256_cmpeq_epi16, _mm256_cmpgt_epi16, _mm256_cvtepi8_epi16, _mm256_max_epi16,
+        _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm256_storeu_si256,
     };
 
     const LANES: usize = 16;
 
     let v_zero = _mm256_setzero_si256();
-    let v_go = _mm256_set1_epi16(-cfg.gap_open as i16);
+    let v_go = _mm256_set1_epi16(-(cfg.gap_open.saturating_add(cfg.gap_extend)) as i16);
     let v_ge = _mm256_set1_epi16(-cfg.gap_extend as i16);
     let v_match = _mm256_set1_epi16(cfg.match_score as i16);
     let v_mism = _mm256_set1_epi16(-cfg.mismatch as i16);
     let v_one = _mm256_set1_epi16(1);
     let v_two = _mm256_set1_epi16(2);
     let v_three = _mm256_set1_epi16(3);
+    let v_four = _mm256_set1_epi16(TRACE_E_EXTEND as i16);
+    let v_eight = _mm256_set1_epi16(TRACE_F_EXTEND as i16);
     let v_neg = _mm256_set1_epi16(-16384);
 
     let trace_w = r_len + 1;
@@ -1394,15 +1625,13 @@ unsafe fn sw_batch_avx2_inner(
         let mut cur_f = v_neg;
 
         // Load 16 read bytes (one per lane) into the low 128 bits of a vector.
-        let read_v = unsafe {
-            _mm_loadu_si128(read_cols.as_ptr().add(i * LANES) as *const __m128i)
-        };
+        let read_v =
+            unsafe { _mm_loadu_si128(read_cols.as_ptr().add(i * LANES) as *const __m128i) };
 
         for j in 1..=r_len {
             // Load 16 reference bytes (one per lane).
-            let ref_v = unsafe {
-                _mm_loadu_si128(ref_cols.as_ptr().add(j * LANES) as *const __m128i)
-            };
+            let ref_v =
+                unsafe { _mm_loadu_si128(ref_cols.as_ptr().add(j * LANES) as *const __m128i) };
 
             let eq8 = _mm_cmpeq_epi8(read_v, ref_v);
             let eq16 = _mm256_cvtepi8_epi16(eq8);
@@ -1414,10 +1643,12 @@ unsafe fn sw_batch_avx2_inner(
             let e_from_h = _mm256_adds_epi16(unsafe { *prev_h.get_unchecked(j) }, v_go);
             let e_from_e = _mm256_adds_epi16(unsafe { *prev_e.get_unchecked(j) }, v_ge);
             let e = _mm256_max_epi16(e_from_h, e_from_e);
+            let e_ext = _mm256_cmpgt_epi16(e_from_e, e_from_h);
 
             let f_from_h = _mm256_adds_epi16(unsafe { *cur_h.get_unchecked(j - 1) }, v_go);
             let f_from_f = _mm256_adds_epi16(cur_f, v_ge);
             let f = _mm256_max_epi16(f_from_h, f_from_f);
+            let f_ext = _mm256_cmpgt_epi16(f_from_f, f_from_h);
 
             let h_tmp = _mm256_max_epi16(h_match, e);
             let h_tmp = _mm256_max_epi16(h_tmp, f);
@@ -1438,6 +1669,8 @@ unsafe fn sw_batch_avx2_inner(
             let tr = _mm256_blendv_epi8(v_three, v_two, is_e);
             let tr = _mm256_blendv_epi8(tr, v_one, is_match);
             let tr = _mm256_blendv_epi8(tr, v_zero, is_zero);
+            let tr = _mm256_or_si256(tr, _mm256_and_si256(e_ext, v_four));
+            let tr = _mm256_or_si256(tr, _mm256_and_si256(f_ext, v_eight));
 
             // Pack 16 × i16 → 16 × u8 into the low 128 bits of one vector and store.
             let packed = _mm256_packus_epi16(tr, tr);
@@ -1502,7 +1735,10 @@ unsafe fn sw_batch_avx2_inner(
         _mm256_storeu_si256(best_score_arr.as_mut_ptr() as *mut __m256i, best_v);
         _mm256_storeu_si256(best_i_arr.as_mut_ptr() as *mut __m256i, best_i_v);
         _mm256_storeu_si256(best_j_arr.as_mut_ptr() as *mut __m256i, best_j_v);
-        _mm256_storeu_si256(best_qlen_score_arr.as_mut_ptr() as *mut __m256i, best_qlen_v);
+        _mm256_storeu_si256(
+            best_qlen_score_arr.as_mut_ptr() as *mut __m256i,
+            best_qlen_v,
+        );
         _mm256_storeu_si256(best_qlen_j_arr.as_mut_ptr() as *mut __m256i, best_qlen_j_v);
     }
 
@@ -1512,45 +1748,20 @@ unsafe fn sw_batch_avx2_inner(
     for k in 0..lanes {
         let local_score = best_score_arr[k];
         let qlen_score = best_qlen_score_arr[k];
-        let (start_i, start_j, bs) = if qlen_score > 0
-            && qlen_score.saturating_add(clip_pen_i16) > local_score
-        {
-            (q_len as i32, best_qlen_j_arr[k] as i32, qlen_score as i32)
-        } else {
-            (best_i_arr[k] as i32, best_j_arr[k] as i32, local_score as i32)
-        };
+        let (start_i, start_j, bs) =
+            if qlen_score > 0 && qlen_score.saturating_add(clip_pen_i16) > local_score {
+                (q_len as i32, best_qlen_j_arr[k] as i32, qlen_score as i32)
+            } else {
+                (
+                    best_i_arr[k] as i32,
+                    best_j_arr[k] as i32,
+                    local_score as i32,
+                )
+            };
 
-        let mut cigar = Vec::new();
-        let mut i = start_i;
-        let mut j = start_j;
-        let read_end = i;
-        let ref_end = j as u32;
-
-        while i > 0 && j > 0 {
-            let idx = (i as usize * trace_w + j as usize) * LANES + k;
-            let tr = unsafe { *trace.get_unchecked(idx) };
-            if tr == 0 {
-                break;
-            }
-            match tr {
-                1 => {
-                    push_cigar(&mut cigar, CigarKind::Match, 1);
-                    i -= 1;
-                    j -= 1;
-                }
-                2 => {
-                    push_cigar(&mut cigar, CigarKind::Ins, 1);
-                    i -= 1;
-                }
-                3 => {
-                    push_cigar(&mut cigar, CigarKind::Del, 1);
-                    j -= 1;
-                }
-                _ => break,
-            }
-        }
-
-        cigar.reverse();
+        let read_end = start_i;
+        let ref_end = start_j as u32;
+        let (cigar, i, j) = traceback_interleaved(trace, trace_w, LANES, k, start_i, start_j);
         results.push(SwResult {
             ref_start: j as u32,
             ref_end,
@@ -1582,7 +1793,7 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
     let neg_inf = i32::MIN / 4;
     let v_zero = splat(0);
     let v_neg = splat(neg_inf);
-    let v_go = splat(-cfg.gap_open);
+    let v_go = splat(-(cfg.gap_open.saturating_add(cfg.gap_extend)));
     let v_ge = splat(-cfg.gap_extend);
 
     let mut prev_h: Vec<int32x4_t> = vec![v_zero; r_len + 1];
@@ -1603,6 +1814,10 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
     let mut hm_buf = [0i32; 4];
     let mut e_buf = [0i32; 4];
     let mut f_buf = [0i32; 4];
+    let mut e_from_h_buf = [0i32; 4];
+    let mut e_from_e_buf = [0i32; 4];
+    let mut f_from_h_buf = [0i32; 4];
+    let mut f_from_f_buf = [0i32; 4];
 
     for i in 1..=q_len {
         cur_h[0] = v_zero;
@@ -1652,19 +1867,30 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             vst1q_s32(hm_buf.as_mut_ptr(), h_match);
             vst1q_s32(e_buf.as_mut_ptr(), e);
             vst1q_s32(f_buf.as_mut_ptr(), f);
+            vst1q_s32(e_from_h_buf.as_mut_ptr(), e_from_h);
+            vst1q_s32(e_from_e_buf.as_mut_ptr(), e_from_e);
+            vst1q_s32(f_from_h_buf.as_mut_ptr(), f_from_h);
+            vst1q_s32(f_from_f_buf.as_mut_ptr(), f_from_f);
 
             for lane in 0..lanes {
                 let idx = i * (r_len + 1) + j;
                 let hval = h_buf[lane];
-                if hval == 0 {
-                    trace[lane][idx] = 0;
+                let mut tr = if hval == 0 {
+                    TRACE_STOP
                 } else if hval == hm_buf[lane] {
-                    trace[lane][idx] = 1;
+                    TRACE_DIAG
                 } else if hval == e_buf[lane] {
-                    trace[lane][idx] = 2;
+                    TRACE_E
                 } else {
-                    trace[lane][idx] = 3;
+                    TRACE_F
+                };
+                if e_from_e_buf[lane] > e_from_h_buf[lane] {
+                    tr |= TRACE_E_EXTEND;
                 }
+                if f_from_f_buf[lane] > f_from_h_buf[lane] {
+                    tr |= TRACE_F_EXTEND;
+                }
+                trace[lane][idx] = tr;
                 if hval > best_score[lane] {
                     best_score[lane] = hval;
                     best_i[lane] = i;
@@ -1707,42 +1933,18 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
         let (start_i, start_j, bs) = if best_qlen_score[lane] > 0
             && best_qlen_score[lane].saturating_add(cfg.clip_penalty) > best_score[lane]
         {
-            (q_len as i32, best_qlen_j[lane] as i32, best_qlen_score[lane])
+            (
+                q_len as i32,
+                best_qlen_j[lane] as i32,
+                best_qlen_score[lane],
+            )
         } else {
             (best_i[lane] as i32, best_j[lane] as i32, best_score[lane])
         };
 
-        let mut cigar = Vec::new();
-        let mut i = start_i;
-        let mut j = start_j;
-        let read_end = i;
-        let ref_end = j as u32;
-
-        while i > 0 && j > 0 {
-            let idx = i as usize * (r_len + 1) + j as usize;
-            let tr = trace[lane][idx];
-            if tr == 0 {
-                break;
-            }
-            match tr {
-                1 => {
-                    push_cigar(&mut cigar, CigarKind::Match, 1);
-                    i -= 1;
-                    j -= 1;
-                }
-                2 => {
-                    push_cigar(&mut cigar, CigarKind::Ins, 1);
-                    i -= 1;
-                }
-                3 => {
-                    push_cigar(&mut cigar, CigarKind::Del, 1);
-                    j -= 1;
-                }
-                _ => break,
-            }
-        }
-
-        cigar.reverse();
+        let read_end = start_i;
+        let ref_end = start_j as u32;
+        let (cigar, i, j) = traceback_dense(&trace[lane], r_len + 1, start_i, start_j);
         results.push(SwResult {
             ref_start: j as u32,
             ref_end,
@@ -1755,4 +1957,206 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
     }
 
     results
+}
+
+#[cfg(test)]
+mod adaptive_band_tests {
+    use super::*;
+
+    fn cfg(bandwidth: i32) -> AlignmentConfig {
+        AlignmentConfig {
+            match_score: 1,
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 1,
+            bandwidth,
+            xdrop: 1000,
+            clip_penalty: 5,
+        }
+    }
+
+    /// Deterministic pseudo-random ACGT reference (no trivial repeats that would
+    /// create alternative equal-scoring placements).
+    fn gen_ref(len: usize) -> Vec<u8> {
+        let bases = b"ACGT";
+        let mut s = 0x1234_5678_9abc_def0u64;
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                bases[(s as usize) & 3]
+            })
+            .collect()
+    }
+
+    fn del_len(cigar: &[CigarOp]) -> u32 {
+        cigar
+            .iter()
+            .filter(|o| o.op == CigarKind::Del)
+            .map(|o| o.len)
+            .sum()
+    }
+
+    /// Two 3 bp deletions push the optimal diagonal to +6, beyond a half-width-4
+    /// fixed band. Adaptive banding re-centers and recovers the full alignment;
+    /// the fixed band clips the tail after the drift exceeds the band.
+    #[test]
+    fn adaptive_recovers_drifted_indels_fixed_band_clips() {
+        let reference = gen_ref(120);
+        // read = ref[0..30] + ref[33..60] + ref[63..120]  → two 3 bp deletions.
+        let mut read = Vec::new();
+        read.extend_from_slice(&reference[0..30]);
+        read.extend_from_slice(&reference[33..60]);
+        read.extend_from_slice(&reference[63..120]);
+        assert_eq!(read.len(), 114);
+
+        let abort = i32::MIN / 8;
+        let adaptive = banded_sw_with(&read, &reference, 0, cfg(4), abort, true);
+        let fixed = banded_sw_with(&read, &reference, 0, cfg(4), abort, false);
+
+        let aligned = |r: &SwResult| r.read_end - r.read_start;
+
+        // Adaptive: keeps BOTH 3 bp deletions and aligns essentially the whole
+        // read (banded_sw soft-clips the very first base regardless of mode — a
+        // pre-existing first-row artifact — so allow a 1 bp slack).
+        assert_eq!(
+            del_len(&adaptive.cigar),
+            6,
+            "adaptive should keep both 3bp dels"
+        );
+        assert!(
+            aligned(&adaptive) >= 112,
+            "adaptive aligned {} of 114",
+            aligned(&adaptive)
+        );
+
+        // Fixed band: once cumulative drift exceeds the half-width it loses the
+        // tail — fewer dels recovered, less read aligned, lower score.
+        assert!(
+            del_len(&fixed.cigar) < 6,
+            "fixed kept {} del bp",
+            del_len(&fixed.cigar)
+        );
+        assert!(
+            adaptive.score > fixed.score + 15,
+            "adaptive {} should clearly beat fixed {}",
+            adaptive.score,
+            fixed.score
+        );
+        assert!(
+            aligned(&adaptive) > aligned(&fixed) + 15,
+            "adaptive aligned {} vs fixed {}",
+            aligned(&adaptive),
+            aligned(&fixed)
+        );
+    }
+
+    /// On a gapless read the adaptive centre equals `i + offset`, so both modes
+    /// must produce byte-identical results — adaptive is a strict superset.
+    #[test]
+    fn gapless_adaptive_equals_fixed() {
+        let reference = gen_ref(120);
+        let read = reference[10..90].to_vec(); // 80 bp exact substring
+        let abort = i32::MIN / 8;
+        let adaptive = banded_sw_with(&read, &reference, 10, cfg(6), abort, true);
+        let fixed = banded_sw_with(&read, &reference, 10, cfg(6), abort, false);
+        // For a gapless read the adaptive centre coincides with the static one,
+        // so results must be byte-identical.
+        assert_eq!(adaptive.score, fixed.score);
+        assert_eq!(adaptive.cigar, fixed.cigar);
+        assert_eq!(adaptive.read_start, fixed.read_start);
+        assert_eq!(adaptive.read_end, fixed.read_end);
+        assert_eq!(del_len(&adaptive.cigar), 0);
+        assert!(
+            adaptive.read_end - adaptive.read_start >= 79,
+            "should align ~all 80 bp"
+        );
+    }
+
+    #[test]
+    fn leading_softclip_is_not_counted_twice_in_md() {
+        let chain = AnchorSpan {
+            ref_id: 0,
+            ref_start: 0,
+            ref_end: 4,
+            read_start: 2,
+            read_end: 6,
+            strand: Strand::Forward,
+        };
+        let sw = SwResult {
+            ref_start: 0,
+            ref_end: 4,
+            read_start: 2,
+            read_end: 6,
+            score: 4,
+            cigar: vec![CigarOp {
+                len: 4,
+                op: CigarKind::Match,
+            }],
+            early_abort: false,
+        };
+        let aln = build_alignment(b"TTACGT", b"ACGT", 0, &chain, false, sw);
+        assert_eq!(aln.nm, 0);
+        assert_eq!(aln.md, "4");
+        assert_eq!(
+            aln.cigar,
+            vec![
+                CigarOp {
+                    len: 2,
+                    op: CigarKind::SoftClip,
+                },
+                CigarOp {
+                    len: 4,
+                    op: CigarKind::Match,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn affine_traceback_score_matches_replayed_cigar() {
+        let reference = gen_ref(90);
+        let mut read = reference[..40].to_vec();
+        read.extend_from_slice(b"TTGCA");
+        read.extend_from_slice(&reference[40..]);
+        let cfg = cfg(20);
+        let result = banded_sw_with(&read, &reference, 0, cfg, i32::MIN / 8, true);
+
+        let mut qi = result.read_start as usize;
+        let mut ri = result.ref_start as usize;
+        let mut replay = 0i32;
+        for op in &result.cigar {
+            match op.op {
+                CigarKind::Match => {
+                    for _ in 0..op.len {
+                        replay += if read[qi] == reference[ri] {
+                            cfg.match_score
+                        } else {
+                            -cfg.mismatch
+                        };
+                        qi += 1;
+                        ri += 1;
+                    }
+                }
+                CigarKind::Ins => {
+                    replay -= cfg.gap_open + cfg.gap_extend * op.len as i32;
+                    qi += op.len as usize;
+                }
+                CigarKind::Del => {
+                    replay -= cfg.gap_open + cfg.gap_extend * op.len as i32;
+                    ri += op.len as usize;
+                }
+                CigarKind::SoftClip => qi += op.len as usize,
+                CigarKind::Skipped => ri += op.len as usize,
+            }
+        }
+        assert_eq!(replay, result.score);
+        assert!(
+            result
+                .cigar
+                .iter()
+                .any(|op| op.op == CigarKind::Ins && op.len >= 5)
+        );
+    }
 }

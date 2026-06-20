@@ -43,7 +43,8 @@ impl PairedConfig {
     pub fn apply_insert_spec(&mut self, spec: &str) -> Result<(), String> {
         let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
         let parse = |s: &str| -> Result<u32, String> {
-            s.parse::<u32>().map_err(|_| format!("invalid insert-size component {s:?}"))
+            s.parse::<u32>()
+                .map_err(|_| format!("invalid insert-size component {s:?}"))
         };
         match parts.len() {
             2 => {
@@ -382,7 +383,11 @@ pub fn pair_rerank(
 
     // Concordant-promote: widen candidate window and allow primary swap + MAPQ lift.
     let promote = pair_promote_enabled();
-    let top_k = if promote { pair_promote_topk().max(top_k) } else { top_k };
+    let top_k = if promote {
+        pair_promote_topk().max(top_k)
+    } else {
+        top_k
+    };
     let mapq_floor = if promote { pair_mapq_floor_cfg() } else { 0 };
 
     let pair_bonus_base: i32 = PAIR_BONUS_BASE;
@@ -433,25 +438,24 @@ pub fn pair_rerank(
 
         if let Some((ii, jj, _, bonus)) = best {
             if bonus > 0 {
-                alignments[r1_idx][ii].score =
-                    alignments[r1_idx][ii].score.saturating_add(bonus);
-                alignments[r2_idx][jj].score =
-                    alignments[r2_idx][jj].score.saturating_add(bonus);
-                if promote {
-                    // Make the concordant placement primary (index 0).
-                    if ii != 0 {
-                        alignments[r1_idx].swap(0, ii);
+                alignments[r1_idx][ii].score = alignments[r1_idx][ii].score.saturating_add(bonus);
+                alignments[r2_idx][jj].score = alignments[r2_idx][jj].score.saturating_add(bonus);
+            }
+            if promote && bonus > 0 {
+                // Lock the joint optimum into slot 0 before rescue, mate
+                // decoration, and MAPQ assignment.
+                if ii != 0 {
+                    alignments[r1_idx].swap(0, ii);
+                }
+                if jj != 0 {
+                    alignments[r2_idx].swap(0, jj);
+                }
+                if mapq_floor > 0 {
+                    if let Some(a) = alignments[r1_idx].first_mut() {
+                        a.mapq = a.mapq.max(mapq_floor);
                     }
-                    if jj != 0 {
-                        alignments[r2_idx].swap(0, jj);
-                    }
-                    if mapq_floor > 0 {
-                        if let Some(a) = alignments[r1_idx].first_mut() {
-                            a.mapq = a.mapq.max(mapq_floor);
-                        }
-                        if let Some(a) = alignments[r2_idx].first_mut() {
-                            a.mapq = a.mapq.max(mapq_floor);
-                        }
+                    if let Some(a) = alignments[r2_idx].first_mut() {
+                        a.mapq = a.mapq.max(mapq_floor);
                     }
                 }
             }
@@ -467,13 +471,14 @@ const PAIR_BONUS_BASE: i32 = 0;
 /// Extra bonus when the (R1[i], R2[j]) cross-product is fully concordant.
 const PAIR_BONUS_CONCORDANT: i32 = 30;
 
-/// `KIRA_PAIR_PROMOTE=1` — promote the best concordant pair to primary and lift MAPQ (default off).
+/// Promote the best concordant pair before rescue and mate-field assignment.
+/// Set `KIRA_PAIR_PROMOTE=0` to disable for an A/B comparison.
 fn pair_promote_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("KIRA_PAIR_PROMOTE")
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on"))
-            .unwrap_or(false)
+            .map(|s| s != "0" && !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
     })
 }
 
@@ -485,7 +490,7 @@ fn pair_promote_topk() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&k: &usize| k >= 1)
-            .unwrap_or(1)
+            .unwrap_or(2)
     })
 }
 
@@ -643,11 +648,16 @@ pub fn rescue_discordant_pairs_with_ref(
                 return;
             }
 
-            // Anchor = higher-MAPQ side; ties → R1 (local 0).
+            // MAPQ is assigned after pairing. Choose from alignment evidence
+            // instead of path-dependent placeholder MAPQ values.
             let (anchor_local, target_local) = {
-                let m1 = aln_pair[0][0].mapq;
-                let m2 = aln_pair[1][0].mapq;
-                if m1 >= m2 { (0usize, 1usize) } else { (1usize, 0usize) }
+                let left = (aln_pair[0][0].score, std::cmp::Reverse(aln_pair[0][0].nm));
+                let right = (aln_pair[1][0].score, std::cmp::Reverse(aln_pair[1][0].nm));
+                if left >= right {
+                    (0usize, 1usize)
+                } else {
+                    (1usize, 0usize)
+                }
             };
 
             let anchor_score = aln_pair[anchor_local][0].score;

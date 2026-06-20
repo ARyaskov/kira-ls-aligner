@@ -163,3 +163,34 @@ fn empty_batch_returns_empty_output() {
     assert_eq!(out.stats.n_reads, 0);
 }
 
+#[test]
+fn ambiguous_exact_match_falls_through_when_only_one_alignment_requested() {
+    let pattern = asymmetric_pattern();
+    let mut reference_bytes = Vec::new();
+    reference_bytes.extend_from_slice(&pattern);
+    reference_bytes.extend_from_slice(&vec![b'T'; 20]);
+    reference_bytes.extend_from_slice(&pattern);
+    let index = make_index(make_ref(vec![("ref1", &reference_bytes)]));
+    let mut reads = vec![read("repeat", &pattern)];
+    pad_with_decoys(&mut reads);
+
+    let out = run(&reads, &index, aln_cfg(), 1);
+    assert!(out.alignments[0].is_empty());
+    assert_eq!(out.stats.reads_ambiguous, 1);
+}
+
+#[test]
+fn ambiguous_exact_match_retains_competitors_when_requested() {
+    let pattern = asymmetric_pattern();
+    let mut reference_bytes = Vec::new();
+    reference_bytes.extend_from_slice(&pattern);
+    reference_bytes.extend_from_slice(&vec![b'T'; 20]);
+    reference_bytes.extend_from_slice(&pattern);
+    let index = make_index(make_ref(vec![("ref1", &reference_bytes)]));
+    let mut reads = vec![read("repeat", &pattern)];
+    pad_with_decoys(&mut reads);
+
+    let out = run(&reads, &index, aln_cfg(), 2);
+    assert_eq!(out.alignments[0].len(), 2);
+    assert_eq!(out.alignments[0][0].score, out.alignments[0][1].score);
+}

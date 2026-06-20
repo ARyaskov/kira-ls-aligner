@@ -118,7 +118,9 @@ The selected mode is applied to subsequent batches and logged once when `KIRA_ST
 - Thread parallelism is applied at the per-read level via Rayon.
 - The reference index is immutable and shared across threads.
 - Batch processing avoids unbounded memory usage and improves cache locality.
-- CUDA support is optional behind the `cuda` feature gate (for future).
+- CUDA support is optional behind the `cuda` feature gate and accelerates the
+  batched Spectral Sieve prefilter. Builds with a stub PTX are rejected when
+  the GPU backend is initialized.
 
 ## Extensibility
 

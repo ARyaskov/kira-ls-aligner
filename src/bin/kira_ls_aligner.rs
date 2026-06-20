@@ -1,7 +1,7 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand};
 #[cfg(feature = "cuda")]
 use anyhow::Context;
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 
 use kira_ls_aligner::cli::{IndexArgs, MemArgs, cmd_index, cmd_mem};
 

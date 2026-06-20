@@ -60,11 +60,7 @@ IIIIIIIIIIII
 
 fn write_tmp(name: &str, content: &[u8]) -> std::path::PathBuf {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "kira-paired-{}-{}.fastq",
-        std::process::id(),
-        name
-    ));
+    let path = dir.join(format!("kira-paired-{}-{}.fastq", std::process::id(), name));
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(content).unwrap();
     path
@@ -75,8 +71,7 @@ fn two_file_pairing_yields_r1_r2_adjacent() {
     let p1 = write_tmp("twofile-r1", R1_FASTQ);
     let p2 = write_tmp("twofile-r2", R2_FASTQ);
     let paths = vec![p1.clone(), p2.clone()];
-    let mut stream =
-        ReadStream::new_multi_with_mode(&paths, 100_000, IngestMode::TwoFile).unwrap();
+    let mut stream = ReadStream::new_multi_with_mode(&paths, 100_000, IngestMode::TwoFile).unwrap();
     let batch = stream.next_batch().unwrap().unwrap();
     assert_eq!(batch.len(), 4, "2 pairs × 2 reads each");
     assert_eq!(batch[0].pair_role, PairRole::R1);
@@ -117,8 +112,7 @@ fn mismatched_pair_ids_fail_loudly() {
     let p1 = write_tmp("mismatch-r1", R1_FASTQ);
     let p2 = write_tmp("mismatch-r2", MISMATCHED_R2_FASTQ);
     let paths = vec![p1.clone(), p2.clone()];
-    let mut stream =
-        ReadStream::new_multi_with_mode(&paths, 100_000, IngestMode::TwoFile).unwrap();
+    let mut stream = ReadStream::new_multi_with_mode(&paths, 100_000, IngestMode::TwoFile).unwrap();
     let result = stream.next_batch();
     assert!(result.is_err(), "expected paired-id mismatch to surface");
     let msg = format!("{}", result.unwrap_err());

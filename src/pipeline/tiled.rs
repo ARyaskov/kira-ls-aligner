@@ -10,7 +10,7 @@ use crate::exec::pool::DualPoolConfig;
 use crate::index::tiling::TilePlan;
 use crate::index::{Index, IndexConfig};
 use crate::io::{HeaderConfig, ReadStream, SamWriter};
-use crate::mapq::assign_mapq;
+use crate::mapq::{assign_mapq_preserving_primary, assign_mapq_with_qual};
 use crate::pipeline::chunk_io::{ChunkReader, ChunkWriter, MergeIter};
 use std::sync::Arc;
 
@@ -143,7 +143,10 @@ fn run_tiled_inner(
     }
 
     let t_merge = Instant::now();
-    eprintln!("[KIRA_TILE] merging {} tile(s) → final SAM", chunk_paths.len());
+    eprintln!(
+        "[KIRA_TILE] merging {} tile(s) → final SAM",
+        chunk_paths.len()
+    );
 
     let mut readers: Vec<ChunkReader> = Vec::with_capacity(chunk_paths.len());
     for path in &chunk_paths {
@@ -207,7 +210,7 @@ fn run_tiled_inner(
             &reads,
             &mut alignments,
             &cfg.pipeline_cfg.paired,
-            cfg.pipeline_cfg.dp_topk.max(1),
+            cfg.pipeline_cfg.dp_topk.max(2),
         );
 
         rescue_discordant_pairs_with_ref(
@@ -220,6 +223,14 @@ fn run_tiled_inner(
             RescueConfig::default(),
         );
 
+        let mut unmapped_mate_info: Vec<Option<MateInfo>> = vec![None; n];
+        apply_pairing(
+            &reads,
+            &mut alignments,
+            &mut unmapped_mate_info,
+            &cfg.pipeline_cfg.paired,
+        );
+
         let pair_ctx = if cfg.pipeline_cfg.paired.is_paired() {
             Some(PairMapqContext {
                 insert_mean: cfg.pipeline_cfg.paired.insert_mean,
@@ -230,16 +241,26 @@ fn run_tiled_inner(
             None
         };
         for (i, alns) in alignments.iter_mut().enumerate() {
-            assign_mapq(alns, reads[i].seq.len(), cfg.pipeline_cfg.mapq, pair_ctx, reads[i].repeat_min_occ);
+            if reads[i].pair_role == crate::types::PairRole::Unpaired {
+                assign_mapq_with_qual(
+                    alns,
+                    reads[i].seq.len(),
+                    reads[i].qual.as_deref(),
+                    cfg.pipeline_cfg.mapq,
+                    pair_ctx,
+                    reads[i].repeat_min_occ,
+                );
+            } else {
+                assign_mapq_preserving_primary(
+                    alns,
+                    reads[i].seq.len(),
+                    reads[i].qual.as_deref(),
+                    cfg.pipeline_cfg.mapq,
+                    pair_ctx,
+                    reads[i].repeat_min_occ,
+                );
+            }
         }
-
-        let mut unmapped_mate_info: Vec<Option<MateInfo>> = vec![None; n];
-        apply_pairing(
-            &reads,
-            &mut alignments,
-            &mut unmapped_mate_info,
-            &cfg.pipeline_cfg.paired,
-        );
 
         let scored = ScoredBatch {
             reads,

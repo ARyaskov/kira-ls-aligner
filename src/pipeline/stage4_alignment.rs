@@ -1,23 +1,24 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
 use crate::alignment::prefilter::{
-    PrefilterOutcome, PrefilterReason, PrefilterResult, UngappedStats, build_ungapped_alignment,
-    min_len_required, prefilter_chain,
+    PrefilterOutcome, PrefilterReason, PrefilterResult, UngappedStats, min_len_required,
+    prefilter_chain,
 };
+#[cfg(feature = "cuda")]
+use crate::alignment::push_u32_decimal;
 use crate::alignment::{
     AlignmentConfig, AnchorSpan, BatchInput, FastPathKind, align_batch_simd, align_chain_with_meta,
     exact_match_alignment, try_fast_dp_alignment,
 };
-#[cfg(feature = "cuda")]
-use crate::alignment::push_u32_decimal;
-#[cfg(feature = "cuda")]
-use crate::types::AlignmentKind;
 use crate::index::Index;
 use crate::seq::reverse_complement;
 use crate::simd::{self, SimdMode};
+#[cfg(feature = "cuda")]
+use crate::types::AlignmentKind;
 use crate::types::{Alignment, Chain, CigarKind, CigarOp, MateInfo, ReadRecord, Strand};
 
 use super::stage3_chaining::ChainBatch;
@@ -99,6 +100,16 @@ pub struct AlignmentBatchStats {
 
 impl AlignmentBatchStats {
     pub fn add(&mut self, other: &AlignmentBatchStats) {
+        let old_prefilter = self
+            .prefilter_accept
+            .saturating_add(self.prefilter_reject)
+            .saturating_add(self.prefilter_fallback);
+        let new_prefilter = other
+            .prefilter_accept
+            .saturating_add(other.prefilter_reject)
+            .saturating_add(other.prefilter_fallback);
+        let old_accept = self.prefilter_accept;
+        let old_fallback = self.prefilter_fallback;
         self.reads += other.reads;
         self.chains_total += other.chains_total;
         self.chains_used += other.chains_used;
@@ -106,7 +117,7 @@ impl AlignmentBatchStats {
         self.dp_simd += other.dp_simd;
         self.dp_scalar += other.dp_scalar;
         self.dp_reads += other.dp_reads;
-        self.dp_topk = other.dp_topk;
+        self.dp_topk = self.dp_topk.max(other.dp_topk);
         self.dp_abort_margin = other.dp_abort_margin;
         self.dp_early_abort += other.dp_early_abort;
         self.exact_matches += other.exact_matches;
@@ -131,14 +142,31 @@ impl AlignmentBatchStats {
         self.lsh_rescue_resolved += other.lsh_rescue_resolved;
         self.gpu_spectral_resolved += other.gpu_spectral_resolved;
         self.unmapped += other.unmapped;
-        self.ungapped_score_p95 = other.ungapped_score_p95;
-        self.ungapped_span_p95 = other.ungapped_span_p95;
-        self.ungapped_mismatches_p95 = other.ungapped_mismatches_p95;
-        self.ungapped_identity_p90 = other.ungapped_identity_p90;
-        self.accept_len_p50 = other.accept_len_p50;
-        self.accept_len_p95 = other.accept_len_p95;
-        self.fallback_len_p50 = other.fallback_len_p50;
-        self.fallback_len_p95 = other.fallback_len_p95;
+        self.ungapped_score_p95 = self.ungapped_score_p95.max(other.ungapped_score_p95);
+        self.ungapped_span_p95 = self.ungapped_span_p95.max(other.ungapped_span_p95);
+        self.ungapped_mismatches_p95 = self
+            .ungapped_mismatches_p95
+            .max(other.ungapped_mismatches_p95);
+        self.ungapped_identity_p90 = weighted_f32(
+            self.ungapped_identity_p90,
+            old_prefilter,
+            other.ungapped_identity_p90,
+            new_prefilter,
+        );
+        self.accept_len_p50 = weighted_usize(
+            self.accept_len_p50,
+            old_accept,
+            other.accept_len_p50,
+            other.prefilter_accept,
+        );
+        self.accept_len_p95 = self.accept_len_p95.max(other.accept_len_p95);
+        self.fallback_len_p50 = weighted_usize(
+            self.fallback_len_p50,
+            old_fallback,
+            other.fallback_len_p50,
+            other.prefilter_fallback,
+        );
+        self.fallback_len_p95 = self.fallback_len_p95.max(other.fallback_len_p95);
     }
 
     pub fn avg_read_len(&self) -> f32 {
@@ -150,10 +178,26 @@ impl AlignmentBatchStats {
     }
 }
 
-struct SimdJob<'a> {
+fn weighted_usize(a: usize, a_weight: usize, b: usize, b_weight: usize) -> usize {
+    let total = a_weight.saturating_add(b_weight);
+    if total == 0 {
+        return 0;
+    }
+    ((a as u128 * a_weight as u128 + b as u128 * b_weight as u128) / total as u128) as usize
+}
+
+fn weighted_f32(a: f32, a_weight: usize, b: f32, b_weight: usize) -> f32 {
+    let total = a_weight.saturating_add(b_weight);
+    if total == 0 {
+        return 0.0;
+    }
+    (a * a_weight as f32 + b * b_weight as f32) / total as f32
+}
+
+struct SimdJob<'read, 'index> {
     read_idx: usize,
-    read_seq: Vec<u8>,
-    ref_window: &'a [u8],
+    read_seq: Cow<'read, [u8]>,
+    ref_window: &'index [u8],
     win_start: u32,
     chain: AnchorSpan,
     is_rev: bool,
@@ -166,43 +210,9 @@ struct ScalarJob {
     abort_score: i32,
 }
 
-// Confidence blends coverage, diagonal consistency, ungapped score and chain margin.
-fn chain_confidence(
-    chain: &Chain,
-    read_len: usize,
-    score_margin: i32,
-    ungapped: Option<&UngappedStats>,
-    cfg: AlignmentConfig,
-) -> f32 {
-    let mut cov = 0usize;
-    for a in chain.anchors.iter() {
-        cov += (a.read_end - a.read_start) as usize;
-    }
-    let coverage = (cov as f32 / read_len.max(1) as f32).min(1.0);
-
-    let mut min_diag = i32::MAX;
-    let mut max_diag = i32::MIN;
-    for a in chain.anchors.iter() {
-        let d = a.ref_start as i32 - a.read_start as i32;
-        min_diag = min_diag.min(d);
-        max_diag = max_diag.max(d);
-    }
-    let diag_span = (max_diag - min_diag).max(0) as f32;
-    let diag_score = (1.0 - (diag_span / (read_len as f32 * 0.2 + 1.0))).clamp(0.0, 1.0);
-
-    let margin_score = (score_margin as f32 / 40.0).clamp(0.0, 1.0);
-    let ungapped_norm = ungapped
-        .map(|m| {
-            (m.score as f32 / (read_len as f32 * cfg.match_score.max(1) as f32)).clamp(0.0, 1.0)
-        })
-        .unwrap_or(0.0);
-
-    0.4 * coverage + 0.2 * diag_score + 0.2 * ungapped_norm + 0.2 * margin_score
-}
-
-struct PerReadResult<'a> {
+struct PerReadResult<'read, 'index> {
     accepted: Vec<Alignment>,
-    simd_jobs: Vec<SimdJob<'a>>,
+    simd_jobs: Vec<SimdJob<'read, 'index>>,
     scalar_jobs: Vec<ScalarJob>,
     dp_used: bool,
     short_read: bool,
@@ -231,7 +241,7 @@ struct PerReadResult<'a> {
     lsh_rescue_resolved: usize,
 }
 
-impl<'a> Default for PerReadResult<'a> {
+impl<'read, 'index> Default for PerReadResult<'read, 'index> {
     fn default() -> Self {
         Self {
             accepted: Vec::new(),
@@ -263,18 +273,18 @@ impl<'a> Default for PerReadResult<'a> {
     }
 }
 
-fn process_read_prefilter<'a>(
+fn process_read_prefilter<'read, 'index>(
     idx: usize,
-    read: &ReadRecord,
+    read: &'read ReadRecord,
     chain_list: &[Chain],
-    index: &'a Index,
+    index: &'index Index,
     cfg: AlignmentStageConfig,
     lanes: usize,
     force_counter: &AtomicUsize,
     debug_counter: &AtomicUsize,
     accept_allowed: bool,
     multi_alignments_enabled: bool,
-) -> PerReadResult<'a> {
+) -> PerReadResult<'read, 'index> {
     let mut res = PerReadResult::default();
     let len = read.seq.len();
     let short_read = len <= 300;
@@ -309,17 +319,24 @@ fn process_read_prefilter<'a>(
     res.chain_best = best;
     res.chain_second = chain_second;
 
-    let short_topk = {
-        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let short_topk_override = {
+        static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("KIRA_SHORT_DPTOPK").ok().and_then(|s| s.parse().ok()).filter(|&k| k >= 1).unwrap_or(1)
+            std::env::var("KIRA_SHORT_DPTOPK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&k| k >= 1)
         })
     };
-    // Short reads default to top-1 (fast), but a 2nd DP alignment at the competing locus gives the
-    // honest second-best score that lowers MAPQ on paralog mismaps (so the caller's MQ filter can
-    // drop them). KIRA_SHORT_DPTOPK=2 re-enables it. Default 1 = unchanged.
-    let effective_dp_topk = if short_read { short_topk } else { cfg.dp_topk.max(1) };
-    let mut accepted_read = false;
+    let ambiguous_chain =
+        chain_list.len() > 1 && (score_margin <= (best / 5).max(8) || read.repeat_min_occ > 1);
+    // Unique short reads stay top-1. Ambiguous reads pay for one competing DP
+    // placement so MAPQ and pair reranking use evidence rather than a proxy.
+    let effective_dp_topk = if short_read {
+        short_topk_override.unwrap_or(if ambiguous_chain { 2 } else { 1 })
+    } else {
+        cfg.dp_topk.max(1)
+    };
     let mut selected = 0usize;
     for chain in chain_list.iter() {
         if chain.score < min_score {
@@ -452,29 +469,7 @@ fn process_read_prefilter<'a>(
             }
         }
 
-        let confidence = if is_top1 && cfg.max_alignments <= 1 {
-            chain_confidence(chain, read_len, score_margin, metrics.as_ref(), cfg.cfg)
-        } else {
-            0.0
-        };
-
-        let final_result = if matches!(result, PrefilterResult::Fallback)
-            && !matches!(reason, PrefilterReason::IndelSuspect)
-            && confidence >= if short_read { 0.65 } else { 0.85 }
-            && metrics.is_some()
-            // Only accept the ungapped alignment if it covers (near) the whole read.
-            // A large soft-clip here means the unaligned tail likely holds an indel
-            // that bwa gaps -> route to the gapped DP cascade instead of clipping it.
-            && metrics.as_ref().map_or(false, |m| (m.len as usize) + 2 >= read_len && m.mism <= 3)
-            && is_top1
-            && short_read
-            && cfg.max_alignments <= 1
-        {
-            let m = metrics.as_ref().unwrap();
-            let aln = build_ungapped_alignment(read_seq, ref_seq, m, &span, cfg.cfg);
-            res.prefilter_reason_counts[PrefilterReason::Accepted.idx()] += 1;
-            PrefilterResult::Accept(aln)
-        } else if forced {
+        let final_result = if forced {
             PrefilterResult::Accept(build_forced_accept(read_seq, ref_seq, &span, cfg.cfg))
         } else {
             result
@@ -487,7 +482,7 @@ fn process_read_prefilter<'a>(
                     res.accept_lens.push(m.len);
                 }
                 res.accepted.push(aln);
-                accepted_read = true;
+                continue;
             }
             PrefilterResult::Reject => {
                 res.prefilter_reject += 1;
@@ -499,10 +494,6 @@ fn process_read_prefilter<'a>(
                     res.fallback_lens.push(m.len);
                 }
             }
-        }
-
-        if accepted_read {
-            break;
         }
 
         #[cfg(feature = "cuda")]
@@ -522,7 +513,7 @@ fn process_read_prefilter<'a>(
                     FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
                     FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
                 }
-                break;
+                continue;
             }
         }
 
@@ -533,7 +524,11 @@ fn process_read_prefilter<'a>(
             {
                 res.simd_jobs.push(SimdJob {
                     read_idx: idx,
-                    read_seq: read_seq.to_vec(),
+                    read_seq: if is_rev {
+                        Cow::Owned(read_seq.to_vec())
+                    } else {
+                        Cow::Borrowed(read_fwd)
+                    },
                     ref_window,
                     win_start,
                     chain: span,
@@ -578,7 +573,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     let accept_allowed = cfg.accept_enable && cfg.max_alignments <= 1;
     let multi_alignments_enabled = cfg.max_alignments > 1;
 
-    let per_read: Vec<PerReadResult<'_>> = reads
+    let per_read: Vec<PerReadResult<'_, '_>> = reads
         .par_iter()
         .enumerate()
         .map(|(idx, read)| {
@@ -600,9 +595,9 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     // Sequential merge of per-read results (cheap; ~1.5M reads but tiny per-read work).
     let mut short_read_batch = false;
     let mut alignments: Vec<Vec<Alignment>> = Vec::with_capacity(reads.len());
-    let mut simd_jobs: Vec<SimdJob<'_>> = Vec::new();
+    let mut simd_jobs: Vec<SimdJob<'_, '_>> = Vec::new();
     let mut scalar_jobs: Vec<ScalarJob> = Vec::new();
-    let mut bucket_map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut bucket_map: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
     let mut dp_used = vec![false; reads.len()];
     let mut potential_accepts: usize = 0;
     let mut ungapped_stats: Vec<UngappedStats> = Vec::new();
@@ -644,9 +639,9 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         chain_second_per_read.push(res.chain_second);
         dp_used[idx] = res.dp_used;
         for job in res.simd_jobs.into_iter() {
-            let read_len = job.read_seq.len();
+            let shape = (job.read_seq.len(), job.ref_window.len());
             let job_idx = simd_jobs.len();
-            bucket_map.entry(read_len).or_default().push(job_idx);
+            bucket_map.entry(shape).or_default().push(job_idx);
             simd_jobs.push(job);
         }
         scalar_jobs.extend(res.scalar_jobs);
@@ -671,7 +666,10 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                 });
                 bucket_map.clear();
                 for (new_idx, job) in simd_jobs.iter().enumerate() {
-                    bucket_map.entry(job.read_seq.len()).or_default().push(new_idx);
+                    bucket_map
+                        .entry((job.read_seq.len(), job.ref_window.len()))
+                        .or_default()
+                        .push(new_idx);
                 }
             }
             eprintln!(
@@ -703,8 +701,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
 
     stats.dp_reads = dp_used.iter().filter(|v| **v).count();
     if short_read_batch {
-        stats.dp_topk = 1;
-        debug_assert!(stats.dp_attempts <= stats.reads);
+        stats.dp_topk = stats.dp_topk.max(2);
     }
 
     if cfg.debug_prefilter
@@ -720,13 +717,10 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     }
 
     let mut simd_batches: Vec<Vec<usize>> = Vec::new();
-    let mut simd_fallback: Vec<usize> = Vec::new();
     for indices in bucket_map.values() {
         for chunk in indices.chunks(lanes) {
-            if chunk.len() == lanes {
+            if !chunk.is_empty() {
                 simd_batches.push(chunk.to_vec());
-            } else {
-                simd_fallback.extend_from_slice(chunk);
             }
         }
     }
@@ -739,7 +733,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                 .map(|&idx| {
                     let job = &simd_jobs[idx];
                     BatchInput {
-                        read_seq: job.read_seq.as_slice(),
+                        read_seq: job.read_seq.as_ref(),
                         ref_window: job.ref_window,
                         win_start: job.win_start,
                         chain: job.chain,
@@ -751,7 +745,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
             let alns = align_batch_simd(&inputs, cfg.cfg, simd_mode);
             batch
                 .iter()
-                .zip(alns.into_iter())
+                .zip(alns)
                 .map(|(&idx, (aln, early))| (simd_jobs[idx].read_idx, aln, early))
                 .collect::<Vec<_>>()
         })
@@ -763,15 +757,6 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
 
     for (idx, aln, _) in simd_results {
         alignments[idx].push(aln);
-    }
-
-    for idx in simd_fallback {
-        let job = &simd_jobs[idx];
-        scalar_jobs.push(ScalarJob {
-            read_idx: job.read_idx,
-            chain: job.chain,
-            abort_score: job.abort_score,
-        });
     }
 
     let scalar_results: Vec<(usize, Alignment, bool)> = scalar_jobs
@@ -796,7 +781,10 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     let xs_min_ratio_pct: i64 = {
         static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("KIRA_XS_MINRATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+            std::env::var("KIRA_XS_MINRATIO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
         })
     };
     for (i, alns) in alignments.iter_mut().enumerate() {
@@ -844,7 +832,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
 /// Submit every `SimdJob` to the GPU dispatcher as a single batch of spectral-sieve scans.
 #[cfg(feature = "cuda")]
 fn gpu_dispatch_spectral(
-    simd_jobs: &[SimdJob<'_>],
+    simd_jobs: &[SimdJob<'_, '_>],
     alignments: &mut [Vec<Alignment>],
     cfg: AlignmentConfig,
 ) -> Vec<bool> {
@@ -898,14 +886,19 @@ fn gpu_dispatch_spectral(
 /// Compare GPU dispatch results against a fresh CPU `bitpacked::scan` call for the first `n` jobs.
 #[cfg(feature = "cuda")]
 fn diagnose_gpu_vs_cpu(
-    simd_jobs: &[SimdJob<'_>],
+    simd_jobs: &[SimdJob<'_, '_>],
     gpu_results: &[crate::cuda::CudaResult],
     n: usize,
 ) {
     use crate::alignment::bitpacked::{self, PackedDna};
     let limit = simd_jobs.len().min(n);
     let mut disagreements = 0usize;
-    for (i, (job, gpu)) in simd_jobs.iter().zip(gpu_results.iter()).take(limit).enumerate() {
+    for (i, (job, gpu)) in simd_jobs
+        .iter()
+        .zip(gpu_results.iter())
+        .take(limit)
+        .enumerate()
+    {
         let read_len = job.read_seq.len();
         let max_mism = crate::alignment::router::spectral_max_mismatches(read_len);
         let pr = PackedDna::pack(&job.read_seq);
@@ -914,10 +907,7 @@ fn diagnose_gpu_vs_cpu(
         let cpu_hit = bitpacked::scan(&pr, &shifted, job.ref_window.len(), max_mism);
 
         let (cpu_str, cpu_accepts) = match cpu_hit {
-            Some(h) => (
-                format!("shift={}, mism={}", h.shift, h.mismatches),
-                true,
-            ),
+            Some(h) => (format!("shift={}, mism={}", h.shift, h.mismatches), true),
             None => ("NONE".to_string(), false),
         };
         let gpu_accepts = gpu.shift >= 0;
@@ -968,7 +958,7 @@ fn diagnose_gpu_vs_cpu(
 /// Build a SAM-compatible `Alignment` from a single GPU spectral result.
 #[cfg(feature = "cuda")]
 fn build_alignment_from_gpu(
-    job: &SimdJob<'_>,
+    job: &SimdJob<'_, '_>,
     result: &crate::cuda::CudaResult,
     cfg: AlignmentConfig,
 ) -> Alignment {
@@ -1101,7 +1091,7 @@ fn build_forced_accept(
     }
 }
 
-fn percentile_i32(values: &mut Vec<i32>, pct: usize) -> i32 {
+fn percentile_i32(values: &mut [i32], pct: usize) -> i32 {
     if values.is_empty() {
         return 0;
     }
@@ -1131,7 +1121,7 @@ fn build_simd_window<'a>(
     Some((start as u32, window))
 }
 
-fn percentile_u16(values: &mut Vec<u16>, pct: usize) -> u16 {
+fn percentile_u16(values: &mut [u16], pct: usize) -> u16 {
     if values.is_empty() {
         return 0;
     }

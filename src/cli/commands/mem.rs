@@ -35,6 +35,14 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
+
 /// Parameters for the fused in-process aligner ([`build_short_pe_aligner`]).
 pub struct FusedAlignerParams {
     pub reference: std::path::PathBuf,
@@ -81,22 +89,29 @@ pub fn build_short_pe_aligner(
     let seeding_cfg = SeedingConfig {
         min_anchor_len: 20,
         max_occ: 500,
+        max_hits_per_minimizer: env_usize("KIRA_K_HITS", 16),
         long_read_threshold: 500,
     };
+    // KIRA_CHAIN_* — chaining gap cost. Lowering lets seed anchors chain ACROSS an indel
+    // (different diagonals) instead of splitting into a single-diagonal chain that hides the
+    // indel from the gapped aligner. KIRA_CHAIN_TUNE=0 disables the repeat-region tightening.
     let chaining_cfg = ChainingConfig {
-        max_dist: 500,
+        max_dist: env_i32("KIRA_CHAIN_MAX_DIST", 500) as u32,
         max_anchors: 2000,
         max_chains: 5,
-        gap_open: 5,
-        gap_extend: 1,
+        gap_open: env_i32("KIRA_CHAIN_GAP_OPEN", 5),
+        gap_extend: env_i32("KIRA_CHAIN_GAP_EXTEND", 1),
         log_gap: 0.2,
         rmq_window: 256,
     };
     let alignment_cfg = AlignmentConfig {
         match_score: 1,
         mismatch: 4,
-        gap_open: 6,
-        gap_extend: 1,
+        // KIRA_GAP_OPEN — WFA/DP gap-open cost. Default 6 makes WFA prefer a terminal mismatch over
+        // a gap for near-end indels (1bp short side: mismatch 4 < gap 7), so they're never placed.
+        // Lowering it places them (more indel recall) at some spurious-gap (FP) cost.
+        gap_open: env_i32("KIRA_GAP_OPEN", 6),
+        gap_extend: env_i32("KIRA_GAP_EXTEND", 1),
         // KIRA_BANDWIDTH / KIRA_XDROP / KIRA_CLIP_PENALTY — alignment-tuning knobs.
         bandwidth: env_i32("KIRA_BANDWIDTH", 50),
         xdrop: env_i32("KIRA_XDROP", 50),
@@ -220,6 +235,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     let seeding_cfg = SeedingConfig {
         min_anchor_len: 20,
         max_occ: 500,
+        max_hits_per_minimizer: env_usize("KIRA_K_HITS", args.seed_occ_cap as usize),
         long_read_threshold: args.long_read_threshold,
     };
 
@@ -323,7 +339,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         _ => OutputConfig::full(),
     };
 
-    let accept_enable = args.accept_enable.unwrap_or(true);
+    let accept_enable = resolve_accept_enable(args.accept_enable, args.fast_output);
 
     let (paired_mode, auto_detected_pe) =
         resolve_paired_mode(args.paired, args.interleaved, args.reads.len())?;
@@ -560,7 +576,9 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
     let tmp = tempfile::Builder::new()
         .prefix("kira-ls-aligner-")
         .suffix(".sam")
@@ -678,7 +696,17 @@ fn run_split_prefix(
         junctions: cfg.junctions.clone(),
         junc_bed_tolerance: cfg.junc_bed_tolerance,
     };
-    run_tiled(reference, &args.reads, args.output.clone(), tiled_cfg, tile_plan)
+    run_tiled(
+        reference,
+        &args.reads,
+        args.output.clone(),
+        tiled_cfg,
+        tile_plan,
+    )
+}
+
+pub(crate) fn resolve_accept_enable(explicit: Option<bool>, fast_output: bool) -> bool {
+    explicit.unwrap_or(fast_output)
 }
 
 /// Resolve the FASTQ ingestion mode from the `--paired` / `--interleaved` flags and the input file.

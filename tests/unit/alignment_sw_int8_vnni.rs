@@ -29,7 +29,9 @@ fn rand_dna(len: usize, mut state: u64) -> Vec<u8> {
     let alphabet = b"ACGT";
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(alphabet[(state >> 60) as usize & 0x3]);
     }
     out
@@ -129,7 +131,10 @@ fn int8_matches_truth_with_mismatches() {
     }
     // clip_penalty=0 so the kernel surfaces the global-max cell rather
     // than biasing toward an end-of-read alignment.
-    let cfg = AlignmentConfig { clip_penalty: 0, ..cfg() };
+    let cfg = AlignmentConfig {
+        clip_penalty: 0,
+        ..cfg()
+    };
     let read_len = 80usize;
     let ref_pad = 20usize;
     let lanes = LANES;
@@ -185,7 +190,10 @@ fn int8_path_viable_thresholds() {
     assert!(!int8_path_viable(120, c)); // 120 ≥ 120 — not viable
     assert!(!int8_path_viable(150, c)); // 150 — past threshold
 
-    let big_match = AlignmentConfig { match_score: 2, ..c };
+    let big_match = AlignmentConfig {
+        match_score: 2,
+        ..c
+    };
     assert!(!int8_path_viable(100, big_match)); // 100 * 2 = 200
     assert!(int8_path_viable(50, big_match)); // 50 * 2 = 100 < 120
 }

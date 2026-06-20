@@ -27,3 +27,14 @@ fn mode_long_for_ont_like() {
     };
     assert_eq!(classify(f), ReadMode::Long);
 }
+
+#[test]
+fn mode_hybrid_for_mixed_short_and_long_batch() {
+    let f = ModeFeatures {
+        read_len_p50: 150,
+        read_len_p90: 5000,
+        avg_minimizers: 50.0,
+        ..ModeFeatures::default()
+    };
+    assert_eq!(classify(f), ReadMode::Hybrid);
+}

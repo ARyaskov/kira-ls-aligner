@@ -67,6 +67,7 @@ pub struct AcBatchStats {
     pub n_reads: usize,
     pub reads_eligible: usize,
     pub reads_resolved: usize,
+    pub reads_ambiguous: usize,
     pub fwd_hits: usize,
     pub rev_hits: usize,
     pub build_ms: f32,
@@ -170,11 +171,11 @@ pub fn run(
 
     for (idx, read) in reads.iter().enumerate() {
         let len = read.seq.len();
-        if len < MIN_PATTERN_LEN || len > MAX_PATTERN_LEN {
+        if !(MIN_PATTERN_LEN..=MAX_PATTERN_LEN).contains(&len) {
             continue;
         }
         // Reads with N cannot match the reference byte-exactly.
-        if read.seq.iter().any(|&b| b == b'N') {
+        if read.seq.contains(&b'N') {
             continue;
         }
         fwd_patterns.push(read.seq.as_slice());
@@ -269,14 +270,35 @@ pub fn run(
     out.stats.fwd_hits = fwd_counter.load(Ordering::Relaxed);
     out.stats.rev_hits = rev_counter.load(Ordering::Relaxed);
 
-    hits.sort_unstable_by_key(|(key, _, _)| *key);
+    hits.sort_unstable_by_key(|(key, read_idx, _)| (*read_idx, *key));
+    // A palindromic read is found by both forward and reverse automata at the
+    // same locus. That is one genomic placement, not a two-locus ambiguity.
+    hits.dedup_by(|a, b| a.1 == b.1 && a.0.0 == b.0.0 && a.0.2 == b.0.2);
     out.stats.scan_ms = t_scan.elapsed().as_secs_f64() as f32 * 1000.0;
 
     let cap = max_alignments.max(1);
-    for (_, read_idx, aln) in hits {
-        if out.alignments[read_idx].len() < cap {
-            out.alignments[read_idx].push(aln);
+    let mut start = 0usize;
+    while start < hits.len() {
+        let read_idx = hits[start].1;
+        let mut end = start + 1;
+        while end < hits.len() && hits[end].1 == read_idx {
+            end += 1;
         }
+        let placements = end - start;
+        if placements == 1 || cap > 1 {
+            out.alignments[read_idx].extend(
+                hits[start..end]
+                    .iter()
+                    .take(cap)
+                    .map(|(_, _, aln)| aln.clone()),
+            );
+        } else {
+            // A top-1 exact shortcut has no evidence for choosing among equal
+            // placements. Leave it unresolved so indexed chaining can compute
+            // repeat evidence and an honest second-best/MAPQ.
+            out.stats.reads_ambiguous += 1;
+        }
+        start = end;
     }
 
     out.stats.reads_resolved = out.alignments.iter().filter(|v| !v.is_empty()).count();
