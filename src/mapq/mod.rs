@@ -1,4 +1,4 @@
-use crate::types::{Alignment, CigarKind};
+use crate::types::{Alignment, AlignmentKind, CigarKind};
 
 /// MAPQ configuration.
 #[derive(Clone, Copy, Debug)]
@@ -116,10 +116,19 @@ fn assign_mapq_impl(
     let occ_cap = repeat_occ_cap(repeat_min_occ) as i32;
     let id_cap = identity_mapq_cap(&alignments[0], read_len) as i32;
     let qual_cap = quality_mapq_cap(qual) as i32;
+    // Mate-rescue placements (single forced window, no genome-wide competitor
+    // search) must not claim full confidence. The score model would emit `cap`
+    // here (sub=0 for the sole window hit), so apply the rescue ceiling.
+    let rescue_cap = if alignments[0].kind == AlignmentKind::Rescued {
+        rescue_mapq_cap() as i32
+    } else {
+        i32::MAX
+    };
     let primary_mapq = compute_mapq(best, sub, cap, read_len)
         .min(occ_cap)
         .min(id_cap)
-        .min(qual_cap);
+        .min(qual_cap)
+        .min(rescue_cap);
 
     alignments[0].mapq = primary_mapq as u8;
     alignments[0].xs_score = if sub > 0 { Some(sub) } else { None };
@@ -230,26 +239,82 @@ fn identity_mismatch_rate(aln: &Alignment) -> f64 {
     mismatches / m as f64
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdMapqMode {
+    Off,
+    /// Binary cliff: full MAPQ up to 13% mismatch, 0 beyond. Backward-compatible default.
+    Binary,
+    /// Graded ceiling: full up to 4%, linear down to 0 at 13%, hard 0 beyond.
+    Ramp,
+}
+
+/// `KIRA_ID_MAPQ` mode. `0`/`off` → Off; `ramp`/`graded` → Ramp; anything else → Binary.
+fn id_mapq_mode() -> IdMapqMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let m = *MODE.get_or_init(|| match std::env::var("KIRA_ID_MAPQ") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => 0,
+        Ok(v) if v.eq_ignore_ascii_case("ramp") || v.eq_ignore_ascii_case("graded") => 2,
+        _ => 1,
+    });
+    match m {
+        0 => IdMapqMode::Off,
+        2 => IdMapqMode::Ramp,
+        _ => IdMapqMode::Binary,
+    }
+}
+
 /// MAPQ ceiling from alignment identity — the bwa `-T` reject expressed as a MAPQ
 /// cap. Clean reads keep full MAPQ; low-identity placements (likely wrong locus)
-/// are capped so the caller's min-MQ filter drops them. Disabled with KIRA_ID_MAPQ=0.
+/// are capped so the caller's min-MQ filter drops them.
+///
+/// Default (Binary) keeps only the clear garbage (>13% mismatch — the near-random,
+/// deeply-negative-score alignments kira otherwise emits at MAPQ 60; bwa never
+/// reports these). The paralog band (NM ~5-19) is left to the competing-locus MAPQ
+/// that dp_topk=2 enables. `KIRA_ID_MAPQ=ramp` instead grades the paralog band
+/// directly (needs GIAB validation vs the binary cliff); `KIRA_ID_MAPQ=0` disables.
 fn identity_mapq_cap(aln: &Alignment, _read_len: usize) -> u8 {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("KIRA_ID_MAPQ")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
-            .unwrap_or(true)
-    });
-    if !enabled {
+    let mode = id_mapq_mode();
+    if mode == IdMapqMode::Off {
         return 60;
     }
     let rate = identity_mismatch_rate(aln);
-    // Only the clear garbage (>13% mismatch — the near-random, deeply-negative-score
-    // alignments kira otherwise emits at MAPQ 60; bwa never reports these). The
-    // paralog band (NM ~5-19) is left to the now-honest competing-locus MAPQ that
-    // dp_topk=2 enables (the true copy gets a real second-best score).
-    if rate <= 0.13 { 60 } else { 0 }
+    match mode {
+        IdMapqMode::Off => 60,
+        IdMapqMode::Binary => {
+            if rate <= 0.13 {
+                60
+            } else {
+                0
+            }
+        }
+        IdMapqMode::Ramp => {
+            const LO: f64 = 0.04;
+            const HI: f64 = 0.13;
+            if rate <= LO {
+                60
+            } else if rate >= HI {
+                0
+            } else {
+                (60.0 * (HI - rate) / (HI - LO)).round().clamp(0.0, 60.0) as u8
+            }
+        }
+    }
+}
+
+/// MAPQ ceiling for mate-rescue placements (`AlignmentKind::Rescued`). Default 30 —
+/// the historical intent of the dead `aln.mapq = 30` store in pairing.rs. Tunable via
+/// `KIRA_RESCUE_MAPQ_CAP`; set to 60 to effectively disable the cap.
+fn rescue_mapq_cap() -> u8 {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<u8> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("KIRA_RESCUE_MAPQ_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(30)
+            .min(60)
+    })
 }
 
 /// Sub-alignment floor as a fraction of the primary score.
@@ -267,11 +332,28 @@ fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize) -> i32 {
     }
     let relative_gap = (best - sub) as f64 / best as f64;
     let length_scale = ((read_len.max(1) as f64) / 100.0).sqrt().clamp(0.75, 3.0);
-    // Approximate posterior error from score separation. The constants are
-    // intentionally conservative and must be recalibrated by the benchmark
-    // reliability gate when truth-labelled data changes.
-    let p_error = (-22.5 * relative_gap * length_scale).exp().clamp(1e-6, 1.0);
+    // Approximate posterior error from score separation. The slope is uncalibrated
+    // (default 22.5, intentionally conservative); sweep `KIRA_MAPQ_BETA` against a
+    // GIAB truth set to fit it to the empirical mismap rate.
+    let p_error = (-mapq_beta() * relative_gap * length_scale)
+        .exp()
+        .clamp(1e-6, 1.0);
     (-10.0 * p_error.log10()).round().clamp(0.0, cap as f64) as i32
+}
+
+/// Slope of the MAPQ posterior-error model (`compute_mapq`). Higher ⇒ steeper ⇒
+/// more confident at a given best/sub separation. Default 22.5; override with
+/// `KIRA_MAPQ_BETA` to recalibrate. Invalid/non-positive values fall back to 22.5.
+fn mapq_beta() -> f64 {
+    use std::sync::OnceLock;
+    static BETA: OnceLock<f64> = OnceLock::new();
+    *BETA.get_or_init(|| {
+        std::env::var("KIRA_MAPQ_BETA")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(22.5)
+    })
 }
 
 /// Percentage overlap between `[a_start..a_end)` and `[b_start..b_end)` as a share of the.

@@ -288,7 +288,9 @@ pub fn rescue_unmapped_mates_with_ref(
                 align_cfg,
                 rescue_cfg.min_rescued_score,
             ) {
-                aln.mapq = 30;
+                // Mark as rescue-placed so MAPQ assignment ceiling-caps it; the
+                // old `aln.mapq = 30` here was a dead store (stage-5 recomputes MAPQ).
+                aln.kind = crate::types::AlignmentKind::Rescued;
                 aln_pair[target_local].push(aln);
             }
         });
@@ -704,7 +706,9 @@ pub fn rescue_discordant_pairs_with_ref(
                 align_cfg,
                 min_score,
             ) {
-                aln.mapq = 30;
+                // Mark as rescue-placed so MAPQ assignment ceiling-caps it; the
+                // old `aln.mapq = 30` here was a dead store (stage-5 recomputes MAPQ).
+                aln.kind = crate::types::AlignmentKind::Rescued;
                 aln_pair[target_local].insert(0, aln);
             }
         });

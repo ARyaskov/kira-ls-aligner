@@ -192,17 +192,34 @@ fn try_fast_dp_alignment_inner(
         gap_extend: cfg.gap_extend,
     };
     let budget = router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
+    // Leading-edge slack for WFA only (the spectral/packed paths above require the
+    // read to start at text[0]). `text` begins exactly at the seed-implied win_start
+    // with only trailing slack, so a 5' deletion before the seed is unrepresentable.
+    // When KIRA_WFA_LEAD > 0, extend the WFA text upstream and free those bases.
+    // lead == 0 (default) reproduces prior behavior byte-for-byte.
+    let lead = (router::wfa_lead().max(0) as usize)
+        .min(win_start)
+        .min(band);
+    let (wfa_text, wfa_text_start, text_begin_free) = if lead > 0 {
+        (
+            &ref_seq[win_start - lead..win_start + text_len],
+            win_start - lead,
+            lead as i32,
+        )
+    } else {
+        (text, win_start, router::wfa_ends_free())
+    };
     let opts = wfa::WfaOptions {
         max_score: budget,
         adaptive_drop: router::wfa_adaptive_drop(),
-        text_begin_free: router::wfa_ends_free(),
+        text_begin_free,
     };
-    let wfa_aln = wfa::wfa_align(read_seq, text, pen, opts)?;
+    let wfa_aln = wfa::wfa_align(read_seq, wfa_text, pen, opts)?;
 
     let aln = wfa_result_to_alignment(
         read_seq,
-        text,
-        win_start,
+        wfa_text,
+        wfa_text_start,
         chain.ref_id,
         wfa_aln,
         cfg,
@@ -231,8 +248,16 @@ pub fn wfa_result_to_alignment(
             CigarKind::Del | CigarKind::Skipped => (r + l, q),
         }
     });
-    if wfa_aln.text_start.saturating_add(cigar_ref) > text.len()
-        || cigar_query > read_seq.len()
+    // The WFA CIGAR must span the entire pattern: the engine is query-global,
+    // so every read base is an M or I op (there are no soft clips). A CIGAR that
+    // consumes a different number of query bases than the read length means the
+    // traceback terminated early (see `wfa::build_cigar`). Reject it rather than
+    // emit a malformed alignment with the wrong reference coordinates — the
+    // caller's cascade then falls through to banded SW / rescue (or the read is
+    // left unmapped), and the io SAM emitter's `consumed == seq_len` invariant
+    // is never violated.
+    if cigar_query != read_len
+        || wfa_aln.text_start.saturating_add(cigar_ref) > text.len()
         || wfa_aln.text_end > text.len()
     {
         return None;
@@ -459,13 +484,27 @@ fn spectral_hit_is_certified(
     // the remaining suffix nearly exact, the Hamming hit is an indel proxy.
     let p = mismatch_pos[0];
     let suffix_len = read.len().saturating_sub(p + 1);
-    if suffix_len >= 8 {
+    let strict = cert_strict();
+    // Strict mode shortens the minimum suffix so near-end indels are still probed.
+    let min_suffix = if strict { 4 } else { 8 };
+    if suffix_len >= min_suffix {
         let read_insertion_like =
             bounded_hamming(&read[p + 1..], &reference[p..reference.len() - 1], 1) <= 1;
         let ref_insertion_like =
             bounded_hamming(&read[p..read.len() - 1], &reference[p + 1..], 1) <= 1;
         if read_insertion_like || ref_insertion_like {
             return false;
+        }
+        // A 2bp indel shifts the suffix by two; the 1-base shift above cannot reveal
+        // it, so a clean 2bp-indel read would otherwise be certified as 2 mismatches.
+        if strict && suffix_len >= 6 {
+            let read_ins2_like =
+                bounded_hamming(&read[p + 2..], &reference[p..reference.len() - 2], 1) <= 1;
+            let ref_ins2_like =
+                bounded_hamming(&read[p..read.len() - 2], &reference[p + 2..], 1) <= 1;
+            if read_ins2_like || ref_ins2_like {
+                return false;
+            }
         }
     }
     true
@@ -966,6 +1005,38 @@ fn adaptive_band_enabled() -> bool {
     })
 }
 
+/// Optional override for the gapped-DP x-drop, from `KIRA_DP_XDROP`. `None` (default)
+/// uses `cfg.xdrop`, keeping the prefilter and DP x-drop coupled as before. Decoupling
+/// lets the DP run a looser x-drop (so the wide band scores through an indel+SNP
+/// cluster) while the prefilter's ungapped extension stays tight.
+#[inline]
+fn dp_xdrop_override() -> Option<i32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<i32>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_DP_XDROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|&v| v >= 0)
+    })
+}
+
+/// Stricter ungapped certification, from `KIRA_CERT_STRICT`. When enabled, the
+/// indel-proxy check in `spectral_hit_is_certified` also tests 2-base shifts and uses
+/// a shorter minimum suffix, so disguised 1-2bp indels fall through to WFA instead of
+/// being emitted as M-only. Default off (prior behavior).
+#[inline]
+fn cert_strict() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_CERT_STRICT")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(false)
+    })
+}
+
 /// Maximum the adaptive band centre may deviate from the static seed diagonal
 /// (`KIRA_ADAPTIVE_MAX_DRIFT`, default 16). Unbounded re-centering chases
 /// spurious matches across long non-matching stretches (e.g. the wrong half of
@@ -1003,6 +1074,25 @@ fn banded_sw(
     )
 }
 
+/// Per-thread reusable buffers for the scalar banded DP. Mirrors the thread-local
+/// scratch the SIMD kernels already use, so a 150bp read no longer allocates ~4
+/// Vecs per row (cur_h/cur_e/cur_f/trace) plus the outer buffers on every call.
+#[derive(Default)]
+struct ScalarSwScratch {
+    prev_h: Vec<i32>,
+    prev_e: Vec<i32>,
+    cur_h: Vec<i32>,
+    cur_e: Vec<i32>,
+    cur_f: Vec<i32>,
+    trace_rows: Vec<Vec<u8>>,
+    row_starts: Vec<i32>,
+}
+
+thread_local! {
+    static SCALAR_SW_SCRATCH: std::cell::RefCell<ScalarSwScratch> =
+        std::cell::RefCell::new(ScalarSwScratch::default());
+}
+
 /// Core banded DP. `adaptive` selects Suzuki–Kasahara band re-centering vs the
 /// static seed-diagonal band; split out so tests can exercise both modes in one
 /// process (the public `banded_sw` reads the choice once from the environment).
@@ -1017,13 +1107,37 @@ fn banded_sw_with(
     let q_len = read.len();
     let r_len = reference.len();
     let band = cfg.bandwidth.max(1);
+    // Gapped-DP x-drop, decoupled from the prefilter's ungapped x-drop (both default
+    // to cfg.xdrop). KIRA_DP_XDROP lets the wide adaptive band actually score through
+    // an indel+SNP cluster without the prefilter-tight x-drop aborting the sweep.
+    let dp_xdrop = dp_xdrop_override().unwrap_or(cfg.xdrop);
 
-    let mut prev_h: Vec<i32> = Vec::new();
-    let mut prev_e: Vec<i32> = Vec::new();
+    // Take the per-thread scratch buffers into locals; they are returned to the
+    // thread-local at the single exit point below. Used exactly like the old
+    // freshly-allocated Vecs — only the storage source changed.
+    let (mut prev_h, mut prev_e, mut cur_h, mut cur_e, mut cur_f, mut trace_rows, mut row_starts) =
+        SCALAR_SW_SCRATCH.with(|c| {
+            let mut s = c.borrow_mut();
+            (
+                std::mem::take(&mut s.prev_h),
+                std::mem::take(&mut s.prev_e),
+                std::mem::take(&mut s.cur_h),
+                std::mem::take(&mut s.cur_e),
+                std::mem::take(&mut s.cur_f),
+                std::mem::take(&mut s.trace_rows),
+                std::mem::take(&mut s.row_starts),
+            )
+        });
+    prev_h.clear();
+    prev_e.clear();
     let mut prev_start = 1i32;
 
-    let mut trace_rows: Vec<Vec<u8>> = vec![Vec::new(); q_len + 1];
-    let mut row_starts: Vec<i32> = vec![1i32; q_len + 1];
+    // Recycle the inner trace Vecs across calls; ensure a slot for every row.
+    if trace_rows.len() < q_len + 1 {
+        trace_rows.resize_with(q_len + 1, Vec::new);
+    }
+    row_starts.clear();
+    row_starts.resize(q_len + 1, 1i32);
 
     let mut best_score = 0;
     let mut best_i = 0usize;
@@ -1051,19 +1165,24 @@ fn banded_sw_with(
         let j_end = (center + band).min(r_len as i32);
         if j_start > j_end {
             row_starts[i] = 1;
-            trace_rows[i] = Vec::new();
-            prev_h = Vec::new();
-            prev_e = Vec::new();
+            trace_rows[i].clear();
+            prev_h.clear();
+            prev_e.clear();
             prev_start = 1;
             continue;
         }
         let row_len = (j_end - j_start + 1) as usize;
         row_starts[i] = j_start;
 
-        let mut cur_h = vec![0i32; row_len];
-        let mut cur_e = vec![i32::MIN / 4; row_len];
-        let mut cur_f = vec![i32::MIN / 4; row_len];
-        let mut trace = vec![0u8; row_len];
+        cur_h.clear();
+        cur_h.resize(row_len, 0i32);
+        cur_e.clear();
+        cur_e.resize(row_len, i32::MIN / 4);
+        cur_f.clear();
+        cur_f.resize(row_len, i32::MIN / 4);
+        let mut trace = std::mem::take(&mut trace_rows[i]);
+        trace.clear();
+        trace.resize(row_len, 0u8);
         let mut row_best = 0i32;
         // Column of this row's best-scoring cell (-1 if no positive cell), used
         // to re-centre the adaptive band for the next row.
@@ -1138,8 +1257,8 @@ fn banded_sw_with(
         }
 
         trace_rows[i] = trace;
-        prev_h = cur_h;
-        prev_e = cur_e;
+        std::mem::swap(&mut prev_h, &mut cur_h);
+        std::mem::swap(&mut prev_e, &mut cur_e);
         prev_start = j_start;
 
         if adaptive {
@@ -1157,7 +1276,7 @@ fn banded_sw_with(
             adaptive_center = raw.clamp(static_next - max_drift, static_next + max_drift);
         }
 
-        if cfg.xdrop > 0 && best_score - row_best > cfg.xdrop {
+        if dp_xdrop > 0 && best_score - row_best > dp_xdrop {
             early_abort = true;
             break;
         }
@@ -1225,7 +1344,7 @@ fn banded_sw_with(
     }
 
     cigar.reverse();
-    SwResult {
+    let result = SwResult {
         ref_start: j as u32,
         ref_end,
         read_start: i,
@@ -1233,7 +1352,19 @@ fn banded_sw_with(
         score: best_score,
         cigar,
         early_abort,
-    }
+    };
+    // Return the scratch buffers (with their grown capacity) for the next call.
+    SCALAR_SW_SCRATCH.with(|c| {
+        let mut s = c.borrow_mut();
+        s.prev_h = prev_h;
+        s.prev_e = prev_e;
+        s.cur_h = cur_h;
+        s.cur_e = cur_e;
+        s.cur_f = cur_f;
+        s.trace_rows = trace_rows;
+        s.row_starts = row_starts;
+    });
+    result
 }
 
 pub(crate) const TRACE_STOP: u8 = 0;
@@ -2158,5 +2289,46 @@ mod adaptive_band_tests {
                 .iter()
                 .any(|op| op.op == CigarKind::Ins && op.len >= 5)
         );
+    }
+
+    /// `wfa_result_to_alignment` must reject (return `None`) any WFA CIGAR that
+    /// does not consume the entire read, rather than emit an alignment whose
+    /// CIGAR under-spans the query — that malformed record would later trip the
+    /// io SAM emitter's `consumed == seq_len` assertion. Defense-in-depth behind
+    /// the `wfa::build_cigar` traceback fix.
+    #[test]
+    fn wfa_result_rejects_underconsuming_cigar() {
+        let read = b"ACGTACGTACGTACGT"; // 16 bp
+        let text = b"ACGTACGTACGTACGTACGT"; // 20 bp window
+        let cfg = cfg(16);
+
+        // A truncated CIGAR consuming only 4 of 16 query bases (the bug shape).
+        let short = wfa::WfaAlignment {
+            score: 0,
+            cigar: vec![CigarOp {
+                len: 4,
+                op: CigarKind::Match,
+            }],
+            text_start: 0,
+            text_end: 4,
+        };
+        assert!(
+            wfa_result_to_alignment(read, text, 0, 0, short, cfg, false).is_none(),
+            "under-consuming WFA CIGAR must be rejected"
+        );
+
+        // A well-formed full-length CIGAR is still accepted.
+        let full = wfa::WfaAlignment {
+            score: 0,
+            cigar: vec![CigarOp {
+                len: 16,
+                op: CigarKind::Match,
+            }],
+            text_start: 0,
+            text_end: 16,
+        };
+        let aln = wfa_result_to_alignment(read, text, 0, 0, full, cfg, false)
+            .expect("full-length WFA CIGAR must be accepted");
+        assert_eq!(aln.read_end, 16);
     }
 }

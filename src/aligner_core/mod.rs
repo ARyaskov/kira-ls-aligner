@@ -265,7 +265,7 @@ impl Aligner {
             pool.total_threads(),
         );
 
-        let mut stream = ReadStream::new_multi_with_mode(
+        let stream = ReadStream::new_multi_with_mode(
             reads_paths,
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
@@ -292,6 +292,39 @@ impl Aligner {
             None
         };
 
+        // Optional input prefetch: a producer thread owns the stream and
+        // decompresses/parses batch N+1 while the pool aligns batch N. It sends
+        // (reads, bytes_read) so the progress bar needs no shared counter. Opt-in
+        // via KIRA_PREFETCH; unset keeps the serial path below (byte-identical).
+        type PrefetchItem = Result<Option<(Vec<crate::types::ReadRecord>, u64)>>;
+        let (batch_rx, producer_handle, mut stream_local) = if prefetch_enabled() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PrefetchItem>(2);
+            let mut s = stream;
+            let handle = std::thread::spawn(move || {
+                loop {
+                    match s.next_batch() {
+                        Ok(Some(reads)) => {
+                            let br = s.bytes_read();
+                            if tx.send(Ok(Some((reads, br)))).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Ok(None));
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            });
+            (Some(rx), Some(handle), None)
+        } else {
+            (None, None, Some(stream))
+        };
+
         // Run the batch loop on the caller's own thread. Each stage
         // installs into the appropriate pool itself, so wrapping the
         // loop in install_driver would only burn a P-pool worker as a
@@ -301,12 +334,24 @@ impl Aligner {
             let mut batch_idx: u64 = 0;
             loop {
                 let fetch_start = Instant::now();
-                let reads_opt = stream.next_batch()?;
-                let fetch_time = fetch_start.elapsed();
-                let reads = match reads_opt {
-                    Some(r) => r,
-                    None => break,
+                let (reads, read_bytes_now) = if let Some(rx) = &batch_rx {
+                    match rx.recv() {
+                        Ok(Ok(Some(pair))) => pair,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => break,
+                    }
+                } else {
+                    let s = stream_local.as_mut().expect("serial stream present");
+                    match s.next_batch()? {
+                        Some(r) => {
+                            let br = s.bytes_read();
+                            (r, br)
+                        }
+                        None => break,
+                    }
                 };
+                let fetch_time = fetch_start.elapsed();
 
                 if let Some(profiles) = auto_profiles.as_mut() {
                     if profiles.decided.is_none() {
@@ -395,7 +440,7 @@ impl Aligner {
                     update_progress(
                         progress.as_ref(),
                         &mut sys,
-                        &stream,
+                        read_bytes_now,
                         self.cfg.threads,
                         output_path_buf.as_deref(),
                         simd_mode,
@@ -406,6 +451,11 @@ impl Aligner {
             }
             Ok(())
         })();
+        // Close the receiver so a blocked producer unblocks, then join it.
+        drop(batch_rx);
+        if let Some(handle) = producer_handle {
+            let _ = handle.join();
+        }
         drive_result?;
         writer.flush()?;
 
@@ -546,10 +596,23 @@ fn init_progress_bar(total: u64) -> ProgressBar {
     pb
 }
 
+/// Whether to prefetch input batches on a producer thread (`KIRA_PREFETCH`).
+/// Default off — the serial fetch→compute→write loop is used unchanged.
+fn prefetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_PREFETCH")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 fn update_progress(
     pb: Option<&ProgressBar>,
     sys: &mut Option<System>,
-    stream: &ReadStream,
+    read_bytes: u64,
     threads: usize,
     output_path: Option<&Path>,
     simd_mode: Option<SimdMode>,
@@ -557,7 +620,6 @@ fn update_progress(
     let Some(pb) = pb else {
         return;
     };
-    let read_bytes = stream.bytes_read();
     pb.set_position(read_bytes);
 
     let cores = std::thread::available_parallelism()

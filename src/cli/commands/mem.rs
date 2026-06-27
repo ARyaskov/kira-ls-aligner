@@ -92,9 +92,10 @@ pub fn build_short_pe_aligner(
         max_hits_per_minimizer: env_usize("KIRA_K_HITS", 16),
         long_read_threshold: 500,
     };
-    // KIRA_CHAIN_* — chaining gap cost. Lowering lets seed anchors chain ACROSS an indel
-    // (different diagonals) instead of splitting into a single-diagonal chain that hides the
-    // indel from the gapped aligner. KIRA_CHAIN_TUNE=0 disables the repeat-region tightening.
+    // KIRA_CHAIN_GAP_OPEN / KIRA_CHAIN_GAP_EXTEND / KIRA_CHAIN_MAX_DIST — chaining gap cost.
+    // Lowering the gap cost lets seed anchors chain ACROSS an indel (different diagonals)
+    // instead of splitting into a single-diagonal chain that hides the indel from the gapped
+    // aligner. (KIRA_CHAIN_SCAN_MULT widens the predecessor scan budget — see chaining/rmq.rs.)
     let chaining_cfg = ChainingConfig {
         max_dist: env_i32("KIRA_CHAIN_MAX_DIST", 500) as u32,
         max_anchors: 2000,

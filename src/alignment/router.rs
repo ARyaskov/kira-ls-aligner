@@ -136,6 +136,16 @@ pub fn wfa_ends_free() -> i32 {
     env_u32("KIRA_WFA_ENDS_FREE", 0) as i32
 }
 
+/// Leading-reference slack for the fast-path WFA window, from `KIRA_WFA_LEAD`.
+/// Extends the WFA text this many bases upstream of the seed-implied window start
+/// and marks them free-to-skip, so a 5' deletion *before* the seed is representable
+/// (the trailing edge already has `bandwidth` slack; the leading edge had none).
+/// `0` (default) reproduces prior behavior exactly. Capped at the bandwidth by the caller.
+#[inline]
+pub fn wfa_lead() -> i32 {
+    env_u32("KIRA_WFA_LEAD", 0) as i32
+}
+
 /// Choose the preferred aligner for a read of the given length.
 #[inline]
 pub fn choose_aligner(read_len: usize) -> AlignerKind {

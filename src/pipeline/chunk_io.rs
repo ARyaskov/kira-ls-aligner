@@ -172,6 +172,7 @@ fn kind_to_byte(k: AlignmentKind) -> u8 {
     match k {
         AlignmentKind::AcceptedUngapped => 0,
         AlignmentKind::DpAligned => 1,
+        AlignmentKind::Rescued => 2,
     }
 }
 
@@ -179,6 +180,7 @@ fn byte_to_kind(b: u8) -> Result<AlignmentKind> {
     match b {
         0 => Ok(AlignmentKind::AcceptedUngapped),
         1 => Ok(AlignmentKind::DpAligned),
+        2 => Ok(AlignmentKind::Rescued),
         x => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("bad AlignmentKind byte {x}"),

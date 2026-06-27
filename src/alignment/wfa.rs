@@ -712,6 +712,36 @@ fn build_cigar(
                     if walk == 0 {
                         break;
                     }
+                    // Stop as soon as this cell is the landing point of a
+                    // backward edge (gap closure or mismatch) at the current
+                    // score, BEFORE consuming a diagonal match. The recurrence
+                    // sets M[s][k] = max(M[s-x][k]+1, I[s][k], D[s][k]) and then
+                    // greedily extends; the pre-extension offset (where an edge
+                    // lands) is therefore ≤ the post-extension offset we start
+                    // from. When extension added nothing, the edge lands exactly
+                    // at `offset`, so it must be tested here first — the original
+                    // code decremented through a coincidental match before
+                    // checking, walking one cell too far and stranding the
+                    // traceback with no resolvable edge (CIGAR under-consumed the
+                    // read). When extension added ≥1 base, none of the sources
+                    // equal the current cell, so these checks can't stop early.
+                    // At s==0 the I/D layers are empty and M[s-x] is out of range,
+                    // so the walk runs straight to the pattern start.
+                    let i_off = get_layer(Layer::I, s, k);
+                    if i_off == walk {
+                        break;
+                    }
+                    let d_off = get_layer(Layer::D, s, k);
+                    if d_off == walk {
+                        break;
+                    }
+                    if s >= pen.mismatch {
+                        let prev = get_layer(Layer::M, s - pen.mismatch, k);
+                        if prev != NONE_OFFSET && prev + 1 == walk {
+                            break;
+                        }
+                    }
+                    // Otherwise walk down through one diagonal match.
                     let i = walk - 1;
                     let j = walk - 1 + k;
                     if i < 0 || j < 0 {
@@ -725,27 +755,6 @@ fn build_cigar(
                         break;
                     }
                     walk -= 1;
-                    if s == 0 && walk == 0 {
-                        break;
-                    }
-
-                    // Check if I[s][k] == walk (we came from gap closure).
-                    let i_off = get_layer(Layer::I, s, k);
-                    if i_off == walk {
-                        break;
-                    }
-                    let d_off = get_layer(Layer::D, s, k);
-                    if d_off == walk {
-                        break;
-                    }
-                    // Check if M[s-x][k] + 1 == walk (we came from mismatch).
-                    if s >= pen.mismatch {
-                        let prev = get_layer(Layer::M, s - pen.mismatch, k);
-                        if prev != NONE_OFFSET && prev + 1 == walk {
-                            break;
-                        }
-                    }
-                    // No backward edge here — keep walking.
                 }
                 let diag_run = offset - walk;
                 push_diag(&mut ops, diag_run);
@@ -856,4 +865,159 @@ fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
         }
     }
     cigar.push(CigarOp { len, op });
+}
+
+#[cfg(test)]
+mod underconsume_tests {
+    use super::*;
+
+    fn query_consumed(cigar: &[CigarOp]) -> u32 {
+        cigar
+            .iter()
+            .map(|op| match op.op {
+                CigarKind::Match | CigarKind::Ins | CigarKind::SoftClip => op.len,
+                CigarKind::Del | CigarKind::Skipped => 0,
+            })
+            .sum()
+    }
+
+    // Regression for an early-terminating WFA traceback. Captured from
+    // `cargo run -- mem ecoli.fa sub_50k.fastq` on tag v0.4.0: a 150bp read whose
+    // optimal alignment closes an insertion gap exactly at the pattern end (no
+    // greedy extension on the final M cell). The M-layer traceback used to consume
+    // one coincidental match before testing the gap-close edge, walking past it and
+    // emitting `[1M]` (query_consumed=1), which tripped the io/mod.rs
+    // `consumed == seq_len` assertion. The CIGAR must span the whole read.
+    #[test]
+    fn wfa_cigar_spans_full_read() {
+        let read = b"ATAGTCGAGCAGGTAATAACGCCCTTCGTGGCGGAACACCAGGTCGATAAAGCCTTTTAACATGCCACGTACCTGCATGAACTCCAGCGGCGGGCAGCCTGCGGATAGCGGGGCAAAATGGCGGATTAAAGTATAAAACCGCCTGGGGGT";
+        let text = b"ATAGTCGAGCAGGTAATAACGCCCTTCGTGGCGGAACACCAGGTCGATAAAGCCTTTTAACATGCCACGTACCTGCATGAACTCCAGCGGCGGGCAGCCTGCGGATAGCGGGTCAAACTGGCGGATTAACGTATCAAGCTGACTGGCGATAAGCGGTTCACTAATCGGCAGATAAAACTCCATCTCCACCTGTTTATTGC";
+        let pen = WfaPenalties {
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 1,
+        };
+        let opts = WfaOptions::exact(150);
+        let aln = wfa_align(read, text, pen, opts).expect("wfa should align");
+
+        assert_eq!(
+            query_consumed(&aln.cigar),
+            read.len() as u32,
+            "WFA CIGAR must consume the entire pattern; got {:?}",
+            aln.cigar
+        );
+        // The optimal path: 134 matches (3 mismatches inside) then the trailing
+        // 16 read bases as an insertion. Score = 3*4 + (6 + 16*1) = 34.
+        assert_eq!(
+            aln.cigar,
+            vec![
+                CigarOp {
+                    len: 134,
+                    op: CigarKind::Match,
+                },
+                CigarOp {
+                    len: 16,
+                    op: CigarKind::Ins,
+                },
+            ],
+        );
+        assert_eq!(aln.score, 34);
+        assert_eq!(aln.text_start, 0);
+        assert_eq!(aln.text_end, 134);
+    }
+
+    /// Small deterministic PRNG (LCG) — no external rand dependency, fully
+    /// reproducible across runs.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn base(&mut self) -> u8 {
+            b"ACGT"[(self.next_u64() % 4) as usize]
+        }
+    }
+
+    /// Replay a WFA CIGAR against (read, text), returning (cost, query_consumed,
+    /// text_consumed_end). A correct WFA result must satisfy:
+    ///   cost == score, query_consumed == read.len(), text_end == aln.text_end.
+    fn replay(read: &[u8], text: &[u8], aln: &WfaAlignment, pen: WfaPenalties) -> (i32, usize, usize) {
+        let mut qi = 0usize;
+        let mut ti = aln.text_start;
+        let mut cost = 0i32;
+        for op in &aln.cigar {
+            match op.op {
+                CigarKind::Match => {
+                    for _ in 0..op.len {
+                        if qi >= read.len() || ti >= text.len() {
+                            return (cost, qi, ti); // defensive; outer asserts will flag it
+                        }
+                        if read[qi] != text[ti] {
+                            cost += pen.mismatch;
+                        }
+                        qi += 1;
+                        ti += 1;
+                    }
+                }
+                CigarKind::Ins | CigarKind::SoftClip => {
+                    cost += pen.gap_open + pen.gap_extend * op.len as i32;
+                    qi += op.len as usize;
+                }
+                CigarKind::Del | CigarKind::Skipped => {
+                    cost += pen.gap_open + pen.gap_extend * op.len as i32;
+                    ti += op.len as usize;
+                }
+            }
+        }
+        (cost, qi, ti)
+    }
+
+    /// Stress the traceback specifically for the bug class: an exact reference
+    /// prefix followed by a diverging 3' tail, which drives the optimal alignment
+    /// to resolve an indel or mismatch cluster right at the pattern end (where the
+    /// final M cell closes a gap with no greedy extension). Every result must span
+    /// the whole read AND be score-consistent when the CIGAR is replayed.
+    #[test]
+    fn wfa_traceback_score_consistent_across_end_divergence() {
+        let pen = WfaPenalties {
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 1,
+        };
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        let text: Vec<u8> = (0..260).map(|_| rng.base()).collect();
+
+        let mut cases = 0u32;
+        for prefix in [110usize, 120, 130, 134, 140, 145, 148, 149, 150] {
+            for tail in [1usize, 2, 3, 4, 6, 8, 12, 16, 20] {
+                let mut read = text[..prefix].to_vec();
+                for _ in 0..tail {
+                    read.push(rng.base());
+                }
+                let Some(aln) = wfa_align(&read, &text, pen, WfaOptions::exact(400)) else {
+                    continue;
+                };
+                cases += 1;
+                assert_eq!(
+                    query_consumed(&aln.cigar),
+                    read.len() as u32,
+                    "prefix={prefix} tail={tail}: CIGAR {:?} must span the whole read",
+                    aln.cigar
+                );
+                let (cost, qi, ti) = replay(&read, &text, &aln, pen);
+                assert_eq!(qi, read.len(), "prefix={prefix} tail={tail}: query replay length");
+                assert_eq!(ti, aln.text_end, "prefix={prefix} tail={tail}: text_end mismatch");
+                assert_eq!(
+                    cost, aln.score,
+                    "prefix={prefix} tail={tail}: replayed cost != reported score; cigar={:?}",
+                    aln.cigar
+                );
+            }
+        }
+        assert!(cases >= 60, "expected many exercised cases, got {cases}");
+    }
 }

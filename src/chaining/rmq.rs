@@ -1,6 +1,22 @@
 use crate::chaining::ChainingConfig;
 use crate::types::{Anchor, Chain, Strand};
 
+/// Multiplier on `rmq_window` for the raw-candidate scan backstop in `chain_group`.
+/// Default 4 (current behavior). Raising it via `KIRA_CHAIN_SCAN_MULT` lets the
+/// predecessor scan reach the full `max_dist` window in dense anchor clusters, at the
+/// cost of more work per anchor. The `examined` (valid-transition) cap is unaffected.
+fn chain_scan_mult() -> usize {
+    use std::sync::OnceLock;
+    static MULT: OnceLock<usize> = OnceLock::new();
+    *MULT.get_or_init(|| {
+        std::env::var("KIRA_CHAIN_SCAN_MULT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(4)
+    })
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct ChainingStats {
     pub anchors_used: usize,
@@ -77,7 +93,11 @@ fn chain_group(anchors: &[Anchor], cfg: ChainingConfig, stats: &mut ChainingStat
         let cur = &anchors[i];
         dp[i] = cur.score.max(anchor_len(cur) as i32);
         let mut examined = 0usize;
-        let scan_limit = predecessor_limit.saturating_mul(4);
+        // `scan_limit` is the raw-candidate backstop that prevents O(n²) on dense
+        // anchor clusters. At the default ×4 it can be exhausted before `ref_delta`
+        // reaches `max_dist`, hiding a true cross-diagonal (indel-spanning) predecessor
+        // behind nearer noise anchors. KIRA_CHAIN_SCAN_MULT widens it for A/B on GIAB.
+        let scan_limit = predecessor_limit.saturating_mul(chain_scan_mult());
 
         for (scanned, j) in (0..i).rev().enumerate() {
             let candidate = &anchors[j];
