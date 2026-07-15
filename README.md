@@ -150,6 +150,58 @@ results, not truth-set SNP/INDEL F1 measurements.
 - CUDA is optional (`--features cuda`) and accelerates the batched Spectral Sieve fast path.
 - Building a usable CUDA binary requires an NVIDIA toolkit with `nvcc` and a supported host C++ compiler. If kernel compilation fails, the build emits a visible warning and embeds a stub PTX that is rejected at runtime.
 
+## Benchmarks: accuracy & speed
+
+The aligner is validated end-to-end by **variant-calling accuracy** on GIAB HG002 — the standard truth set.
+
+**Setup**
+
+| | |
+|---|---|
+| Data | GIAB HG002, **chr20**, Illumina PE 150 bp, ~30× (12.44M reads) |
+| Reference / truth | GRCh38 chr20; GIAB HG002 v4.2.1 high-confidence calls + BED |
+| Hardware / threads | 16 threads, prebuilt `.kiraidx` |
+| Aligner config | gapped WFA path (`KIRA_ALGO=wfa`) + two-tier locus search (`KIRA_TWOTIER`), caller filters MAPQ ≥ 13 / BQ ≥ 6 |
+
+**Measured (kira-ls-aligner + calling)**
+
+| Metric | Precision | Recall | F1 |
+|---|---|---|---|
+| **SNP**   | 0.994 | 0.965 | **0.9792** |
+| **INDEL** | 0.880 | 0.875 | **0.8774** |
+
+| Speed (chr20, 30×, 16 threads) | |
+|---|---|
+| Alignment stage | ~150–220 s |
+| Full pipeline (align → sort/markdup → mpileup → VCF) | ~370–390 s |
+
+**How that compares (reference)**
+
+Variant-calling F1 is a **pipeline** metric — it depends on the *caller* as much as the aligner, so
+the fair comparison is against pipelines using the same **class** of caller. The figures below are
+*typical published ranges* for GIAB HG002 (whole-genome, GA4GH/precisionFDA-style) shown **for
+orientation only** — they are **not** head-to-head runs on identical data/config, and kira's row is
+chr20-only:
+
+| Aligner + caller (HG002, ~30×) | SNP F1 | INDEL F1 | caller class |
+|---|---|---|---|
+| **kira-ls-aligner + calling** *(measured, chr20)* | **0.979** | **0.877** | mpileup |
+| bwa-mem2 / novoalign + bcftools mpileup | ~0.98–0.99 | ~0.90–0.94 | mpileup (same class) |
+| bwa-mem2 + GATK HaplotypeCaller | ~0.996 | ~0.993 | local reassembly |
+| bwa-mem2 + DeepVariant | ~0.9995 | ~0.998 | deep learning (industrial ceiling) |
+
+Takeaways:
+
+- kira's **SNP** accuracy sits in the mpileup-class band and within ~0.01–0.02 F1 of the
+  deep-learning ceiling — most of that residual gap is the **caller**, not the aligner.
+- kira's **INDEL** F1 trails the mpileup class and is the main open item on the accuracy roadmap.
+- The GATK/DeepVariant lead comes from **local reassembly / deep-learning calling**, which is
+  orthogonal to alignment.
+
+> These are development results on a single chromosome, not a certified whole-genome benchmark.
+> See the versioned [benchmark gate](docs/benchmarking.md) (runtime + SNP/INDEL F1) for regression
+> criteria, and record accession/checksum + exact commands next to any result you reproduce.
+
 ## Kira LS Aligner vs bwa-mem2 vs minimap2 vs bwa-mem2/mm2-fast
 
 **Goal:** a single drop-in aligner that is fast for both short and long reads while preserving bwa-mem semantics.

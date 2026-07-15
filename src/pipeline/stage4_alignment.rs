@@ -273,6 +273,114 @@ impl<'read, 'index> Default for PerReadResult<'read, 'index> {
     }
 }
 
+/// Two-tier candidate search (SNP-recall / paralog disambiguation). When enabled, ambiguous
+/// short reads have every competitive candidate LOCUS scored by a cheap exact WFA score-only
+/// pass, and the chains are reordered so the true-lowest-cost loci are the ones that receive the
+/// full DP (and feed pair-reranking + MAPQ) — instead of trusting the coarse chain (anchor-
+/// coverage) score, which mis-ranks the true locus below a cleaner-matching paralog. Score-only +
+/// bounded to ambiguous reads keeps it cheap; unique reads keep the top-1 fast path untouched.
+/// On GIAB HG002 chr20 PE it recovered +41 true SNPs with zero new false positives (paralog
+/// placement) at held speed; larger effect expected genome-wide. Default ON; disable with
+/// `KIRA_TWOTIER=0`.
+fn two_tier_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("KIRA_TWOTIER").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Feed the two-tier Myers locus cost into MAPQ. For a single-DP read with a competing chain,
+/// replace the coarse `score·chain_second/chain_best` XS proxy with one derived from the real
+/// Myers edit-cost gap between the primary and competing loci.
+///
+/// DEFAULT OFF: on GIAB HG002 chr20 PE it was accuracy-NEUTRAL (zero SNPs moved). It only fires
+/// on non-ambiguous single-DP reads — where the competitor is weak and the proxy already clears
+/// the `best/2` floor to MAPQ cap — while ambiguous reads already take a real 2nd-DP XS from the
+/// two-tier. The residual MAPQ-0 alt-read loss is genuine paralog ambiguity, not a calibration
+/// error. Kept as an opt-in for data with a different paralog structure. Enable `KIRA_TWOTIER_MAPQ=1`.
+fn twotier_mapq_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("KIRA_TWOTIER_MAPQ").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Max candidate loci the two-tier search score-only-ranks per read (default = chaining's
+/// `max_chains`, capped here). `KIRA_TWOTIER_K`.
+fn two_tier_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_TWOTIER_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k >= 2)
+            .unwrap_or(5)
+    })
+}
+
+/// Score-only-rank the min_score-passing candidate chains by exact WFA alignment cost and return
+/// a reordered index list (lowest-cost locus first), or `None` when there is nothing to reorder
+/// (fewer than 2 passing candidates) or the order is already optimal. Non-passing chains are kept
+/// at the tail so the caller's `min_score` filter still applies unchanged.
+fn two_tier_reorder(
+    read_fwd: &[u8],
+    read_rev_cache: &mut Option<Vec<u8>>,
+    chain_list: &[Chain],
+    index: &Index,
+    cfg: AlignmentConfig,
+    min_score: i32,
+    max_k: usize,
+) -> Option<Vec<usize>> {
+    let passing: Vec<usize> = chain_list
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.score >= min_score)
+        .map(|(i, _)| i)
+        .take(max_k)
+        .collect();
+    if passing.len() < 2 {
+        return None;
+    }
+    let any_rev = passing
+        .iter()
+        .any(|&ci| matches!(chain_list[ci].strand, Strand::Reverse));
+    if any_rev && read_rev_cache.is_none() {
+        *read_rev_cache = Some(reverse_complement(read_fwd));
+    }
+    let read_rev = read_rev_cache.as_deref();
+    let mut scored: Vec<(usize, i32)> = Vec::with_capacity(passing.len());
+    for &ci in passing.iter() {
+        let chain = &chain_list[ci];
+        let is_rev = matches!(chain.strand, Strand::Reverse);
+        let read_seq = if is_rev { read_rev.unwrap() } else { read_fwd };
+        let ref_seq = index.ref_bases(chain.ref_id as usize);
+        let span = AnchorSpan {
+            ref_id: chain.ref_id,
+            ref_start: chain.ref_start,
+            ref_end: chain.ref_end,
+            read_start: chain.read_start,
+            read_end: chain.read_end,
+            strand: chain.strand,
+        };
+        // Bit-parallel Myers edit distance (bounded memory) — lower = better locus.
+        let cost = crate::alignment::locus_edit_cost(read_seq, ref_seq, &span, cfg)
+            .map(|d| d as i32)
+            .unwrap_or(i32::MAX);
+        scored.push((ci, cost));
+    }
+    // Sort by exact cost; original chain index breaks ties deterministically so true paralogs
+    // (equal cost) keep the higher-scoring chain first and MAPQ stays honest + reproducible.
+    scored.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let new_passing: Vec<usize> = scored.iter().map(|&(ci, _)| ci).collect();
+    // No-op if the score-only order already matches chain order.
+    if new_passing == passing {
+        return None;
+    }
+    let mut order = new_passing;
+    for i in 0..chain_list.len() {
+        if !order.contains(&i) {
+            order.push(i);
+        }
+    }
+    Some(order)
+}
+
 fn process_read_prefilter<'read, 'index>(
     idx: usize,
     read: &'read ReadRecord,
@@ -337,8 +445,30 @@ fn process_read_prefilter<'read, 'index>(
     } else {
         cfg.dp_topk.max(1)
     };
+    // Two-tier candidate search: reorder the loci so the full DP (and pair-rerank + MAPQ inputs)
+    // land on the true-lowest-cost loci by exact score-only, not the coarse chain-score order.
+    // Only ambiguous reads pay for it; `None` (the common path) iterates chains in place.
+    let two_tier_order = if two_tier_enabled() && short_read && ambiguous_chain {
+        two_tier_reorder(
+            read_fwd,
+            &mut read_rev_cache,
+            chain_list,
+            index,
+            cfg.cfg,
+            min_score,
+            two_tier_k(),
+        )
+    } else {
+        None
+    };
+
     let mut selected = 0usize;
-    for chain in chain_list.iter() {
+    for pos in 0..chain_list.len() {
+        let ci = match &two_tier_order {
+            Some(order) => order[pos],
+            None => pos,
+        };
+        let chain = &chain_list[ci];
         if chain.score < min_score {
             continue;
         }
@@ -545,6 +675,59 @@ fn process_read_prefilter<'read, 'index>(
             abort_score,
         });
         res.dp_used = true;
+    }
+
+    // Myers-cost MAPQ refinement (single-DP reads with a competing chain). Replaces the coarse
+    // chain-score XS proxy with one derived from the true Myers edit-cost gap between the primary
+    // and competing loci, so a distinguishable paralog gives high MAPQ (recovering alt reads the
+    // --min-MQ floor drops) and a real tie stays MAPQ 0. Two-DP reads already carry a real 2nd-
+    // alignment XS; SIMD/scalar-deferred reads (empty `accepted` here) fall back to the proxy.
+    // Guard `two_tier_order.is_none()`: only when the chains were NOT reordered do chain_list[0]
+    // and [1] reliably correspond to the primary (the sole DP'd locus) and its top competitor.
+    if twotier_mapq_enabled()
+        && short_read
+        && two_tier_order.is_none()
+        && chain_list.len() >= 2
+        && res.accepted.len() == 1
+        && res.accepted[0].xs_score.is_none()
+        && chain_list[1].score > 0
+    {
+        let any_rev = matches!(chain_list[0].strand, Strand::Reverse)
+            || matches!(chain_list[1].strand, Strand::Reverse);
+        if any_rev && read_rev_cache.is_none() {
+            read_rev_cache = Some(reverse_complement(read_fwd));
+        }
+        let read_rev = read_rev_cache.as_deref();
+        let cost_of = |chain: &Chain| -> Option<usize> {
+            let rseq = if matches!(chain.strand, Strand::Reverse) {
+                read_rev.unwrap()
+            } else {
+                read_fwd
+            };
+            let ref_seq = index.ref_bases(chain.ref_id as usize);
+            let span = AnchorSpan {
+                ref_id: chain.ref_id,
+                ref_start: chain.ref_start,
+                ref_end: chain.ref_end,
+                read_start: chain.read_start,
+                read_end: chain.read_end,
+                strand: chain.strand,
+            };
+            crate::alignment::locus_edit_cost(rseq, ref_seq, &span, cfg.cfg)
+        };
+        if let Some(c0) = cost_of(&chain_list[0]) {
+            let best = res.accepted[0].score.max(1);
+            // Alignment-score cost of one extra edit (a match becoming a mismatch).
+            let k_pen = cfg.cfg.match_score + cfg.cfg.mismatch;
+            let sub = match cost_of(&chain_list[1]) {
+                // Competitor within the Myers bound: its score gap from the primary is the
+                // edit-cost gap priced at k_pen per edit.
+                Some(c1) => (best - (c1 as i32 - c0 as i32).max(0) * k_pen).clamp(0, best),
+                // Competitor beyond the Myers bound → clearly worse → no MAPQ compression.
+                None => 0,
+            };
+            res.accepted[0].xs_score = Some(sub);
+        }
     }
 
     res

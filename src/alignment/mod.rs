@@ -127,6 +127,103 @@ pub fn try_fast_dp_alignment(
     None
 }
 
+/// Cheap WFA score-only probe that gates the ungapped fast-path accept in the accuracy
+/// profile. Returns `true` when a gapped alignment of the read against the seed window is
+/// STRICTLY cheaper (in WFA cost) than the accepted ungapped alignment with `ungapped_mism`
+/// mismatches — i.e. the M-CIGAR is hiding a real (near-read-end) indel and the read should be
+/// routed to the WFA traceback instead of frozen as mismatches.
+///
+/// The WFA budget is set one below the ungapped cost (`ungapped_mism * mismatch - 1`), so
+/// `wfa_score_only` explores only that far and returns `Some` only when a genuinely cheaper,
+/// indel-bearing alignment exists. SNP-only reads have no cheaper gapped alignment, so it
+/// returns `None` after little work and the fast-path accept stands. Uses the same seed window
+/// as `try_fast_dp_alignment_inner` and exact (unpruned) WFA so the gate cannot false-accept by
+/// pruning away the winning gap diagonal.
+pub fn ungapped_beaten_by_gap(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    ungapped_mism: u32,
+    cfg: AlignmentConfig,
+) -> bool {
+    if ungapped_mism == 0 {
+        return false;
+    }
+    let read_len = read_seq.len();
+    if read_len == 0 {
+        return false;
+    }
+    let expected_ref_start = chain.ref_start as i32 - chain.read_start as i32;
+    if expected_ref_start < 0 {
+        return false;
+    }
+    let win_start = expected_ref_start as usize;
+    if win_start >= ref_seq.len() {
+        return false;
+    }
+    let band = cfg.bandwidth.max(1) as usize;
+    let pad = band;
+    let max_text_len = ref_seq.len() - win_start;
+    let text_len = (read_len + pad).min(max_text_len);
+    if text_len < read_len {
+        return false;
+    }
+    let text = &ref_seq[win_start..win_start + text_len];
+
+    let ungapped_cost = ungapped_mism as i32 * cfg.mismatch;
+    if ungapped_cost <= 0 {
+        return false;
+    }
+    let pen = wfa::WfaPenalties {
+        mismatch: cfg.mismatch,
+        gap_open: cfg.gap_open,
+        gap_extend: cfg.gap_extend,
+    };
+    let opts = wfa::WfaOptions {
+        max_score: ungapped_cost - 1,
+        adaptive_drop: None,
+        text_begin_free: 0,
+    };
+    wfa::wfa_score_only(read_seq, text, pen, opts).is_some()
+}
+
+/// Bit-parallel Myers edit distance of `read_seq` against the seed window of `chain` (semi-global
+/// on the reference — best ending position in the window). Returns `None` when the edit distance
+/// exceeds the Myers reject bound: a locus too divergent to be a real competitor. Used by the
+/// two-tier candidate search to rank competing loci by true edit cost — far more discriminating
+/// than the coarse chain (anchor-coverage) score — with bounded, per-call memory (fixed bit-vector
+/// state, unlike an unbounded WFA score-only whose wavefront pool balloons on divergent loci) and
+/// bit-parallel speed. Lower cost = better locus; the same seed window as `try_fast_dp_alignment`.
+pub fn locus_edit_cost(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+) -> Option<usize> {
+    let read_len = read_seq.len();
+    if read_len == 0 {
+        return None;
+    }
+    let expected_ref_start = chain.ref_start as i32 - chain.read_start as i32;
+    if expected_ref_start < 0 {
+        return None;
+    }
+    let win_start = expected_ref_start as usize;
+    if win_start >= ref_seq.len() {
+        return None;
+    }
+    let band = cfg.bandwidth.max(1) as usize;
+    let pad = band;
+    let max_text_len = ref_seq.len() - win_start;
+    let text_len = (read_len + pad).min(max_text_len);
+    if text_len < read_len {
+        return None;
+    }
+    let text = &ref_seq[win_start..win_start + text_len];
+    let max_k = router::myers_reject_bound(read_len);
+    myers::bounded_edit_distance(read_seq, text, max_k).map(|(dist, _pos)| dist)
+}
+
 /// Original cascade body.
 fn try_fast_dp_alignment_inner(
     read_seq: &[u8],
@@ -1194,7 +1291,14 @@ fn banded_sw_with(
                 if let Some((h, s)) = prev_diag(i, j, prev_start, &prev_h, read, reference, cfg) {
                     (h, s)
                 } else {
-                    (0, 0)
+                    // No diagonal cell in the previous band (local-alignment start or band
+                    // edge). Local SW: the implicit H above-left is the 0 boundary, but the
+                    // base pair STILL scores. Returning score 0 here dropped the first matched
+                    // base at the matrix top-left (soft-clip) — a long-standing off-by-one.
+                    let qb = read[i - 1];
+                    let rb = reference[(j - 1) as usize];
+                    let s = if qb == rb { cfg.match_score } else { -cfg.mismatch };
+                    (0, s)
                 };
             let h_match = h_diag + score_diag;
 
@@ -2148,16 +2252,16 @@ mod adaptive_band_tests {
 
         let aligned = |r: &SwResult| r.read_end - r.read_start;
 
-        // Adaptive: keeps BOTH 3 bp deletions and aligns essentially the whole
-        // read (banded_sw soft-clips the very first base regardless of mode — a
-        // pre-existing first-row artifact — so allow a 1 bp slack).
+        // Adaptive: keeps BOTH 3 bp deletions and aligns the whole read. (The former
+        // first-row off-by-one that soft-clipped base 0 is fixed, so the leading base is
+        // now recovered — allow only a 1 bp tail slack.)
         assert_eq!(
             del_len(&adaptive.cigar),
             6,
             "adaptive should keep both 3bp dels"
         );
         assert!(
-            aligned(&adaptive) >= 112,
+            aligned(&adaptive) >= 113,
             "adaptive aligned {} of 114",
             aligned(&adaptive)
         );
@@ -2203,6 +2307,73 @@ mod adaptive_band_tests {
             adaptive.read_end - adaptive.read_start >= 79,
             "should align ~all 80 bp"
         );
+    }
+
+    /// Regression for the banded-SW first-row off-by-one. When the read's very first base
+    /// matches the reference it must be ALIGNED (M), not dropped as a leading soft-clip.
+    /// Before the fix, `prev_diag`'s None branch returned score 0, so the top-left matched
+    /// base was never scored: the alignment started at read position 1 and lost one match.
+    /// A 60 bp exact substring therefore scored 59 (not 60) and began at read_start 1.
+    #[test]
+    fn first_base_match_is_not_softclipped() {
+        let reference = gen_ref(80);
+        let read = reference[0..60].to_vec(); // exact, starts at ref[0], no indel
+        let abort = i32::MIN / 8;
+        for adaptive in [false, true] {
+            let r = banded_sw_with(&read, &reference, 0, cfg(8), abort, adaptive);
+            assert_eq!(r.read_start, 0, "first base aligned (adaptive={adaptive})");
+            assert_eq!(r.read_end, 60, "full read aligned (adaptive={adaptive})");
+            assert_eq!(del_len(&r.cigar), 0);
+            assert_eq!(r.score, 60, "all 60 matches scored (adaptive={adaptive})");
+            assert_ne!(
+                r.cigar.first().map(|o| o.op),
+                Some(CigarKind::SoftClip),
+                "no leading soft-clip (adaptive={adaptive})"
+            );
+        }
+    }
+
+    /// The ungapped-accept gate `ungapped_beaten_by_gap`: a read whose ungapped mismatches
+    /// are strictly cheaper resolved as a deletion must be flagged (routed to WFA traceback),
+    /// while a pure-substitution read must not (no gap beats its mismatch cost).
+    #[test]
+    fn gap_gate_flags_indel_not_snps() {
+        let reference = gen_ref(160);
+        let c = cfg(50);
+        let flip = |b: u8| if b == b'A' { b'C' } else { b'A' };
+        let mk_span = |read_len: usize| AnchorSpan {
+            ref_id: 0,
+            ref_start: 10,
+            ref_end: 10 + read_len as u32,
+            read_start: 0,
+            read_end: read_len as u32,
+            strand: Strand::Forward,
+        };
+
+        // Pure substitutions: 60 bp read = ref[10..70] with 2 flips. No gap is cheaper
+        // than the 2-mismatch cost, so the ungapped accept must stand.
+        let mut snp = reference[10..70].to_vec();
+        snp[20] = flip(snp[20]);
+        snp[40] = flip(snp[40]);
+        assert!(
+            !ungapped_beaten_by_gap(&snp, &reference, &mk_span(snp.len()), 2, c),
+            "SNP-only read must not be flagged"
+        );
+
+        // 2 bp deletion at read pos 48 (read = ref[10..58] ++ ref[60..72]); the ungapped
+        // placement smears the tail into many mismatches, but a 2 bp D costs only 8 — the
+        // gate must detect that a gapped alignment is strictly cheaper.
+        let mut del = Vec::new();
+        del.extend_from_slice(&reference[10..58]);
+        del.extend_from_slice(&reference[60..72]);
+        assert!(
+            ungapped_beaten_by_gap(&del, &reference, &mk_span(del.len()), 6, c),
+            "deletion-bearing read must be flagged for WFA traceback"
+        );
+
+        // Exact read: ungapped_mism = 0 short-circuits to not-beaten.
+        let exact = reference[10..70].to_vec();
+        assert!(!ungapped_beaten_by_gap(&exact, &reference, &mk_span(exact.len()), 0, c));
     }
 
     #[test]

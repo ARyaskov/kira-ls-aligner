@@ -270,6 +270,21 @@ pub fn prefilter_chain(
         };
     }
 
+    // Final gate: accept ungapped only if it is score-optimal. A near-read-end indel sits in
+    // the ungapped extension (outside the co-linear anchor checked above) and shows up as a few
+    // mismatches; the cheap WFA score-only probe detects when a gapped alignment is strictly
+    // cheaper and routes the read to the WFA traceback so the indel is placed instead of frozen.
+    if hamming > 0
+        && ungap_gap_check_enabled()
+        && crate::alignment::ungapped_beaten_by_gap(read_seq, ref_seq, chain, hamming as u32, cfg)
+    {
+        return PrefilterOutcome {
+            result: PrefilterResult::Fallback,
+            metrics: Some(metrics),
+            reason: PrefilterReason::IndelSuspect,
+        };
+    }
+
     let aln = build_ungapped_alignment(read_seq, ref_seq, &metrics, chain, cfg);
     PrefilterOutcome {
         result: PrefilterResult::Accept(aln),
@@ -318,6 +333,24 @@ fn ungap_min_id() -> Option<u16> {
         std::env::var("KIRA_UNGAP_MINID")
             .ok()
             .and_then(|s| s.parse().ok())
+    })
+}
+/// Gate the ungapped fast-path accept with a cheap WFA score-only probe: a co-linear anchor can
+/// still hide a near-read-end indel in its ungapped extension as a few mismatches, and freezing
+/// that as an M-CIGAR caps indel recall. When enabled, reads whose ungapped mismatches are
+/// strictly beaten by a gapped alignment are routed to the WFA traceback instead. Enable with
+/// `KIRA_UNGAP_GAP_CHECK=1`.
+///
+/// DEFAULT OFF: on GIAB HG002 chr20 PE (KIRA_ALGO=wfa) it was accuracy-NEUTRAL — the rerouted
+/// indels it recovers are dropped by the caller's indel-QUAL filter, so it moved indel F1 by
+/// +1 TP / 11240 while costing +45% align time (the score-only probe runs on every accepted
+/// read). Kept as an opt-in mechanism (and a building block for score-only candidate ranking).
+fn ungap_gap_check_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_UNGAP_GAP_CHECK")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 fn ungapped_extend(

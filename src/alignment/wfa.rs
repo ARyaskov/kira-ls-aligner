@@ -113,14 +113,24 @@ struct WfaScratch {
 
 impl WfaScratch {
     fn reset(&mut self) {
+        // Only recycle slots that still own an allocation. `retire_layer` already returned the
+        // offsets of layers that fell outside the look-back window and left `WaveFront::empty()`
+        // (a zero-capacity Vec) in their place; pushing those empty Vecs back grew the pool's
+        // backing array by ~3·max_score entries PER CALL — an unbounded leak on large budgets.
         for wf in self.m_hist.drain(..) {
-            self.pool.push(wf.offsets);
+            if !wf.offsets.is_empty() {
+                self.pool.push(wf.offsets);
+            }
         }
         for wf in self.i_hist.drain(..) {
-            self.pool.push(wf.offsets);
+            if !wf.offsets.is_empty() {
+                self.pool.push(wf.offsets);
+            }
         }
         for wf in self.d_hist.drain(..) {
-            self.pool.push(wf.offsets);
+            if !wf.offsets.is_empty() {
+                self.pool.push(wf.offsets);
+            }
         }
     }
 }
