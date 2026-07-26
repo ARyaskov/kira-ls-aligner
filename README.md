@@ -136,6 +136,46 @@ results, not truth-set SNP/INDEL F1 measurements.
 - `-R, --read-group` : Read group line (e.g. `ID:rg1\tSM:sample`).
 - `-o, --output` : Output SAM path (stdout if omitted).
 
+### Tuning knobs (environment)
+
+Defaults are what the numbers below were measured with; each knob exists so the
+default can be A/B'd without a rebuild.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `KIRA_MATE_GUIDE` | on | Promote the candidate locus that has a plausible mate partner, when exactly one candidate has one. `0` disables. |
+| `KIRA_ANCHOR_CAP_K` | on | Never require an anchor to be longer than the seed length `k`. `0` restores the old `min_anchor_len` behaviour. |
+| `KIRA_TWOTIER` | on | Rank ambiguous candidate loci by bounded Myers edit cost instead of chain score. |
+| `KIRA_PREFETCH` | on | Parse the next batch on a producer thread while the current one aligns. `0` restores the serial loop. |
+| `KIRA_AC_DISABLE` | auto | Aho-Corasick exact-match fast path. `0` forces on, `1` forces off. See below. |
+| `KIRA_RESCUE_WIDE` | off | After a banded mate-rescue attempt misses its score bar, also run a full-window SW. `1` restores it. |
+| `KIRA_MATE_SEED` | on | Bias seed-occurrence sampling toward copies that have the mate nearby. `0` disables. |
+| `KIRA_ALGO` | `packed` | Fast-path aligner: `packed`, `spectral`, `wfa`, `sw`. `wfa` is the gapped path used for the INDEL figures below. |
+
+`KIRA_MATE_SEED` matters only where a minimizer occurs more often than
+`--seed-occ-cap`, i.e. in repeats. Over that cap seeding *must* discard copies,
+and without a mate hint it picks by a deterministic hash — in a repeat family the
+true copy survives only by luck. With the hint, copies that have the mate within
+the insert window sort ahead of the rest, and the hash then only breaks ties among
+equals; nothing is dropped that the unhinted path would have kept. Hints are
+ignored when the mate is itself scattered across more than a few loci, since a
+scattered mate carries no positional information and following it promotes wrong
+placements. On GIAB chr20 this is where the indel recall gain above comes from.
+
+`KIRA_RESCUE_WIDE` is off because the second, unbanded DP it adds cost 22% of the
+alignment stage while moving zero reads in placement, MAPQ or CIGAR — measured on
+both regression sets below, including the one carrying 30 bp indels in 20% of
+reads, which is exactly the off-diagonal case it exists for. The wide search
+still runs when the packed scan cannot (ambiguous bases in the window), since
+there is then no best diagonal to band around.
+
+The Aho-Corasick path rescans the whole reference **once per batch**, so it only
+pays when the reference is much smaller than the batch. It auto-enables only when
+the per-batch scan is at most half the batch's own base count. Forcing it on
+outside that regime is expensive: on E. coli (4.6 Mbp) with the default 4 Mbp
+batch, an 800k-read run took 35.2 s with AC versus 2.9 s without, for 6 more
+correctly placed reads out of 80 000.
+
 ## Presets
 
 - `short`: `k=19`, `w=10`, tighter chaining and smaller alignment bands.
@@ -165,15 +205,116 @@ The aligner is validated end-to-end by **variant-calling accuracy** on GIAB HG00
 
 **Measured (kira-ls-aligner + calling)**
 
-| Metric | Precision | Recall | F1 |
-|---|---|---|---|
-| **SNP**   | 0.994 | 0.965 | **0.9792** |
-| **INDEL** | 0.880 | 0.875 | **0.8774** |
+Both arms are the same pipeline, the same prebuilt index and the same caller
+settings; only the aligner library differs. Scored against the truth VCF inside
+the high-confidence BED.
 
-| Speed (chr20, 30×, 16 threads) | |
+| Metric | | v0.4.2 | current |
+|---|---|---|---|
+| **SNP**   | P / R / F1 | 0.9938 / 0.9650 / **0.9792** | 0.9937 / 0.9656 / **0.9795** |
+|           | TP / FP / FN | 68811 / 429 / 2497 | 68858 / 436 / 2450 |
+| **INDEL** | P / R / F1 | 0.8799 / 0.8749 / **0.8774** | 0.8787 / 0.8781 / **0.8784** |
+|           | TP / FP / FN | 9834 / 1342 / 1406 | 9866 / 1362 / 1370 |
+
+SNP: 47 more true calls for 7 more false. INDEL: 32 more true calls and 36 fewer
+misses for 20 more false — recall +0.0032. The indel movement comes from
+mate-guided seed sampling (see the knob table); everything else in this round was
+throughput work that left the output bit-identical.
+
+| Speed (chr20, 30×, 16 threads, best of 2-3 runs) | v0.4.2 | current | |
+|---|---|---|---|
+| **Alignment** | 115.4 s | 91.4 s | **1.26×** |
+| Sort + markdup | 16.0 s | 17.6 s | — |
+| mpileup | 66.5–116.1 s | 105.4–108.5 s | see below |
+| **Full pipeline (align → sort/markdup → mpileup → VCF)** | 308.6 s | 322.0 s | ~wash |
+
+Only the alignment row is this crate's work, and it is the only row worth
+quoting. `sort + markdup` and `mpileup` are the calling tool's stages; their
+run-to-run spread on this host is large (mpileup ranged 66–116 s on *identical*
+code), which swamps the difference in total wall time. Treat the full-pipeline
+row as "unchanged", not as a measurement.
+
+### Memory
+
+`align_streaming` hands each batch's scored records to the caller instead of
+accumulating the run as SAM text. In-process consumers should prefer it;
+`align_to_sam_bytes` holds the entire run's text at once (5.2 GB on chr20) and
+its consumer then parses that straight back into records.
+
+Peak resident set of the fused `kira-bt solid` pipeline on chr20 30×, measured by
+sampling the process working set:
+
+| | peak |
 |---|---|
-| Alignment stage | ~150–220 s |
-| Full pipeline (align → sort/markdup → mpileup → VCF) | ~370–390 s |
+| before | 19.7 GB |
+| releasing the sorted records before the caller runs | 14.7 GB |
+| + streaming records instead of SAM text | 14.4 GB |
+| + converting to the caller's form by consuming, not cloning | **12.0 GB** |
+
+Variant output is unchanged across all four. chr20 is ~2% of GRCh38, so this
+makes a 32 GB machine comfortable for a chromosome, but the peak still scales
+with the input.
+
+For that, `kira-bt solid --window-mb N` processes the reference in windows:
+alignments are spilled to per-window temporary BAMs as they are produced, and
+each window is then sorted, deduplicated and called on its own, so peak memory
+follows the window size instead of the run.
+
+| chr20 30×, same binary | peak | wall |
+|---|---|---|
+| resident (default) | 12.0 GB | ~230 s |
+| `--window-mb 16` | **3.4 GB** | ~295 s |
+
+The two produce **byte-identical VCFs**. Verified also at `--window-mb 100`
+(one window for the whole chromosome), which isolates the spill round-trip from
+the window boundaries — that too matches. Roughly 25–30% slower, for a peak that
+no longer grows with the input.
+
+An earlier revision of this table claimed 1.75× on the full pipeline. That was
+real but came from installing `mimalloc` as a `#[global_allocator]` *in the
+library*, which is imposed on every consumer's whole process — and it silently
+broke one: the downstream `kira-bt norm` began writing 0-byte VCFs while exiting
+0. The allocator now lives only in this crate's own binary, so the fused
+in-process pipeline no longer gets it, and the sort/markdup and teardown gains
+went with it. See the note at the top of `src/lib.rs`.
+
+### Throughput regression set (simulated PE, known truth)
+
+Alongside the GIAB gate there is a fast regression set: 150 bp PE reads sampled
+from a reference with the source locus encoded in the read name, so placement
+correctness is checkable per read in seconds rather than hours. 800k reads,
+E. coli K-12, 16 threads, in-process stage timers:
+
+| Stage | before | after | |
+|---|---|---|---|
+| input | 338.1 ms | 9.3 ms | −97% |
+| sketch | 241.6 ms | 213.1 ms | −12% |
+| seeding | 327.3 ms | 271.0 ms | −17% |
+| chaining | 76.5 ms | 36.2 ms | −53% |
+| alignment | 1136.1 ms | 429.3 ms | −62% |
+| output | 393.6 ms | 158.7 ms | −60% |
+| **total** | **2686 ms** | **1300 ms** | **2.07×** |
+
+Measure with `ab.sh`-style *alternating* runs (one of each arm, repeated, minimum
+per stage). Sustained benchmarking drives this class of CPU from boost down to
+base clock — a 2×+ swing — so two runs taken minutes apart are not comparable,
+and a single-arm-then-other-arm comparison will report whichever arm ran first as
+slower. `cargo bench --bench cascade_bench` gives per-function costs for the same
+reason: within one criterion invocation the clock is at least stable.
+
+Comparing shipped defaults to shipped defaults — i.e. including the corrected
+Aho-Corasick gate — the same run goes from 34.6 s to about 1.3 s. Placement
+accuracy over the same set: 98.888% → 98.911% correct, 8897 → 8708 misplaced,
+and 401 more correctly placed reads clear a MAPQ ≥ 13 caller filter at a cost of
+3 more wrong ones.
+
+A second set with the same generator carries indels up to 30 bp in 20% of reads,
+to exercise the gapped and off-diagonal paths that the high-identity set never
+reaches.
+
+These are single-machine development numbers on one bacterial reference, not a
+substitute for the GIAB gate. E. coli has far less repeat structure than a human
+genome, so anything that targets paralog placement is under-stated here.
 
 **How that compares (reference)**
 

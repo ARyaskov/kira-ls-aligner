@@ -73,44 +73,38 @@ pub const DEFAULT_MYERS_BOUND_FLOOR: u32 = 4;
 pub const DEFAULT_SPECTRAL_MISM_PCT: u32 = 3;
 pub const DEFAULT_SPECTRAL_MISM_FLOOR: u32 = 2;
 
-fn env_u32(name: &'static str, default: u32) -> u32 {
-    static CELLS: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, u32>>> =
-        OnceLock::new();
-    let cells = CELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut map = cells.lock().unwrap();
-    if let Some(v) = map.get(&name) {
-        return *v;
-    }
-    let v = std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default);
-    map.insert(name, v);
-    v
+/// Define a process-wide `u32` tuning knob backed by a single `OnceLock`.
+///
+/// These are read several times per alignment candidate, so the lookup must not
+/// touch a shared lock — a `Mutex<HashMap>` here serialises every worker thread.
+macro_rules! env_knob_u32 {
+    ($vis:vis fn $name:ident() = $env:literal, $default:expr) => {
+        #[inline]
+        $vis fn $name() -> u32 {
+            static CELL: OnceLock<u32> = OnceLock::new();
+            *CELL.get_or_init(|| {
+                std::env::var($env)
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or($default)
+            })
+        }
+    };
 }
 
-fn env_usize(name: &'static str, default: usize) -> usize {
-    env_u32(name, default as u32) as usize
-}
+env_knob_u32!(fn wfa_max_read_len_u32() = "KIRA_WFA_MAX_LEN", DEFAULT_WFA_MAX_READ_LEN as u32);
+env_knob_u32!(pub fn wfa_budget_pct() = "KIRA_WFA_BUDGET_PCT", DEFAULT_WFA_BUDGET_PCT);
+env_knob_u32!(pub fn myers_bound_pct() = "KIRA_MYERS_BOUND_PCT", DEFAULT_MYERS_BOUND_PCT);
+env_knob_u32!(pub fn myers_bound_floor() = "KIRA_MYERS_BOUND_FLOOR", DEFAULT_MYERS_BOUND_FLOOR);
+env_knob_u32!(fn wfa_ends_free_u32() = "KIRA_WFA_ENDS_FREE", 0);
+env_knob_u32!(fn wfa_lead_u32() = "KIRA_WFA_LEAD", 0);
+env_knob_u32!(fn chain_quality_pct() = "KIRA_CHAIN_QUALITY_PCT", 70);
+env_knob_u32!(fn spectral_mism_pct() = "KIRA_SPECTRAL_MISM_PCT", DEFAULT_SPECTRAL_MISM_PCT);
+env_knob_u32!(fn spectral_mism_floor() = "KIRA_SPECTRAL_MISM_FLOOR", DEFAULT_SPECTRAL_MISM_FLOOR);
 
 #[inline]
 pub fn wfa_max_read_len() -> usize {
-    env_usize("KIRA_WFA_MAX_LEN", DEFAULT_WFA_MAX_READ_LEN)
-}
-
-#[inline]
-pub fn wfa_budget_pct() -> u32 {
-    env_u32("KIRA_WFA_BUDGET_PCT", DEFAULT_WFA_BUDGET_PCT)
-}
-
-#[inline]
-pub fn myers_bound_pct() -> u32 {
-    env_u32("KIRA_MYERS_BOUND_PCT", DEFAULT_MYERS_BOUND_PCT)
-}
-
-#[inline]
-pub fn myers_bound_floor() -> u32 {
-    env_u32("KIRA_MYERS_BOUND_FLOOR", DEFAULT_MYERS_BOUND_FLOOR)
+    wfa_max_read_len_u32() as usize
 }
 
 /// WFA-adaptive pruning drop, from `KIRA_WFA_ADAPTIVE` (antidiagonals).
@@ -133,7 +127,7 @@ pub fn wfa_adaptive_drop() -> Option<i32> {
 /// `0` (default) keeps the read pinned to the window start.
 #[inline]
 pub fn wfa_ends_free() -> i32 {
-    env_u32("KIRA_WFA_ENDS_FREE", 0) as i32
+    wfa_ends_free_u32() as i32
 }
 
 /// Leading-reference slack for the fast-path WFA window, from `KIRA_WFA_LEAD`.
@@ -143,7 +137,7 @@ pub fn wfa_ends_free() -> i32 {
 /// `0` (default) reproduces prior behavior exactly. Capped at the bandwidth by the caller.
 #[inline]
 pub fn wfa_lead() -> i32 {
-    env_u32("KIRA_WFA_LEAD", 0) as i32
+    wfa_lead_u32() as i32
 }
 
 /// Choose the preferred aligner for a read of the given length.
@@ -186,7 +180,7 @@ pub fn fast_path_worth_attempting(chain_score: i32, read_len: usize) -> bool {
     if chain_score <= 0 || read_len == 0 {
         return false;
     }
-    let threshold_pct = env_u32("KIRA_CHAIN_QUALITY_PCT", 70);
+    let threshold_pct = chain_quality_pct();
     let ratio_x100 = (chain_score as u32).saturating_mul(100) / (read_len as u32);
     ratio_x100 >= threshold_pct
 }
@@ -194,8 +188,8 @@ pub fn fast_path_worth_attempting(chain_score: i32, read_len: usize) -> bool {
 /// Maximum mismatches Spectral Sieve will accept for an ungapped alignment.
 #[inline]
 pub fn spectral_max_mismatches(read_len: usize) -> usize {
-    let pct = env_u32("KIRA_SPECTRAL_MISM_PCT", DEFAULT_SPECTRAL_MISM_PCT) as usize;
-    let floor = env_u32("KIRA_SPECTRAL_MISM_FLOOR", DEFAULT_SPECTRAL_MISM_FLOOR) as usize;
+    let pct = spectral_mism_pct() as usize;
+    let floor = spectral_mism_floor() as usize;
     ((read_len * pct) / 100).max(floor)
 }
 

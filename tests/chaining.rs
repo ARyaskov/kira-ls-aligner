@@ -40,6 +40,7 @@ fn chaining_prefers_longer_chain() {
         gap_extend: 1,
         log_gap: 0.1,
         rmq_window: 64,
+        keep_anchors: true,
     };
     let mut stats = ChainingStats::default();
     let chains = chain_anchors(&anchors, cfg, &mut stats);
@@ -56,6 +57,8 @@ fn cfg() -> ChainingConfig {
         gap_extend: 1,
         log_gap: 1.0,
         rmq_window: 64,
+        // These tests assert on the materialised anchor path.
+        keep_anchors: true,
     }
 }
 

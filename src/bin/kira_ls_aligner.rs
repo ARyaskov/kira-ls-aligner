@@ -5,6 +5,11 @@ use clap::{Parser, Subcommand};
 
 use kira_ls_aligner::cli::{IndexArgs, MemArgs, cmd_index, cmd_mem};
 
+/// Alignment is allocation-heavy and the default Windows heap serialises across
+/// threads. Kept in the binary, never the library — see the note in `src/lib.rs`.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "kira-ls-aligner")]
 #[command(about = "Unified short/long read aligner", version, author)]

@@ -32,6 +32,28 @@ pub fn serialize(
     output_cfg: OutputConfig,
     max_alignments: usize,
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    serialize_into(
+        input,
+        formatter,
+        read_group,
+        output_cfg,
+        max_alignments,
+        &mut out,
+    );
+    out
+}
+
+/// [`serialize`] into a caller-owned buffer, cleared first and keeping its
+/// capacity so it can be recycled across batches.
+pub fn serialize_into(
+    input: ScoredBatch,
+    formatter: &SamFormatter,
+    read_group: Option<&str>,
+    output_cfg: OutputConfig,
+    max_alignments: usize,
+    out: &mut Vec<u8>,
+) {
     let reads: Vec<ReadRecord> = input.reads;
     let mut alignments = input.alignments;
     let unmapped_mate_info = input.unmapped_mate_info;
@@ -110,11 +132,11 @@ pub fn serialize(
         .collect();
 
     let total: usize = chunks.iter().map(|c| c.len()).sum();
-    let mut out = Vec::with_capacity(total);
+    out.clear();
+    out.reserve(total.saturating_sub(out.capacity()));
     for c in chunks {
         out.extend_from_slice(&c);
     }
-    out
 }
 
 fn retain_reported_alignments(

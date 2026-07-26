@@ -29,41 +29,82 @@ pub struct ChainingStats {
 /// depends on both query/reference distance and diagonal drift. We keep a
 /// coordinate-sorted window of predecessor candidates and score each valid
 /// transition explicitly. `rmq_window` bounds work per anchor.
+/// Reusable per-worker working set for [`chain_anchors_rmq`], so chaining does
+/// not allocate its DP arrays and anchor paths once per read.
+#[derive(Default)]
+pub struct ChainScratch {
+    filtered: Vec<Anchor>,
+    dp: Vec<i32>,
+    prev: Vec<u32>,
+    has_successor: Vec<bool>,
+    endpoints: Vec<u32>,
+    /// Anchor indices (into `filtered`) of every candidate chain's path, packed
+    /// end to end; a `ChainSpan` refers to its slice by offset and length.
+    path_buf: Vec<u32>,
+    spans: Vec<ChainSpan>,
+}
+
+/// Sentinel for "no predecessor" in [`ChainScratch::prev`]; `u32::MAX` cannot be
+/// a valid anchor index because `max_anchors` is far below it.
+const NO_PREV: u32 = u32::MAX;
+
+/// A candidate chain before its anchor path is materialised.
+#[derive(Clone, Copy)]
+struct ChainSpan {
+    score: i32,
+    ref_id: u32,
+    strand: Strand,
+    read_start: u32,
+    read_end: u32,
+    ref_start: u32,
+    ref_end: u32,
+    path_start: u32,
+    path_len: u32,
+}
+
 pub fn chain_anchors_rmq(
     anchors: &[Anchor],
     cfg: ChainingConfig,
     stats: &mut ChainingStats,
+    scratch: &mut ChainScratch,
 ) -> Vec<Chain> {
     if anchors.is_empty() {
         return Vec::new();
     }
 
-    let mut filtered = anchors.to_vec();
-    if filtered.len() > cfg.max_anchors {
+    scratch.filtered.clear();
+    scratch.filtered.extend_from_slice(anchors);
+    if scratch.filtered.len() > cfg.max_anchors {
         // Keep informative anchors without preferring low reference
         // coordinates, then restore coordinate order for chaining.
-        filtered.select_nth_unstable_by_key(cfg.max_anchors, anchor_rank_key);
-        filtered.truncate(cfg.max_anchors);
-        stats.chains_pruned += anchors.len() - filtered.len();
+        scratch
+            .filtered
+            .select_nth_unstable_by_key(cfg.max_anchors, anchor_rank_key);
+        scratch.filtered.truncate(cfg.max_anchors);
+        stats.chains_pruned += anchors.len() - scratch.filtered.len();
     }
-    filtered.sort_by_key(anchor_coord_key);
+    scratch.filtered.sort_by_key(anchor_coord_key);
 
-    let mut chains = Vec::new();
+    scratch.spans.clear();
+    scratch.path_buf.clear();
     let mut start = 0usize;
-    while start < filtered.len() {
-        let (ref_id, strand) = (filtered[start].ref_id, filtered[start].strand);
+    while start < scratch.filtered.len() {
+        let (ref_id, strand) = (
+            scratch.filtered[start].ref_id,
+            scratch.filtered[start].strand,
+        );
         let mut end = start + 1;
-        while end < filtered.len()
-            && filtered[end].ref_id == ref_id
-            && filtered[end].strand == strand
+        while end < scratch.filtered.len()
+            && scratch.filtered[end].ref_id == ref_id
+            && scratch.filtered[end].strand == strand
         {
             end += 1;
         }
-        chains.extend(chain_group(&filtered[start..end], cfg, stats));
+        chain_group(start, end, cfg, stats, scratch);
         start = end;
     }
 
-    chains.sort_by_key(|c| {
+    scratch.spans.sort_by_key(|c| {
         (
             std::cmp::Reverse(c.score),
             c.ref_id,
@@ -72,21 +113,58 @@ pub fn chain_anchors_rmq(
             c.read_start,
         )
     });
-    dedup_near_identical_chains(&mut chains);
-    chains.truncate(cfg.max_chains);
-    chains
+    dedup_near_identical_spans(&mut scratch.spans);
+    scratch.spans.truncate(cfg.max_chains);
+
+    // Materialise the surviving chains, and their anchor paths only if asked.
+    scratch
+        .spans
+        .iter()
+        .map(|s| Chain {
+            score: s.score,
+            ref_id: s.ref_id,
+            read_start: s.read_start,
+            read_end: s.read_end,
+            ref_start: s.ref_start,
+            ref_end: s.ref_end,
+            strand: s.strand,
+            anchors: if cfg.keep_anchors {
+                scratch.path_buf[s.path_start as usize..(s.path_start + s.path_len) as usize]
+                    .iter()
+                    .map(|&idx| scratch.filtered[idx as usize].clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        })
+        .collect()
 }
 
-fn chain_group(anchors: &[Anchor], cfg: ChainingConfig, stats: &mut ChainingStats) -> Vec<Chain> {
-    let n = anchors.len();
+/// Chain the anchors in `scratch.filtered[group_start..group_end]`, appending
+/// one [`ChainSpan`] per candidate chain (and its path) to `scratch`.
+fn chain_group(
+    group_start: usize,
+    group_end: usize,
+    cfg: ChainingConfig,
+    stats: &mut ChainingStats,
+    scratch: &mut ChainScratch,
+) {
+    let n = group_end - group_start;
     if n == 0 {
-        return Vec::new();
+        return;
     }
     stats.anchors_used += n;
 
-    let mut dp = vec![0i32; n];
-    let mut prev = vec![None; n];
-    let mut has_successor = vec![false; n];
+    let anchors = &scratch.filtered[group_start..group_end];
+    let dp = &mut scratch.dp;
+    let prev = &mut scratch.prev;
+    let has_successor = &mut scratch.has_successor;
+    dp.clear();
+    dp.resize(n, 0i32);
+    prev.clear();
+    prev.resize(n, NO_PREV);
+    has_successor.clear();
+    has_successor.resize(n, false);
     let predecessor_limit = cfg.rmq_window.max(1);
 
     for i in 0..n {
@@ -116,26 +194,55 @@ fn chain_group(anchors: &[Anchor], cfg: ChainingConfig, stats: &mut ChainingStat
             let score = dp[j].saturating_add(transition);
             if score > dp[i] {
                 dp[i] = score;
-                prev[i] = Some(j);
+                prev[i] = j as u32;
             }
         }
-        if let Some(j) = prev[i] {
-            has_successor[j] = true;
+        if prev[i] != NO_PREV {
+            has_successor[prev[i] as usize] = true;
         }
     }
 
-    let mut endpoints: Vec<usize> = (0..n).filter(|&i| !has_successor[i]).collect();
-    endpoints.sort_by_key(|&i| std::cmp::Reverse(dp[i]));
+    let endpoints = &mut scratch.endpoints;
+    endpoints.clear();
+    endpoints.extend((0..n as u32).filter(|&i| !has_successor[i as usize]));
     if endpoints.is_empty() {
-        endpoints.extend(0..n);
-        endpoints.sort_by_key(|&i| std::cmp::Reverse(dp[i]));
+        endpoints.extend(0..n as u32);
     }
+    endpoints.sort_by_key(|&i| std::cmp::Reverse(dp[i as usize]));
 
-    endpoints
-        .into_iter()
+    let path_buf = &mut scratch.path_buf;
+    let spans = &mut scratch.spans;
+    for &end in endpoints
+        .iter()
         .take(cfg.max_chains.saturating_mul(2).max(1))
-        .filter_map(|end| build_chain(anchors, &dp, &prev, end))
-        .collect()
+    {
+        // Walk the predecessor links into the shared path buffer end-to-start,
+        // then reverse that slice in place.
+        let path_start = path_buf.len();
+        let mut cur = end;
+        loop {
+            path_buf.push(group_start as u32 + cur);
+            if prev[cur as usize] == NO_PREV {
+                break;
+            }
+            cur = prev[cur as usize];
+        }
+        path_buf[path_start..].reverse();
+
+        let first = &anchors[(path_buf[path_start] as usize) - group_start];
+        let last = &anchors[(path_buf[path_buf.len() - 1] as usize) - group_start];
+        spans.push(ChainSpan {
+            score: dp[end as usize],
+            ref_id: first.ref_id,
+            strand: first.strand,
+            read_start: first.read_start,
+            read_end: last.read_end,
+            ref_start: first.ref_start,
+            ref_end: last.ref_end,
+            path_start: path_start as u32,
+            path_len: (path_buf.len() - path_start) as u32,
+        });
+    }
 }
 
 fn transition_score(prev: &Anchor, cur: &Anchor, cfg: ChainingConfig) -> Option<i32> {
@@ -170,37 +277,13 @@ fn transition_score(prev: &Anchor, cur: &Anchor, cfg: ChainingConfig) -> Option<
     Some(contribution.saturating_sub(penalty))
 }
 
-fn build_chain(
-    anchors: &[Anchor],
-    dp: &[i32],
-    prev: &[Option<usize>],
-    endpoint: usize,
-) -> Option<Chain> {
-    let mut path = Vec::new();
-    let mut cur = Some(endpoint);
-    while let Some(i) = cur {
-        path.push(anchors[i].clone());
-        cur = prev[i];
-    }
-    path.reverse();
-    let first = path.first()?;
-    let last = path.last()?;
-    Some(Chain {
-        score: dp[endpoint],
-        ref_id: first.ref_id,
-        read_start: first.read_start,
-        read_end: last.read_end,
-        ref_start: first.ref_start,
-        ref_end: last.ref_end,
-        strand: first.strand,
-        anchors: path,
-    })
-}
-
-fn dedup_near_identical_chains(chains: &mut Vec<Chain>) {
-    let mut kept: Vec<Chain> = Vec::with_capacity(chains.len());
-    for chain in chains.drain(..) {
-        let duplicate = kept.iter().any(|other| {
+/// Drop chains that cover essentially the same read and reference interval as an
+/// already-kept, higher-scoring one. Retains order; operates in place.
+fn dedup_near_identical_spans(spans: &mut Vec<ChainSpan>) {
+    let mut kept = 0usize;
+    for i in 0..spans.len() {
+        let chain = spans[i];
+        let duplicate = spans[..kept].iter().any(|other| {
             if chain.ref_id != other.ref_id || chain.strand != other.strand {
                 return false;
             }
@@ -226,10 +309,11 @@ fn dedup_near_identical_chains(chains: &mut Vec<Chain>) {
                 && r_overlap.saturating_mul(100) / r_short >= 90
         });
         if !duplicate {
-            kept.push(chain);
+            spans[kept] = chain;
+            kept += 1;
         }
     }
-    *chains = kept;
+    spans.truncate(kept);
 }
 
 #[inline]

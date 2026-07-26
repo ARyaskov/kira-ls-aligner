@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::index::{Index, MinimizerIndex, Occ};
-use crate::seq::reverse_complement;
+use crate::seq::{common_prefix_len, common_suffix_len, reverse_complement};
 use crate::sketch::{MinimizerConfig, minimizers};
 use crate::types::{Anchor, Minimizer, ReadRecord, SeedHit, Strand};
 
@@ -12,6 +12,13 @@ pub struct SeedingConfig {
     pub max_occ: usize,
     pub max_hits_per_minimizer: usize,
     pub long_read_threshold: usize,
+    /// Half-width, in bases, of the window in which a mate's anchors count as
+    /// supporting a candidate occurrence; `None` disables mate-guided sampling.
+    ///
+    /// Occurrences beyond `max_hits_per_minimizer` are discarded by a
+    /// deterministic hash, which in a repeat family keeps the true copy only by
+    /// luck. This window lets the sample prefer copies with the mate nearby.
+    pub mate_window: Option<u32>,
 }
 
 fn add_seed_hits(
@@ -149,24 +156,20 @@ pub fn extend_seeds_into(
         let mut q_end = q_start + k;
         let mut r_end = r_start + k;
 
-        while q_start > 0 && r_start > 0 {
-            let qb = read_seq[(q_start - 1) as usize];
-            let rb = ref_seq[(r_start - 1) as usize];
-            if qb != rb {
-                break;
-            }
-            q_start -= 1;
-            r_start -= 1;
-        }
-        while (q_end as usize) < read_seq.len() && (r_end as usize) < ref_seq.len() {
-            let qb = read_seq[q_end as usize];
-            let rb = ref_seq[r_end as usize];
-            if qb != rb {
-                break;
-            }
-            q_end += 1;
-            r_end += 1;
-        }
+        // Extend left through the matching suffix of what precedes the seed,
+        // right through the matching prefix of what follows it.
+        let left = common_suffix_len(
+            &read_seq[..q_start as usize],
+            &ref_seq[..r_start as usize],
+        ) as i32;
+        q_start -= left;
+        r_start -= left;
+
+        let q_tail = (q_end.max(0) as usize).min(read_seq.len());
+        let r_tail = (r_end.max(0) as usize).min(ref_seq.len());
+        let right = common_prefix_len(&read_seq[q_tail..], &ref_seq[r_tail..]) as i32;
+        q_end += right;
+        r_end += right;
 
         let len = (q_end - q_start).max(0) as u32;
         if len < cfg.min_anchor_len {

@@ -131,6 +131,86 @@ fn multi_block_150_random() {
     assert_eq!(d, nd);
 }
 
+/// The early exit must not move the accept/reject boundary or change the
+/// reported distance, so sweep `max_k` across the whole range — including the
+/// values just below and above the true distance, where it fires.
+#[test]
+fn early_exit_preserves_accept_boundary_across_max_k() {
+    let bases = b"ACGT";
+    let mut rng = 0x5EED_1234u64;
+    for _ in 0..120 {
+        let m = 1 + (xorshift(&mut rng) as usize % 160);
+        let n = m + (xorshift(&mut rng) as usize % 80);
+        let pattern: Vec<u8> = (0..m)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
+        let mut text: Vec<u8> = (0..n)
+            .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+            .collect();
+        if xorshift(&mut rng) % 2 == 0 && n >= m {
+            let start = (xorshift(&mut rng) as usize) % (n - m + 1);
+            text[start..start + m].copy_from_slice(&pattern);
+        }
+        let (truth, _) = naive_semi_global(&pattern, &text);
+        for max_k in 0..=m {
+            let got = bounded_edit_distance(&pattern, &text, max_k);
+            if max_k >= truth {
+                assert_eq!(
+                    got.map(|(d, _)| d),
+                    Some(truth),
+                    "m={m} n={n} max_k={max_k} truth={truth}: accepted result differs"
+                );
+            } else {
+                assert_eq!(
+                    got, None,
+                    "m={m} n={n} max_k={max_k} truth={truth}: should reject"
+                );
+            }
+        }
+    }
+}
+
+/// `bounded_edit_distance` dispatches on pattern length: fixed stack arrays up
+/// to 256 bases, heap fallback above. Every other test here is well under 256,
+/// so sweep across the boundary and check both sides against naive DP.
+#[test]
+fn both_storage_paths_agree_with_naive_across_the_256_boundary() {
+    let bases = b"ACGT";
+    let mut rng = 0x0BAD_C0DEu64;
+    for m in [200usize, 255, 256, 257, 300, 400] {
+        for trial in 0..6 {
+            let n = m + (xorshift(&mut rng) as usize % 60);
+            let pattern: Vec<u8> = (0..m)
+                .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+                .collect();
+            let mut text: Vec<u8> = (0..n)
+                .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
+                .collect();
+            if trial % 2 == 0 && n >= m {
+                let start = (xorshift(&mut rng) as usize) % (n - m + 1);
+                text[start..start + m].copy_from_slice(&pattern);
+                // Perturb so the case is not trivially zero-distance.
+                let p = start + (xorshift(&mut rng) as usize % m);
+                text[p] = if text[p] == b'A' { b'T' } else { b'A' };
+            }
+            let (truth, _) = naive_semi_global(&pattern, &text);
+            assert_eq!(
+                bounded_edit_distance(&pattern, &text, m).map(|(d, _)| d),
+                Some(truth),
+                "m={m} n={n} trial={trial}: distance differs from naive DP"
+            );
+            // The reject boundary must land in the same place on both paths.
+            if truth > 0 {
+                assert_eq!(
+                    bounded_edit_distance(&pattern, &text, truth - 1),
+                    None,
+                    "m={m} n={n} trial={trial}: should reject at max_k = truth-1"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn random_corpus_matches_naive() {
     let bases = b"ACGT";

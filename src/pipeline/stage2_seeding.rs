@@ -2,7 +2,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::index::Index;
-use crate::seq::reverse_complement_into;
+use crate::seq::{common_prefix_len, common_suffix_len, reverse_complement_into};
 use crate::types::{Anchor, ReadRecord, Strand};
 
 use super::stage1_sketch::{ReadSketch, SketchBatch};
@@ -38,6 +38,45 @@ struct ProtoAnchor {
 struct AnchorCandidate {
     proto: ProtoAnchor,
     score: i32,
+    /// Deterministic tiebreak among equally-scoring candidates. Precomputed so
+    /// the sort comparator does not rehash O(n log n) times per read.
+    tiebreak: u64,
+}
+
+/// Width of a mate-hint bin, in bases. Coarse on purpose: binning turns the
+/// window test into a couple of hash probes instead of a range scan.
+const HINT_BIN: u32 = 512;
+
+/// Most distinct hint bins a mate may occupy for its hints to be trusted. A mate
+/// scattered over many loci carries no positional information, and following it
+/// anyway promotes wrong placements.
+const HINT_MAX_BINS: usize = 8;
+
+/// Positions where a read's mate plausibly sits, as a coarse bin set.
+#[derive(Default)]
+struct MateHints {
+    bins: rustc_hash::FxHashSet<(u32, u32)>,
+}
+
+impl MateHints {
+    fn build_from(&mut self, anchors: &[Anchor]) {
+        self.bins.clear();
+        for a in anchors {
+            self.bins.insert((a.ref_id, a.ref_start / HINT_BIN));
+        }
+    }
+
+    /// Usable only when the mate is concentrated (see [`HINT_MAX_BINS`]).
+    fn is_usable(&self) -> bool {
+        !self.bins.is_empty() && self.bins.len() <= HINT_MAX_BINS
+    }
+
+    /// Does the mate sit within `window` bases of `(ref_id, pos)`?
+    fn supports(&self, ref_id: u32, pos: u32, window: u32) -> bool {
+        let lo = pos.saturating_sub(window) / HINT_BIN;
+        let hi = pos.saturating_add(window) / HINT_BIN;
+        (lo..=hi).any(|bin| self.bins.contains(&(ref_id, bin)))
+    }
 }
 
 pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig) -> SeedBatch {
@@ -45,12 +84,15 @@ pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig
     let sketches = input.sketches;
     let mut stats = SeedBatchStats::default();
 
+    // Paired input is laid out R1, R2, R1, R2 …, so a chunk of two is one
+    // template and both mates can inform each other.
     let results: Vec<(Vec<Anchor>, usize, u32)> = reads
-        .par_iter()
-        .zip(sketches.par_iter())
-        .map_init(ThreadCtx::default, |ctx, (read, sketch)| {
-            seed_one(read, sketch, index, cfg, ctx)
+        .par_chunks(2)
+        .zip(sketches.par_chunks(2))
+        .map_init(ThreadCtx::default, |ctx, (read_pair, sketch_pair)| {
+            seed_template(read_pair, sketch_pair, index, cfg, ctx)
         })
+        .flatten()
         .collect();
 
     let mut anchors: Vec<Vec<Anchor>> = Vec::with_capacity(results.len());
@@ -68,13 +110,81 @@ pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig
     }
 }
 
+/// Seed one template (a mate pair, or a single read at the tail of the batch).
+///
+/// The first mate is seeded blind and its anchors hint the second. It is only
+/// re-seeded with the second's hints if its own sampling had to discard
+/// occurrences — otherwise a hint could not change its outcome.
+fn seed_template(
+    read_pair: &[ReadRecord],
+    sketch_pair: &[ReadSketch],
+    index: &Index,
+    cfg: crate::seeding::SeedingConfig,
+    ctx: &mut ThreadCtx,
+) -> Vec<(Vec<Anchor>, usize, u32)> {
+    let paired = cfg.mate_window.is_some()
+        && read_pair.len() == 2
+        && read_pair[0].pair_role != crate::types::PairRole::Unpaired
+        && read_pair[1].pair_role != crate::types::PairRole::Unpaired;
+
+    if !paired {
+        return read_pair
+            .iter()
+            .zip(sketch_pair.iter())
+            .map(|(read, sketch)| {
+                let (a, before, occ, _) = seed_one(read, sketch, index, cfg, ctx, None);
+                (a, before, occ)
+            })
+            .collect();
+    }
+
+    let (a0, before0, occ0, truncated0) =
+        seed_one(&read_pair[0], &sketch_pair[0], index, cfg, ctx, None);
+
+    let mut hints0 = std::mem::take(&mut ctx.hints_a);
+    hints0.build_from(&a0);
+    let hint_for_second = hints0.is_usable().then_some(&hints0);
+    let (a1, before1, occ1, _) = seed_one(
+        &read_pair[1],
+        &sketch_pair[1],
+        index,
+        cfg,
+        ctx,
+        hint_for_second,
+    );
+
+    // Only the mate that lost occurrences can gain from a second pass.
+    let (a0, before0, occ0) = if truncated0 {
+        let mut hints1 = std::mem::take(&mut ctx.hints_b);
+        hints1.build_from(&a1);
+        let out = if hints1.is_usable() {
+            let (a, before, occ, _) =
+                seed_one(&read_pair[0], &sketch_pair[0], index, cfg, ctx, Some(&hints1));
+            (a, before, occ)
+        } else {
+            (a0, before0, occ0)
+        };
+        ctx.hints_b = hints1;
+        out
+    } else {
+        (a0, before0, occ0)
+    };
+    ctx.hints_a = hints0;
+
+    vec![(a0, before0, occ0), (a1, before1, occ1)]
+}
+
+/// Seed one read. Returns its anchors, the pre-prune anchor count, the minimum
+/// seed occurrence count, and whether any bucket had to be truncated.
 fn seed_one(
     read: &ReadRecord,
     sketch: &ReadSketch,
     index: &Index,
     cfg: crate::seeding::SeedingConfig,
     ctx: &mut ThreadCtx,
-) -> (Vec<Anchor>, usize, u32) {
+    hints: Option<&MateHints>,
+) -> (Vec<Anchor>, usize, u32, bool) {
+    let mut truncated_any = false;
     let table = if read.seq.len() >= cfg.long_read_threshold {
         &index.long
     } else {
@@ -147,10 +257,29 @@ fn seed_one(
         // repeats to the first copy in the genome.
         let take_n = k_hits.min(ctx.occs.len());
         if take_n < ctx.occs.len() {
-            ctx.occs
-                .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
-                    occurrence_sample_key(m.hash, *rid, *pos, *strand)
-                });
+            // Over the cap: copies will be dropped either way. Rank
+            // mate-supported ones first and let the hash decide among equals,
+            // so the hint only reorders a choice that was arbitrary.
+            truncated_any = true;
+            match (hints, cfg.mate_window) {
+                (Some(h), Some(window)) => {
+                    ctx.occs.select_nth_unstable_by_key(
+                        take_n,
+                        |(rid, pos, strand)| {
+                            (
+                                !h.supports(*rid, *pos, window),
+                                occurrence_sample_key(m.hash, *rid, *pos, *strand),
+                            )
+                        },
+                    );
+                }
+                _ => {
+                    ctx.occs
+                        .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
+                            occurrence_sample_key(m.hash, *rid, *pos, *strand)
+                        });
+                }
+            }
         }
         for &(rid, pos, ref_strand) in ctx.occs[..take_n].iter() {
             let (read_pos, strand, diag) = relative_seed_coordinates(
@@ -186,14 +315,31 @@ fn seed_one(
     let before = ctx.merged.len();
     ctx.anchors_before_prune = before;
 
+    let read_len_salt = read.seq.len() as u64;
     for proto in ctx.merged.drain(..) {
         let score = proto
             .read_end
             .saturating_sub(proto.read_start)
             .min(proto.ref_end.saturating_sub(proto.ref_start)) as i32;
-        ctx.candidates.push(AnchorCandidate { proto, score });
+        let tiebreak =
+            occurrence_sample_key(read_len_salt, proto.ref_id, proto.ref_start, proto.strand);
+        ctx.candidates.push(AnchorCandidate {
+            proto,
+            score,
+            tiebreak,
+        });
     }
 
+    // An anchor is never shorter than the seed it grew from, so a requirement
+    // above `k` discards every seed whose exact match stops at exactly `k` —
+    // a mismatch on both flanks, the defining shape of a seed in a divergent
+    // region. The short preset ships min_anchor_len=20 against k=19, so cap the
+    // requirement at the k in use. `KIRA_ANCHOR_CAP_K=0` restores the old rule.
+    let min_anchor_len = if anchor_cap_k() {
+        cfg.min_anchor_len.min(sketch.k as u32)
+    } else {
+        cfg.min_anchor_len
+    };
     let max_anchors_per_read = anchor_limit(read.seq.len(), sketch.k);
     let max_anchors_per_diag = if read.seq.len() >= cfg.long_read_threshold {
         64
@@ -201,15 +347,17 @@ fn seed_one(
         16
     };
 
-    ctx.candidates.sort_by_key(|c| {
+    // Unstable sort is safe (and allocation-free) because the key is a total
+    // order on candidate content: after the hash tiebreak the coordinate fields
+    // separate everything but identical candidates, so output stays reproducible.
+    ctx.candidates.sort_unstable_by_key(|c| {
         (
             std::cmp::Reverse(c.score),
-            occurrence_sample_key(
-                read.seq.len() as u64,
-                c.proto.ref_id,
-                c.proto.ref_start,
-                c.proto.strand,
-            ),
+            c.tiebreak,
+            c.proto.ref_id,
+            c.proto.ref_start,
+            c.proto.read_start,
+            u8::from(c.proto.strand),
         )
     });
     ctx.anchors.clear();
@@ -227,7 +375,7 @@ fn seed_one(
         *count += 1;
 
         let anchor = extend_proto(read, index, cand, &mut ctx.rc_buf, &mut ctx.rc_ready);
-        if anchor.read_end.saturating_sub(anchor.read_start) >= cfg.min_anchor_len
+        if anchor.read_end.saturating_sub(anchor.read_start) >= min_anchor_len
             && anchor.read_end <= read_len
         {
             ctx.anchors.push(anchor);
@@ -253,7 +401,12 @@ fn seed_one(
     });
 
     let min_occ = if min_occ == u32::MAX { 0 } else { min_occ };
-    (std::mem::take(&mut ctx.anchors), before, min_occ)
+    (
+        std::mem::take(&mut ctx.anchors),
+        before,
+        min_occ,
+        truncated_any,
+    )
 }
 
 #[inline]
@@ -343,6 +496,17 @@ fn compact_proto_anchors(
     }
 }
 
+/// Whether `min_anchor_len` is capped at the seed length `k` (see `seed_one`).
+/// Default on; `KIRA_ANCHOR_CAP_K=0` restores the pre-fix behaviour.
+fn anchor_cap_k() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_ANCHOR_CAP_K")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn anchor_limit(read_len: usize, k: usize) -> usize {
     if read_len < 500 {
         return 256;
@@ -375,24 +539,21 @@ fn extend_proto(
     let mut q_end = cand.proto.read_end as i32;
     let mut r_end = cand.proto.ref_end as i32;
 
-    while q_start > 0 && r_start > 0 {
-        let qb = read_seq[(q_start - 1) as usize];
-        let rb = ref_seq[(r_start - 1) as usize];
-        if qb != rb {
-            break;
-        }
-        q_start -= 1;
-        r_start -= 1;
-    }
-    while (q_end as usize) < read_seq.len() && (r_end as usize) < ref_seq.len() {
-        let qb = read_seq[q_end as usize];
-        let rb = ref_seq[r_end as usize];
-        if qb != rb {
-            break;
-        }
-        q_end += 1;
-        r_end += 1;
-    }
+    // Extend left through the matching suffix of everything before the seed,
+    // right through the matching prefix of everything after it.
+    let left = common_suffix_len(
+        &read_seq[..q_start as usize],
+        &ref_seq[..r_start as usize],
+    ) as i32;
+    q_start -= left;
+    r_start -= left;
+
+    let right = common_prefix_len(
+        &read_seq[(q_end as usize).min(read_seq.len())..],
+        &ref_seq[(r_end as usize).min(ref_seq.len())..],
+    ) as i32;
+    q_end += right;
+    r_end += right;
 
     let len = (q_end - q_start).max(0) as u32;
     let score = len as i32;
@@ -427,6 +588,9 @@ struct ThreadCtx {
     ids_scratch: Vec<Option<usize>>,
     /// `(start, end)` bucket descriptors — same length as `hashes_scratch`.
     buckets_scratch: Vec<Option<(usize, usize)>>,
+    /// Mate-hint bin sets, reused across templates.
+    hints_a: MateHints,
+    hints_b: MateHints,
 }
 
 /// Grow per-thread scratch buffers to fit at least `n` minimizers.
@@ -444,6 +608,85 @@ fn grow_scratch(ctx: &mut ThreadCtx, n: usize) {
     if ctx.hashes_scratch.capacity() < n {
         ctx.hashes_scratch
             .reserve(n - ctx.hashes_scratch.capacity());
+    }
+}
+
+#[cfg(test)]
+mod mate_hint_tests {
+    use super::*;
+
+    fn anchor_at(ref_id: u32, ref_start: u32) -> Anchor {
+        Anchor {
+            read_start: 0,
+            read_end: 19,
+            ref_id,
+            ref_start,
+            ref_end: ref_start + 19,
+            strand: Strand::Forward,
+            score: 19,
+        }
+    }
+
+    #[test]
+    fn supports_covers_the_window_and_nothing_beyond() {
+        let mut h = MateHints::default();
+        h.build_from(&[anchor_at(0, 10_000)]);
+        // Inside the window on both sides.
+        assert!(h.supports(0, 10_000, 500));
+        assert!(h.supports(0, 10_400, 500));
+        assert!(h.supports(0, 9_600, 500));
+        // A different contig is never support, however close the coordinate.
+        assert!(!h.supports(1, 10_000, 500));
+        // Far away on the same contig: the classic dispersed-repeat copy.
+        assert!(!h.supports(0, 5_000_000, 500));
+    }
+
+    #[test]
+    fn window_is_honoured_at_bin_granularity() {
+        let mut h = MateHints::default();
+        h.build_from(&[anchor_at(0, 0)]);
+        // Bins are HINT_BIN wide, so support extends to the end of the bin the
+        // window reaches into — coarser than the window, never narrower.
+        assert!(h.supports(0, HINT_BIN - 1, 0));
+        assert!(h.supports(0, HINT_BIN * 3, HINT_BIN * 3));
+        assert!(!h.supports(0, HINT_BIN * 10, HINT_BIN));
+    }
+
+    #[test]
+    fn scattered_mate_is_not_usable() {
+        let mut h = MateHints::default();
+        // A mate concentrated in a few places is trustworthy.
+        let focused: Vec<Anchor> = (0..HINT_MAX_BINS as u32)
+            .map(|i| anchor_at(0, i * HINT_BIN))
+            .collect();
+        h.build_from(&focused);
+        assert!(h.is_usable(), "a mate in {HINT_MAX_BINS} bins should be usable");
+
+        // One bin more and it carries no positional information.
+        let scattered: Vec<Anchor> = (0..HINT_MAX_BINS as u32 + 1)
+            .map(|i| anchor_at(0, i * HINT_BIN * 100))
+            .collect();
+        h.build_from(&scattered);
+        assert!(!h.is_usable(), "a scattered mate must be ignored");
+    }
+
+    #[test]
+    fn unmapped_mate_yields_no_hints() {
+        let mut h = MateHints::default();
+        h.build_from(&[]);
+        assert!(!h.is_usable());
+        assert!(!h.supports(0, 0, 1000));
+    }
+
+    #[test]
+    fn hints_are_rebuilt_not_accumulated() {
+        let mut h = MateHints::default();
+        h.build_from(&[anchor_at(0, 1_000)]);
+        h.build_from(&[anchor_at(0, 9_000_000)]);
+        // Reusing the set across templates must not leave the previous mate's
+        // positions behind, or a read is hinted toward its neighbour's locus.
+        assert!(!h.supports(0, 1_000, 500));
+        assert!(h.supports(0, 9_000_000, 500));
     }
 }
 

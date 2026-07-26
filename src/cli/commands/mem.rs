@@ -86,11 +86,12 @@ pub fn build_short_pe_aligner(
         long_w: 10,
         long_read_threshold: 500,
     };
-    let seeding_cfg = SeedingConfig {
+    let mut seeding_cfg = SeedingConfig {
         min_anchor_len: 20,
         max_occ: 500,
         max_hits_per_minimizer: env_usize("KIRA_K_HITS", 16),
         long_read_threshold: 500,
+        mate_window: None,
     };
     // KIRA_CHAIN_GAP_OPEN / KIRA_CHAIN_GAP_EXTEND / KIRA_CHAIN_MAX_DIST — chaining gap cost.
     // Lowering the gap cost lets seed anchors chain ACROSS an indel (different diagonals)
@@ -104,6 +105,7 @@ pub fn build_short_pe_aligner(
         gap_extend: env_i32("KIRA_CHAIN_GAP_EXTEND", 1),
         log_gap: 0.2,
         rmq_window: 256,
+            keep_anchors: false,
     };
     let alignment_cfg = AlignmentConfig {
         match_score: 1,
@@ -130,6 +132,7 @@ pub fn build_short_pe_aligner(
     paired_cfg
         .apply_insert_spec(&p.insert_size)
         .map_err(|e| anyhow::anyhow!("--insert-size: {e}"))?;
+    seeding_cfg.mate_window = mate_seed_window(&paired_cfg);
 
     let pipeline_cfg = PipelineConfig {
         sketch: sketch_cfg,
@@ -233,11 +236,12 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         long_read_threshold: args.long_read_threshold,
     };
 
-    let seeding_cfg = SeedingConfig {
+    let mut seeding_cfg = SeedingConfig {
         min_anchor_len: 20,
         max_occ: 500,
         max_hits_per_minimizer: env_usize("KIRA_K_HITS", args.seed_occ_cap as usize),
         long_read_threshold: args.long_read_threshold,
+        mate_window: None,
     };
 
     let (max_dist, max_anchors, bandwidth, rmq_window) = if preset == "long" {
@@ -260,6 +264,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         gap_extend: 1,
         log_gap: 0.2,
         rmq_window,
+        // Only the splice aligner walks a chain's anchor path.
+        keep_anchors: splice_preset,
     };
 
     let alignment_cfg = AlignmentConfig {
@@ -290,6 +296,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_extend: 1,
                 log_gap: 0.2,
                 rmq_window: 256,
+            keep_anchors: false,
             },
             AlignmentConfig {
                 match_score: args.match_score,
@@ -315,6 +322,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_extend: 1,
                 log_gap: 0.2,
                 rmq_window: 1024,
+            keep_anchors: false,
             },
             AlignmentConfig {
                 match_score: args.match_score,
@@ -356,6 +364,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     paired_cfg
         .apply_insert_spec(&args.insert_size)
         .map_err(|e| anyhow::anyhow!("--insert-size: {e}"))?;
+    seeding_cfg.mate_window = mate_seed_window(&paired_cfg);
 
     let strand_policy = match args.splice_strand.to_ascii_lowercase().as_str() {
         "auto" => SpliceStrandPolicy::Auto,
@@ -708,6 +717,20 @@ fn run_split_prefix(
 
 pub(crate) fn resolve_accept_enable(explicit: Option<bool>, fast_output: bool) -> bool {
     explicit.unwrap_or(fast_output)
+}
+
+/// Window used by mate-guided seed sampling, or `None` for single-end input and
+/// when `KIRA_MATE_SEED=0`. `insert_max` is deliberately generous: the window
+/// only has to separate "mate is around here" from "mate is elsewhere in the
+/// genome".
+pub(crate) fn mate_seed_window(paired: &PairedConfig) -> Option<u32> {
+    let enabled = std::env::var("KIRA_MATE_SEED")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if !enabled || !paired.is_paired() {
+        return None;
+    }
+    Some(paired.insert_max.max(paired.insert_mean.saturating_add(4 * paired.insert_sd)).max(500))
 }
 
 /// Resolve the FASTQ ingestion mode from the `--paired` / `--interleaved` flags and the input file.

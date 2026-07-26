@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 
-use crate::chaining::{ChainingConfig, ChainingStats, chain_anchors};
+use crate::chaining::{ChainScratch, ChainingConfig, ChainingStats, chain_anchors_with_scratch};
 use crate::types::{Chain, ReadRecord};
 
 use super::stage2_seeding::{SeedBatch, SeedBatchStats};
@@ -26,12 +26,13 @@ pub fn run(input: SeedBatch, cfg: ChainingConfig) -> ChainBatch {
     let seed_stats = input.stats.clone();
     let mut stats = ChainingBatchStats::default();
 
+    // One working set per worker, reused across that worker's reads.
     let results: Vec<(Vec<Chain>, ChainingStats)> = input
         .anchors
         .par_iter()
-        .map(|anchors| {
+        .map_init(ChainScratch::default, |scratch, anchors| {
             let mut s = ChainingStats::default();
-            let chains = chain_anchors(anchors, cfg, &mut s);
+            let chains = chain_anchors_with_scratch(anchors, cfg, &mut s, scratch);
             (chains, s)
         })
         .collect();

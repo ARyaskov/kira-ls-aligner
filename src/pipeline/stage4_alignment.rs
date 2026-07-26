@@ -52,6 +52,9 @@ pub struct AlignmentStageConfig {
     pub long_read_threshold: usize,
     pub max_alignments: usize,
     pub short_preset: bool,
+    /// Paired-end policy, used by the mate-guided candidate search to decide
+    /// which (R1 chain, R2 chain) combinations form a plausible fragment.
+    pub paired: crate::pipeline::pairing::PairedConfig,
 }
 
 /// Per-batch alignment stats.
@@ -381,10 +384,90 @@ fn two_tier_reorder(
     Some(order)
 }
 
+/// Mate-guided candidate search. Default ON; `KIRA_MATE_GUIDE=0` disables.
+///
+/// Chains are ranked by anchor coverage alone, so inside a repeat family the
+/// true locus routinely ranks below a cleaner-matching copy and never receives a
+/// DP (`dp_topk` is 1-2 for short reads). The mate is independent evidence:
+/// usually only one copy sits at a plausible fragment distance from where the
+/// mate's own chains land. Chains with such a partner are promoted before top-k
+/// selection, and rescued from the `min_chain_ratio` filter. Chain-level only,
+/// so it costs one O(n·m) scan over two short lists per pair and no extra DP.
+fn mate_guide_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_MATE_GUIDE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Does the (this-read chain, mate chain) combination look like one fragment?
+/// Same geometry `pair_rerank` applies to finished alignments — same contig,
+/// convergent orientation, fragment length inside the concordance window —
+/// evaluated on chain spans instead.
+fn chains_look_paired(
+    a: &Chain,
+    b: &Chain,
+    window: (u32, u32),
+) -> bool {
+    if a.ref_id != b.ref_id || a.strand == b.strand {
+        return false;
+    }
+    let a_rev = matches!(a.strand, Strand::Reverse);
+    let a_is_left = a.ref_start <= b.ref_start;
+    let convergent = if a_is_left { !a_rev } else { a_rev };
+    if !convergent {
+        return false;
+    }
+    let lo = a.ref_start.min(b.ref_start);
+    let hi = a.ref_end.max(b.ref_end);
+    let frag = hi.saturating_sub(lo);
+    frag >= window.0 && frag <= window.1
+}
+
+/// Index of the single chain the mate discriminates in favour of, if any.
+///
+/// Returns `Some(ci)` only when **exactly one** candidate locus has a plausible
+/// mate partner. The uniqueness requirement is load-bearing: inside a repeat
+/// family the mate's own chains land on every copy, so "has a concordant
+/// partner" holds for all of them and carries no information. Promoting on
+/// non-unique support picks an arbitrary copy, displaces the real competitor out
+/// of the top-k DP, and hands the result a confident MAPQ — measured at 4946
+/// newly callable wrong placements against 1910 correct ones.
+fn unique_mate_supported_chain(
+    chain_list: &[Chain],
+    mate_chains: &[Chain],
+    cfg: &crate::pipeline::pairing::PairedConfig,
+    max_k: usize,
+) -> Option<usize> {
+    if chain_list.len() < 2 || mate_chains.is_empty() {
+        return None;
+    }
+    let window = crate::pipeline::pairing::concordance_window(cfg);
+    let probe = chain_list.len().min(max_k);
+    let mate_probe = mate_chains.len().min(max_k);
+
+    let mut found: Option<usize> = None;
+    for ci in 0..probe {
+        let supported = mate_chains[..mate_probe]
+            .iter()
+            .any(|m| chains_look_paired(&chain_list[ci], m, window));
+        if supported {
+            if found.is_some() {
+                return None; // more than one plausible locus ⇒ no information
+            }
+            found = Some(ci);
+        }
+    }
+    found
+}
+
 fn process_read_prefilter<'read, 'index>(
     idx: usize,
     read: &'read ReadRecord,
     chain_list: &[Chain],
+    mate_chains: &[Chain],
     index: &'index Index,
     cfg: AlignmentStageConfig,
     lanes: usize,
@@ -461,15 +544,55 @@ fn process_read_prefilter<'read, 'index>(
     } else {
         None
     };
+    // Mate support layers on top of that order rather than replacing it: the
+    // mate says which loci are geometrically possible, the two-tier Myers cost
+    // says which of those the read actually matches. Reordering by the mate
+    // alone de-ranks the real competitors MAPQ is computed from.
+    let mate_pick = if mate_guide_enabled() && short_read && cfg.paired.is_paired() {
+        unique_mate_supported_chain(chain_list, mate_chains, &cfg.paired, two_tier_k())
+    } else {
+        None
+    };
+    // Move the uniquely mate-supported locus to the front; the rest keep their
+    // relative order, so the Myers ranking still decides what the mate cannot.
+    let candidate_order: Option<Vec<usize>> = match (&two_tier_order, mate_pick) {
+        (None, None) => None,
+        (Some(order), None) => Some(order.clone()),
+        (base, Some(pick)) => {
+            let mut order: Vec<usize> = base
+                .clone()
+                .unwrap_or_else(|| (0..chain_list.len()).collect());
+            order.sort_by_key(|&ci| ci != pick);
+            Some(order)
+        }
+    };
+    // Promoting means this read's own seeds ranked a different locus first, so
+    // the displaced locus is a real competitor and must be scored too —
+    // otherwise MAPQ reports full confidence in a mate-only decision.
+    let mate_promoted = mate_pick.is_some_and(|pick| {
+        candidate_order
+            .as_ref()
+            .and_then(|o| o.first().copied())
+            .is_some_and(|first| first == pick && pick != 0)
+    });
+    let effective_dp_topk = if mate_promoted {
+        effective_dp_topk.max(2)
+    } else {
+        effective_dp_topk
+    };
 
     let mut selected = 0usize;
     for pos in 0..chain_list.len() {
-        let ci = match &two_tier_order {
+        let ci = match &candidate_order {
             Some(order) => order[pos],
             None => pos,
         };
+        let mate_backed = mate_pick == Some(ci);
         let chain = &chain_list[ci];
-        if chain.score < min_score {
+        // Keep a mate-supported chain even below `min_chain_ratio`: that filter
+        // is what discards the true locus when a repeat copy matches the read's
+        // seeds more cleanly.
+        if chain.score < min_score && !mate_backed {
             continue;
         }
         if selected >= effective_dp_topk {
@@ -756,14 +879,29 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     let accept_allowed = cfg.accept_enable && cfg.max_alignments <= 1;
     let multi_alignments_enabled = cfg.max_alignments > 1;
 
+    // Paired input is laid out as adjacent R1/R2 records, so the mate's chains
+    // are `chains[idx ^ 1]`. Empty slice for single-end and for a truncated
+    // final record, which disables the mate-guided search for that read.
+    static NO_CHAINS: &[Chain] = &[];
+    let paired_batch = cfg.paired.is_paired();
     let per_read: Vec<PerReadResult<'_, '_>> = reads
         .par_iter()
         .enumerate()
         .map(|(idx, read)| {
+            let mate_idx = idx ^ 1;
+            let mate_chains = if paired_batch
+                && read.pair_role != crate::types::PairRole::Unpaired
+                && mate_idx < chains.len()
+            {
+                &chains[mate_idx][..]
+            } else {
+                NO_CHAINS
+            };
             process_read_prefilter(
                 idx,
                 read,
                 &chains[idx],
+                mate_chains,
                 index,
                 cfg,
                 lanes,
@@ -1319,3 +1457,7 @@ fn percentile_u16_sorted(values: &[u16], pct: usize) -> u16 {
     let idx = (values.len() - 1) * pct / 100;
     values[idx]
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/pipeline_stage4_mate_guide.rs"]
+mod mate_guide_tests;

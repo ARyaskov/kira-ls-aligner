@@ -41,7 +41,7 @@ use crate::pipeline::stage4_alignment::{
     AlignmentBatchStats, AlignmentStageConfig, run as align_run,
 };
 use crate::pipeline::stage5_scoring::run as score_run;
-use crate::pipeline::stage6_output::serialize as output_serialize;
+use crate::pipeline::stage6_output::serialize_into as output_serialize_into;
 use crate::seeding::SeedingConfig;
 
 /// Pipeline configuration aggregated across stages.
@@ -213,6 +213,7 @@ impl Pipeline {
                         long_read_threshold: self.config.long_read_threshold,
                         max_alignments: self.config.max_alignments,
                         short_preset: self.config.short_preset,
+                        paired: self.config.paired,
                     },
                 )
             }
@@ -229,6 +230,19 @@ impl Pipeline {
         formatter: &SamFormatter,
         read_group: Option<&str>,
     ) -> Result<PipelineBatchOutput> {
+        let mut sam_buf = Vec::new();
+        let stats =
+            self.process_batch_into(input, index, formatter, read_group, &mut sam_buf)?;
+        Ok(PipelineBatchOutput { stats, sam_buf })
+    }
+
+    /// Run stages 1-5 and hand back the scored batch unserialised, for in-process
+    /// consumers that want alignment records rather than SAM text.
+    pub fn process_batch_scored(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+    ) -> Result<(stage5_scoring::ScoredBatch, PipelineBatchStats)> {
         let mut stages = [Duration::ZERO; 6];
 
         let t0 = Instant::now();
@@ -265,6 +279,16 @@ impl Pipeline {
             .install_light(|| chain_run(seeds, self.config.chaining));
         let chaining_stats = chains.stats.clone();
         stages[2] = t2.elapsed();
+
+        // Read the current insert-size estimate before stage 4: the mate-guided
+        // candidate search needs the concordance window to judge (R1 chain, R2
+        // chain) combinations. The estimator is only *updated* after pairing, so
+        // reading it here observes the same value stage 4 would have seen.
+        let paired_cfg = self
+            .insert_estimator
+            .read()
+            .map(|e| e.current())
+            .unwrap_or(self.config.paired);
 
         let t3 = Instant::now();
         let t_stage4;
@@ -307,6 +331,7 @@ impl Pipeline {
                         long_read_threshold: self.config.long_read_threshold,
                         max_alignments: self.config.max_alignments,
                         short_preset: self.config.short_preset,
+                        paired: paired_cfg,
                     },
                 )
             }
@@ -327,12 +352,6 @@ impl Pipeline {
                 ac_stats.scan_ms,
             );
         }
-
-        let paired_cfg = self
-            .insert_estimator
-            .read()
-            .map(|e| e.current())
-            .unwrap_or(self.config.paired);
 
         let tru = Instant::now();
         {
@@ -416,31 +435,42 @@ impl Pipeline {
         let align_stats = scored.stats.clone();
         stages[4] = t4.elapsed();
 
-        // Stage 6 SAM emit — pure string formatting.
-        let t5 = Instant::now();
-        // Keep the final aggregate buffer owned by the caller thread.  On
-        // Windows, repeatedly allocating it on a Rayon worker and freeing it
-        // on a writer thread makes the process retain roughly one SAM file's
-        // worth of heap across a long run.
-        let sam_buf = output_serialize(
+        Ok((
             scored,
-            formatter,
-            read_group,
-            self.config.output,
-            self.config.max_alignments,
-        );
-        stages[5] = t5.elapsed();
-
-        Ok(PipelineBatchOutput {
-            stats: PipelineBatchStats {
+            PipelineBatchStats {
                 times: PipelineStageTimes { stages },
                 align: align_stats,
                 sketch: sketch_stats,
                 seed: seed_stats,
                 chaining: chaining_stats,
             },
+        ))
+    }
+
+    /// [`Self::process_batch_serialized`] writing into a caller-owned SAM buffer,
+    /// so the driver can recycle one buffer across batches.
+    pub fn process_batch_into(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+        formatter: &SamFormatter,
+        read_group: Option<&str>,
+        sam_buf: &mut Vec<u8>,
+    ) -> Result<PipelineBatchStats> {
+        let (scored, mut stats) = self.process_batch_scored(input, index)?;
+
+        // Stage 6 SAM emit — pure string formatting.
+        let t5 = Instant::now();
+        output_serialize_into(
+            scored,
+            formatter,
+            read_group,
+            self.config.output,
+            self.config.max_alignments,
             sam_buf,
-        })
+        );
+        stats.times.stages[5] = t5.elapsed();
+        Ok(stats)
     }
 }
 

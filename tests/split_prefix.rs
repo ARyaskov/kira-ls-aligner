@@ -102,6 +102,7 @@ fn full_pipeline_cfg() -> PipelineConfig {
             max_occ: 500,
             max_hits_per_minimizer: 16,
             long_read_threshold: 500,
+            mate_window: None,
         },
         chaining: ChainingConfig {
             max_dist: 500,
@@ -111,6 +112,7 @@ fn full_pipeline_cfg() -> PipelineConfig {
             gap_extend: 1,
             log_gap: 0.2,
             rmq_window: 256,
+            keep_anchors: false,
         },
         alignment: alignment_cfg,
         accept_enable: true,

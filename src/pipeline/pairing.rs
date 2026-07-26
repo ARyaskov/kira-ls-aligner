@@ -562,7 +562,7 @@ fn pair_is_concordant(a1: &MatePrimaryScored, a2: &MatePrimaryScored, cfg: &Pair
 }
 
 /// 3 σ-around-mean window for **concordance** classification.
-fn concordance_window(cfg: &PairedConfig) -> (u32, u32) {
+pub(crate) fn concordance_window(cfg: &PairedConfig) -> (u32, u32) {
     if cfg.estimator_locked && cfg.insert_sd > 0 {
         let lo = (cfg.insert_mean as i64 - 3 * cfg.insert_sd as i64).max(0) as u32;
         let hi = (cfg.insert_mean as i64 + 3 * cfg.insert_sd as i64).max(0) as u32;

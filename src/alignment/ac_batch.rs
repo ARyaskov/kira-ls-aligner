@@ -75,7 +75,18 @@ pub struct AcBatchStats {
 }
 
 /// AC auto-disables above this total reference size (bp); override: KIRA_AC_MAX_REF_MB.
+/// A hard ceiling only; the binding condition is [`AC_MAX_SCAN_TO_BATCH_RATIO`].
 const AC_MAX_REF_BP_DEFAULT: u64 = 50_000_000;
+
+/// Maximum ratio of AC scan work to batch read bases for the auto gate.
+///
+/// Each batch scans the whole reference twice (forward + reverse-complement
+/// automaton), so the cost is `2 * ref_bp` per batch while the saving is per
+/// read. AC only wins when the reference is much smaller than the batch — small
+/// viral/plasmid/amplicon references. Gating on reference size alone enabled it
+/// for every bacterial genome, where it cost 12x the runtime for +0.008% of
+/// reads placed.
+const AC_MAX_SCAN_TO_BATCH_RATIO: f64 = 0.5;
 
 /// AC policy from `KIRA_AC_DISABLE`: unset = Auto, `0` = ForceOn, else ForceOff.
 #[derive(Clone, Copy, PartialEq)]
@@ -110,27 +121,41 @@ fn ac_max_ref_bp() -> u64 {
     })
 }
 
-fn ac_should_run(total_ref_bp: u64) -> bool {
+fn ac_should_run(total_ref_bp: u64, batch_bases: u64) -> bool {
     let mode = ac_mode();
+    // Scan work per batch: both automata traverse the full reference.
+    let scan_bp = total_ref_bp.saturating_mul(2);
+    let amortises =
+        batch_bases > 0 && (scan_bp as f64) <= (batch_bases as f64) * AC_MAX_SCAN_TO_BATCH_RATIO;
     let run = match mode {
         AcMode::ForceOff => false,
         AcMode::ForceOn => true,
-        AcMode::Auto => total_ref_bp <= ac_max_ref_bp(),
+        AcMode::Auto => total_ref_bp <= ac_max_ref_bp() && amortises,
     };
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
         let mb = total_ref_bp as f64 / 1e6;
         let thr = ac_max_ref_bp() / 1_000_000;
+        let batch_mb = batch_bases as f64 / 1e6;
         match mode {
-            AcMode::Auto if run => {
-                eprintln!("[KIRA_AC] auto: ENABLED (reference {mb:.0} Mbp ≤ {thr} Mbp)")
-            }
-            AcMode::Auto => eprintln!(
-                "[KIRA_AC] auto: DISABLED (reference {mb:.0} Mbp > {thr} Mbp) — using indexed \
+            AcMode::Auto if run => eprintln!(
+                "[KIRA_AC] auto: ENABLED (reference {mb:.1} Mbp ≤ {thr} Mbp; per-batch scan \
+                 {:.1} Mbp ≤ {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp)",
+                scan_bp as f64 / 1e6,
+            ),
+            AcMode::Auto if total_ref_bp > ac_max_ref_bp() => eprintln!(
+                "[KIRA_AC] auto: DISABLED (reference {mb:.1} Mbp > {thr} Mbp) — using indexed \
                  path. Force on: KIRA_AC_DISABLE=0; raise gate: KIRA_AC_MAX_REF_MB."
             ),
+            AcMode::Auto => eprintln!(
+                "[KIRA_AC] auto: DISABLED (per-batch scan {:.1} Mbp exceeds \
+                 {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp — the rescan would cost \
+                 more than the seeding it saves) — using indexed path. Force on: \
+                 KIRA_AC_DISABLE=0; or raise -K to enlarge batches.",
+                scan_bp as f64 / 1e6,
+            ),
             AcMode::ForceOn => {
-                eprintln!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0), reference {mb:.0} Mbp")
+                eprintln!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0), reference {mb:.1} Mbp")
             }
             AcMode::ForceOff => eprintln!("[KIRA_AC] forced OFF (KIRA_AC_DISABLE=1)"),
         }
@@ -158,7 +183,8 @@ pub fn run(
     let total_ref_bp: u64 = (0..index.reference.sequences.len())
         .map(|r| index.ref_bases(r).len() as u64)
         .sum();
-    if !ac_should_run(total_ref_bp) {
+    let batch_bases: u64 = reads.iter().map(|r| r.seq.len() as u64).sum();
+    if !ac_should_run(total_ref_bp, batch_bases) {
         return out;
     }
 

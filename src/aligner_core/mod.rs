@@ -245,6 +245,23 @@ impl Aligner {
 
         let formatter = writer.formatter_handle();
 
+        // Emit on a dedicated thread so writing batch N overlaps aligning N+1.
+        // Buffers are recycled over `free_rx` so each is allocated and freed on
+        // the same thread.
+        let (sam_tx, sam_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let (free_tx, free_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer_handle = std::thread::spawn(move || -> Result<()> {
+            while let Ok(buf) = sam_rx.recv() {
+                writer.write_batch(&buf)?;
+                let mut buf = buf;
+                buf.clear();
+                // A closed channel just means the driver finished; drop the buffer.
+                let _ = free_tx.send(buf);
+            }
+            writer.flush()?;
+            Ok(())
+        });
+
         let pool = Arc::new(
             DualPool::new(DualPoolConfig {
                 p_threads: self.cfg.num_p_threads,
@@ -373,14 +390,19 @@ impl Aligner {
                 let input = stage0_input::run(reads);
                 let stage0_time = fetch_time + stage0_start.elapsed();
 
-                let batch_out = pipeline.process_batch_serialized(
+                // Reuse a buffer the writer already drained.
+                let mut sam_buf = free_rx.try_recv().unwrap_or_default();
+                let batch_stats = pipeline.process_batch_into(
                     input,
                     &index,
                     &formatter,
                     self.cfg.read_group.as_deref(),
+                    &mut sam_buf,
                 )?;
-                let batch_stats = batch_out.stats;
-                writer.write_batch(&batch_out.sam_buf)?;
+                if sam_tx.send(sam_buf).is_err() {
+                    // Writer thread died — surface its error via the join below.
+                    break;
+                }
 
                 if let Some(profiles) = auto_profiles.as_mut() {
                     if profiles.decided.is_some() {
@@ -456,8 +478,15 @@ impl Aligner {
         if let Some(handle) = producer_handle {
             let _ = handle.join();
         }
+        // Signal end-of-stream to the writer, then drain it. The writer's own
+        // error is reported first when both sides failed, since a write failure
+        // is what makes the driver's send fail.
+        drop(sam_tx);
+        let write_result = writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("SAM writer thread panicked"))?;
+        write_result?;
         drive_result?;
-        writer.flush()?;
 
         if stats_enabled {
             if let Some(pb) = progress.as_ref() {
@@ -495,12 +524,109 @@ impl Aligner {
         Ok(())
     }
 
+    /// Run the alignment pipeline in-process, handing each batch's scored records
+    /// to `sink` as they are produced. Peak memory is one batch, not one run.
+    ///
+    /// Preferred over [`Self::align_to_sam_bytes`] for in-process consumers, which
+    /// would otherwise parse the SAM text straight back into records.
+    ///
+    /// Call [`Self::sam_header_bytes`] first for the reference dictionary; it is
+    /// separate so the sink can borrow the parsed header.
+    pub fn align_streaming<F>(
+        &self,
+        index: Index,
+        reads_paths: &[std::path::PathBuf],
+        mut sink: F,
+    ) -> Result<()>
+    where
+        F: FnMut(crate::pipeline::stage5_scoring::ScoredBatch) -> Result<()>,
+    {
+        let mut index = index;
+        validate_index_compatibility(&index, &self.cfg.pipeline)?;
+        self.install_hot_cache(&mut index);
+
+        let pool = Arc::new(
+            DualPool::new(DualPoolConfig {
+                p_threads: self.cfg.num_p_threads,
+                e_threads: self.cfg.num_e_threads,
+                total_threads: Some(self.cfg.threads),
+            })
+            .context("build hybrid-aware thread pools")?,
+        );
+
+        let mut stream = ReadStream::new_multi_with_mode(
+            reads_paths,
+            self.cfg.batch_bases,
+            self.cfg.pipeline.paired.mode,
+        )?;
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+            .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+        let mut auto_profiles = self.cfg.auto_profiles.clone();
+
+        while let Some(reads) = stream.next_batch()? {
+            if let Some(profiles) = auto_profiles.as_mut()
+                && profiles.decided.is_none()
+            {
+                let features = mode_features_from_reads(&reads);
+                let mode = classify(features);
+                profiles.decided = Some(mode);
+                pipeline.config = profiles.select(mode);
+            }
+            let input = stage0_input::run(reads);
+            let (scored, stats) = pipeline.process_batch_scored(input, &index)?;
+            if auto_profiles.as_ref().is_some_and(|p| p.decided.is_some()) {
+                adjust_auto_params(&mut pipeline.config, &stats.align, &stats.sketch);
+            }
+            sink(scored)?;
+        }
+        Ok(())
+    }
+
+    /// The SAM header this aligner would emit for `index`, byte-for-byte what the
+    /// file path writes.
+    pub fn sam_header_bytes(&self, index: &Index) -> Result<Vec<u8>> {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut writer = SamWriter::from_writer(
+            Box::new(crate::io::VecSink(sink.clone())),
+            index.reference.clone(),
+        );
+        match &self.cfg.header {
+            Some(hdr) => writer.write_header_with_ctx(hdr)?,
+            None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
+        }
+        writer.flush()?;
+        drop(writer);
+        Arc::try_unwrap(sink)
+            .map_err(|_| anyhow::anyhow!("SAM header buffer still shared"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("SAM header buffer mutex poisoned"))
+    }
+
+    /// Build the hot-bucket cache for both sub-indices from the environment.
+    fn install_hot_cache(&self, index: &mut Index) {
+        let hot_n: usize = std::env::var("KIRA_HOT_CACHE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000);
+        if hot_n == 0 {
+            return;
+        }
+        let max_occs: usize = std::env::var("KIRA_HOT_CACHE_MAX_OCCS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000_000);
+        let mmap_bytes = index.mmap.as_deref().map(|m| &m[..]);
+        index.short.build_hot_cache(mmap_bytes, hot_n, max_occs);
+        index
+            .long
+            .build_hot_cache(mmap_bytes, hot_n / 4, max_occs / 4);
+    }
+
     /// Run the full alignment pipeline in-process and return the complete SAM
-    /// (header + records) as a byte buffer — nothing is written to disk. For
-    /// fused in-memory pipelines (e.g. `kira-bt solid`) that hand the SAM
-    /// straight to sort/markdup/pileup. Reuses the same per-batch path as the
-    /// file writer (`process_batch_serialized`); skips progress/stats and the
-    /// adaptive per-batch mode re-selection of `run_with_index`.
+    /// (header + records) as a byte buffer — nothing is written to disk.
+    ///
+    /// Prefer [`Self::align_streaming`] for in-process consumers: this holds the
+    /// entire run's SAM text in memory at once.
     pub fn align_to_sam_bytes(
         &self,
         mut index: Index,
@@ -597,15 +723,17 @@ fn init_progress_bar(total: u64) -> ProgressBar {
 }
 
 /// Whether to prefetch input batches on a producer thread (`KIRA_PREFETCH`).
-/// Default off — the serial fetch→compute→write loop is used unchanged.
+///
+/// On by default: FASTQ parsing and gzip inflation are single-threaded, so
+/// otherwise the worker pool idles for every batch fetch. Output is unchanged.
 fn prefetch_enabled() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
     *CELL.get_or_init(|| {
         std::env::var("KIRA_PREFETCH")
             .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.is_empty())
-            .unwrap_or(false)
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
     })
 }
 

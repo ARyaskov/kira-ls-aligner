@@ -264,19 +264,20 @@ fn try_fast_dp_alignment_inner(
     }
     let text = &ref_seq[win_start..win_start + text_len];
 
-    if matches!(kind, router::AlignerKind::PackedSpectral)
-        && let Some(aln) =
-            try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
-    {
-        return Some((aln, FastPathKind::PackedSpectral));
-    }
-
+    // `SpectralSieve` and `PackedSpectral` resolve to the same kernel, so probe
+    // once and attribute the result to whichever kind was routed.
     if matches!(
         kind,
         router::AlignerKind::PackedSpectral | router::AlignerKind::SpectralSieve
-    ) && let Some(aln) = try_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
+    ) && let Some(aln) =
+        try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
     {
-        return Some((aln, FastPathKind::SpectralSieve));
+        let attribution = if matches!(kind, router::AlignerKind::PackedSpectral) {
+            FastPathKind::PackedSpectral
+        } else {
+            FastPathKind::SpectralSieve
+        };
+        return Some((aln, attribution));
     }
     // Spectral didn't apply (indel suspected) — fall through to WFA below.
 
@@ -442,6 +443,51 @@ pub fn wfa_result_to_alignment(
     })
 }
 
+/// Reusable per-thread buffers for the 2-bit packed spectral scan, which would
+/// otherwise allocate six `Vec`s per fast-path candidate.
+#[derive(Default)]
+struct PackedScratch {
+    read_bits: Vec<u8>,
+    ref_bits: Vec<u8>,
+    ref_shifted: [Vec<u8>; 4],
+}
+
+thread_local! {
+    static PACKED_SCRATCH: std::cell::RefCell<PackedScratch> =
+        std::cell::RefCell::new(PackedScratch::default());
+}
+
+/// Run the packed spectral scan against `text` using thread-local scratch.
+/// Returns the best hit and the best mismatch count at a distinct shift.
+fn packed_scan_scratch(
+    read_seq: &[u8],
+    text: &[u8],
+) -> Option<(bitpacked::PackedHit, Option<usize>)> {
+    PACKED_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let PackedScratch {
+            read_bits,
+            ref_bits,
+            ref_shifted,
+        } = &mut *s;
+        let read_valid = bitpacked::pack_into(read_seq, read_bits);
+        if !read_valid {
+            return None;
+        }
+        if !bitpacked::pack_into(text, ref_bits) {
+            return None;
+        }
+        bitpacked::pre_shift_into(ref_bits, ref_shifted);
+        bitpacked::scan_best_with_second_raw(
+            read_bits,
+            read_seq.len(),
+            read_valid,
+            ref_shifted,
+            text.len(),
+        )
+    })
+}
+
 /// Bit-Packed Spectral fast path.
 fn try_packed_spectral_alignment(
     read_seq: &[u8],
@@ -454,15 +500,7 @@ fn try_packed_spectral_alignment(
     let read_len = read_seq.len();
     let max_mism = router::spectral_max_mismatches(read_len);
 
-    let read_packed = bitpacked::PackedDna::pack(read_seq);
-    let ref_packed = bitpacked::PackedDna::pack(text);
-    if !read_packed.valid || !ref_packed.valid {
-        return None;
-    }
-    let ref_shifted = ref_packed.pre_shifted_window();
-
-    let (hit, second_mismatches) =
-        bitpacked::scan_best_with_second(&read_packed, &ref_shifted, text.len())?;
+    let (hit, second_mismatches) = packed_scan_scratch(read_seq, text)?;
     let ref_aligned = &text[hit.shift..hit.shift + read_len];
     if !spectral_hit_is_certified(read_seq, ref_aligned, &hit, second_mismatches, max_mism) {
         return None;
@@ -517,18 +555,6 @@ fn try_packed_spectral_alignment(
         xs_strand: None,
         mate: MateInfo::default(),
     })
-}
-
-/// Spectral Sieve fast path: scan all candidate shifts in the local reference window.
-fn try_spectral_alignment(
-    read_seq: &[u8],
-    text: &[u8],
-    win_start: usize,
-    chain: &AnchorSpan,
-    cfg: AlignmentConfig,
-    is_rev: bool,
-) -> Option<Alignment> {
-    try_packed_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev)
 }
 
 fn spectral_hit_is_certified(
@@ -759,6 +785,15 @@ pub struct SwPublicResult {
     pub early_abort: bool,
 }
 
+/// `KIRA_RESCUE_NO_FAST` — force mate rescue through the wide banded-SW path.
+/// Read once: `align_in_window` runs for every rescued mate.
+#[inline]
+fn rescue_no_fast() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var_os("KIRA_RESCUE_NO_FAST").is_some())
+}
+
 /// Align a read against a *wide* reference window — no chain anchor required.
 pub fn align_in_window(
     read_seq: &[u8],
@@ -773,19 +808,14 @@ pub fn align_in_window(
     if read_len == 0 || ref_window.is_empty() || read_len > ref_window.len() {
         return None;
     }
-    if std::env::var_os("KIRA_RESCUE_NO_FAST").is_some() {
+    if rescue_no_fast() {
         return align_in_window_wide_sw(
             read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score,
         );
     }
 
-    let read_packed = bitpacked::PackedDna::pack(read_seq);
-    let ref_packed = bitpacked::PackedDna::pack(ref_window);
-    if read_packed.valid && ref_packed.valid {
-        let ref_shifted = ref_packed.pre_shifted_window();
-        if let Some((best, second)) =
-            bitpacked::scan_best_with_second(&read_packed, &ref_shifted, ref_window.len())
-        {
+    {
+        if let Some((best, second)) = packed_scan_scratch(read_seq, ref_window) {
             let max_mism = router::spectral_max_mismatches(read_len);
             let target = &ref_window[best.shift..best.shift + read_len];
             if spectral_hit_is_certified(read_seq, target, &best, second, max_mism) {
@@ -823,11 +853,39 @@ pub fn align_in_window(
                     read_seq, ref_window, win_start, &chain, is_rev, sw,
                 ));
             }
+            if !rescue_wide_fallback() {
+                return None;
+            }
         }
     }
     align_in_window_wide_sw(
         read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score,
     )
+}
+
+/// `KIRA_RESCUE_WIDE=1` — after the banded rescue attempt at the best ungapped
+/// diagonal misses `min_score`, also run the full-window SW. Default **off**.
+///
+/// That fallback sets the band to half the window, i.e. an unbanded
+/// O(read x window) scalar DP, and it was reached for most discordant pairs
+/// because `min_score` there is the mate's existing score. It cost 22% of the
+/// alignment stage while changing nothing: over two 800k/300k-read regression
+/// sets — the second carrying indels up to 30 bp in 20% of reads, i.e. exactly
+/// the off-diagonal case it exists for — enabling it moved zero reads in
+/// placement, MAPQ or CIGAR.
+///
+/// This only skips the *second* DP. When the packed scan cannot run at all
+/// (ambiguous bases in the window) the wide search still happens, since there is
+/// no best diagonal to band around.
+#[inline]
+fn rescue_wide_fallback() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KIRA_RESCUE_WIDE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// Wide-band SW path — the original `align_in_window` body.
