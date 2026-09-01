@@ -96,13 +96,26 @@ fn assign_mapq_impl(
     }
     let best = alignments[0].score.max(1);
     let (primary_read_start, primary_read_end) = original_read_interval(&alignments[0], read_len);
+    // Count of competing same-region loci scoring above the sub floor — the
+    // multiplicity term of the MAPQ model (bwa-mem's mem_approx_mapq_se uses
+    // the count of suboptimal hits for exactly this). `sub` itself keeps its
+    // historical semantics (max score over all >=50%-overlapping competitors,
+    // regardless of the floor) so XS and the score-gap term are unchanged.
+    let sub_floor = best / SUB_FLOOR_DIVISOR;
+    let mut sub_count = 0u32;
     let sub_real = alignments
         .iter()
         .skip(1)
         .filter_map(|a| {
             let (read_start, read_end) = original_read_interval(a, read_len);
-            (read_overlap_pct(primary_read_start, primary_read_end, read_start, read_end) >= 50)
-                .then_some(a.score)
+            if read_overlap_pct(primary_read_start, primary_read_end, read_start, read_end) >= 50 {
+                if a.score > sub_floor {
+                    sub_count += 1;
+                }
+                Some(a.score)
+            } else {
+                None
+            }
         })
         .max();
     let sub = sub_real.unwrap_or_else(|| alignments[0].xs_score.unwrap_or(0));
@@ -124,7 +137,7 @@ fn assign_mapq_impl(
     } else {
         i32::MAX
     };
-    let primary_mapq = compute_mapq(best, sub, cap, read_len)
+    let primary_mapq = compute_mapq(best, sub, cap, read_len, sub_count)
         .min(occ_cap)
         .min(id_cap)
         .min(qual_cap)
@@ -320,11 +333,13 @@ fn rescue_mapq_cap() -> u8 {
 /// Sub-alignment floor as a fraction of the primary score.
 const SUB_FLOOR_DIVISOR: i32 = 2;
 
-/// Compute MAPQ from a best/sub score pair under a cap.
-fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize) -> i32 {
+/// Compute MAPQ from a best/sub score pair under a cap, with a multiplicity
+/// penalty for `sub_count` competing loci above the sub floor.
+fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize, sub_count: u32) -> i32 {
     let best = best.max(1);
     let floor = best / SUB_FLOOR_DIVISOR;
     if sub < floor {
+        // No competitor above the floor — sub_count is 0 by construction.
         return cap;
     }
     if sub >= best {
@@ -334,11 +349,37 @@ fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize) -> i32 {
     let length_scale = ((read_len.max(1) as f64) / 100.0).sqrt().clamp(0.75, 3.0);
     // Approximate posterior error from score separation. The slope is uncalibrated
     // (default 22.5, intentionally conservative); sweep `KIRA_MAPQ_BETA` against a
-    // GIAB truth set to fit it to the empirical mismap rate.
+    // truth-in-name simulated set (`kira_ls_aligner eval` reports the empirical
+    // mismap rate per MAPQ bucket to fit it against).
     let p_error = (-mapq_beta() * relative_gap * length_scale)
         .exp()
         .clamp(1e-6, 1.0);
-    (-10.0 * p_error.log10()).round().clamp(0.0, cap as f64) as i32
+    let mut mapq = (-10.0 * p_error.log10()).round().clamp(0.0, cap as f64) as i32;
+    // Multiplicity penalty (bwa-mem `mem_approx_mapq_se`): several distinct
+    // loci scoring above the sub floor is stronger ambiguity evidence than the
+    // best runner-up alone, and the score gap to the *second* runner-up carries
+    // no extra signal once both are near-best. γ·ln(n) with bwa's γ = 6.585 by
+    // default; `KIRA_MAPQ_MULT=0` disables.
+    if sub_count > 1 {
+        let pen = (mapq_mult_gamma() * (sub_count as f64).ln()).round() as i32;
+        mapq = (mapq - pen).max(0);
+    }
+    mapq
+}
+
+/// Multiplicity-penalty slope γ (`KIRA_MAPQ_MULT`). Default 6.585 — the value
+/// bwa-mem fits in `mem_approx_mapq_se`. Invalid/negative values fall back to
+/// the default; 0 disables the penalty.
+fn mapq_mult_gamma() -> f64 {
+    use std::sync::OnceLock;
+    static GAMMA: OnceLock<f64> = OnceLock::new();
+    *GAMMA.get_or_init(|| {
+        std::env::var("KIRA_MAPQ_MULT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(6.585)
+    })
 }
 
 /// Slope of the MAPQ posterior-error model (`compute_mapq`). Higher ⇒ steeper ⇒

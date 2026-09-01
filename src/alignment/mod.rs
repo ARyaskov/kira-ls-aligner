@@ -4,6 +4,7 @@ pub mod cgk;
 pub mod junc_bed;
 pub mod lsh_rescue;
 pub mod myers;
+pub mod normalize;
 pub mod prefilter;
 pub mod router;
 pub mod spectral;
@@ -1669,7 +1670,7 @@ pub(crate) fn push_u32_decimal(out: &mut Vec<u8>, mut v: u32) {
     }
 }
 
-fn compute_nm_md(
+pub(crate) fn compute_nm_md(
     read: &[u8],
     reference: &[u8],
     read_start: usize,

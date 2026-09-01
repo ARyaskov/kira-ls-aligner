@@ -386,6 +386,23 @@ impl Pipeline {
         }
         t_rescue_discordant = trd.elapsed();
 
+        // Indel left-normalization: canonicalise gap placement so equivalent
+        // alignments of the same variant emit identical CIGARs (GATK
+        // LeftAlignIndels / bcftools norm convention). Runs before pairing so
+        // TLEN/proper-pair geometry sees final coordinates — which in fact
+        // never move: normalization only slides indels within the aligned
+        // span. NM/MD are recomputed for the records that moved.
+        {
+            let reads = &align.reads;
+            let alns = &mut align.alignments;
+            let index = &index;
+            self.pool.install_compute(move || {
+                crate::alignment::normalize::normalize_alignments(reads, alns, |ref_id| {
+                    index.ref_bases(ref_id as usize)
+                })
+            });
+        }
+
         let tap = Instant::now();
         apply_pairing(
             &align.reads,

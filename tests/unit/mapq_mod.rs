@@ -320,3 +320,62 @@ fn coregion_secondary_still_deflates_primary_mapq() {
     assert_eq!(alns[0].mapq, 24);
     assert!(alns[1].is_secondary);
 }
+
+#[test]
+fn single_competitor_above_floor_has_no_multiplicity_penalty() {
+    // One strong competitor: sub_count = 1 → identical to the pre-penalty model.
+    let primary = make_aln(150, 0, 150, 0);
+    let competitor = make_aln(120, 0, 150, 1);
+    let mut alns = vec![primary, competitor];
+    assign_mapq(&mut alns, 150, cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 24);
+}
+
+#[test]
+fn two_competitors_above_floor_apply_multiplicity_penalty() {
+    // Two strong competitors (both > floor=75): γ·ln(2) ≈ 4.56 → −5 MAPQ.
+    let primary = make_aln(150, 0, 150, 0);
+    let second = make_aln(120, 0, 150, 1);
+    let third = make_aln(110, 0, 150, 2);
+    let mut alns = vec![primary, second, third];
+    assign_mapq(&mut alns, 150, cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 24 - 5);
+}
+
+#[test]
+fn three_competitors_penalize_more_than_two() {
+    // γ·ln(3) ≈ 7.23 → −7 MAPQ against the same best/sub gap as the
+    // two-competitor case (sub stays 120).
+    let primary = make_aln(150, 0, 150, 0);
+    let mut alns = vec![primary];
+    for (i, score) in [120, 110, 100].into_iter().enumerate() {
+        alns.push(make_aln(score, 0, 150, i as u32 + 1));
+    }
+    assign_mapq(&mut alns, 150, cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 24 - 7);
+}
+
+#[test]
+fn competitors_below_floor_do_not_count_for_multiplicity() {
+    // Secondaries under the floor (75) are weak partial matches: they set
+    // neither sub nor the multiplicity count.
+    let primary = make_aln(150, 0, 150, 0);
+    let mut alns = vec![primary];
+    for ref_id in 1..=4u32 {
+        alns.push(make_aln(60, 0, 150, ref_id));
+    }
+    assign_mapq(&mut alns, 150, cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 60);
+}
+
+#[test]
+fn disjoint_supplementary_loci_do_not_count_for_multiplicity() {
+    // <50% read overlap → supplementary, not a competing locus.
+    let primary = make_aln(300, 0, 500, 0);
+    let mut alns = vec![primary];
+    for i in 0..3u32 {
+        alns.push(make_aln(280, 500 + i * 500, 1000 + i * 500, i));
+    }
+    assign_mapq(&mut alns, 2000, cfg(), None, 1);
+    assert_eq!(alns[0].mapq, 60);
+}

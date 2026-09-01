@@ -3,7 +3,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use kira_ls_aligner::cli::{IndexArgs, MemArgs, cmd_index, cmd_mem};
+use kira_ls_aligner::cli::{EvalArgs, IndexArgs, MemArgs, cmd_eval, cmd_index, cmd_mem};
 
 /// Alignment is allocation-heavy and the default Windows heap serialises across
 /// threads. Kept in the binary, never the library — see the note in `src/lib.rs`.
@@ -24,6 +24,8 @@ enum Commands {
     Index(IndexArgs),
     /// Align reads (bwa-mem compatible)
     Mem(MemArgs),
+    /// Evaluate placement accuracy against truth-in-name read ids
+    Eval(EvalArgs),
     /// Run a long-lived GPU server with a warm CUDA context.
     GpuServer(GpuServerArgs),
 }
@@ -43,6 +45,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Index(args) => cmd_index(args),
         Commands::Mem(args) => cmd_mem(args),
+        Commands::Eval(args) => cmd_eval(args),
         Commands::GpuServer(args) => run_gpu_server(args),
     }
 }

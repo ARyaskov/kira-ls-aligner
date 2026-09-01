@@ -34,6 +34,14 @@ kira-ls-aligner is organized as a strict multi-stage pipeline. Each stage lives 
    - Uses X-drop and safe early-abort bounds to reduce wasted DP work.
    - Output: `AlignBatch { reads, alignments }`.
 
+Between stage 4 and stage 5 (also for the tiled `--split-prefix` pipeline)
+alignments pass through **indel left-normalization** (`src/alignment/normalize.rs`):
+equivalent gap placements inside homopolymers/tandem repeats slide to their
+leftmost CIGAR, so the same variant emits one canonical CIGAR across reads
+(GATK `LeftAlignIndels` / `bcftools norm` convention). Positions and insert
+sizes are untouched; NM/MD are recomputed for the moved records. Kill-switch:
+`KIRA_LEFT_NORM=0`.
+
 6. **Stage 5 - Scoring** (`stage5_scoring.rs`)
    - Assigns MAPQ, primary/secondary flags, and suboptimal score (`XS`).
    - Output: `ScoredBatch { reads, alignments }`.
@@ -104,8 +112,15 @@ The selected mode is applied to subsequent batches and logged once when `KIRA_ST
 - **Output:** `ScoredBatch`.
 - **Algorithm:**
   - Primary alignment = best score.
-  - Secondary alignments flagged with MAPQ 0.
-  - MAPQ approximates bwa-mem/minimap2 behavior with a 60 cap.
+  - Secondary alignments (loci covering ≥50 % of the primary's read region) are
+    flagged with MAPQ 0; disjoint loci become supplementary.
+  - MAPQ approximates bwa-mem/minimap2 behavior with a 60 cap, from a best/sub
+    score-gap posterior (`KIRA_MAPQ_BETA`) minus a multiplicity penalty of
+    `KIRA_MAPQ_MULT · ln(n)` over `n` above-floor competing loci (bwa-mem
+    `mem_approx_mapq_se` term).
+  - Additional ceilings: identity (`KIRA_ID_MAPQ`), repeat copy-number
+    (`KIRA_REPEAT_MAPQ`), mean FASTQ quality, mate-rescue
+    (`KIRA_RESCUE_MAPQ_CAP`) and discordant-pair caps.
 
 ### Stage 6 - Output
 - **Input:** `ScoredBatch` + `SamWriter`.

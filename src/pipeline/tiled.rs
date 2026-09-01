@@ -223,6 +223,12 @@ fn run_tiled_inner(
             RescueConfig::default(),
         );
 
+        // Indel left-normalization (see pipeline/mod.rs) — same placement as
+        // the in-memory pipeline: after rescue, before pairing/MAPQ.
+        crate::alignment::normalize::normalize_alignments(&reads, &mut alignments, |ref_id| {
+            reference.sequences[ref_id as usize].bases(None)
+        });
+
         let mut unmapped_mate_info: Vec<Option<MateInfo>> = vec![None; n];
         apply_pairing(
             &reads,

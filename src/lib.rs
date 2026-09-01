@@ -7,6 +7,7 @@ pub mod aligner_core;
 pub mod alignment;
 pub mod chaining;
 pub mod cli;
+pub mod eval;
 pub mod exec;
 pub mod index;
 pub mod io;

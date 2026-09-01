@@ -114,10 +114,37 @@ points, but used 24.7 GiB peak working set and took 2.07x the wall time of the
 ACCEPT-on control. It is not the recommended default. These are concordance
 results, not truth-set SNP/INDEL F1 measurements.
 
+## Evaluation tooling (`eval`)
+
+For simulated reads whose FASTQ id encodes the source locus
+(`<name>:<contig>:<start>-<end>` or `<name>_<contig>_<start>_<end>`), the
+binary scores a SAM/stdout stream and attributes every read:
+
+```bash
+kira_ls_aligner eval out.sam --tolerance 150 --mapq-thresholds 13,30,60 \
+  --dump-attribution per_read.tsv
+```
+
+Reports unmapped / correct-locus / wrong-locus counts, with INDEL-bearing
+reads broken out and per-MAPQ-threshold counts (what a caller's `MQ ≥ t`
+filter trades off). Use it to attribute recall loss to a stage class
+(seeding → unmapped, placement → wrong_locus, MAPQ → below threshold) instead
+of a variant-calling round-trip. `x2 / x2` comparison runs of the regression
+set (alternating arms, minimum per stage) use this plus `KIRA_STATS=1`.
+
+```text
+[EVAL] total_records=... truth_parsed=... no_truth=...
+[EVAL] unmapped=... (..%)
+[EVAL] mapped=... correct=... (..%) wrong_locus=... (..%)
+[EVAL] indel_bearing: correct=... wrong_locus=...
+[EVAL] mapq>=13: correct=... wrong=... precision=..% recall_of_correct=..%
+```
+
 ## CLI Options (bwa-mem compatible subset)
 
 - `index REF` : Build a minimizer index.
 - `mem REF READS...` : Align reads to reference (one or more FASTQ/FASTA files).
+- `eval SAM` : Evaluate placement accuracy against truth-in-name read ids (simulation regression tool).
 - `--index` : Use a prebuilt index file (REF is kept for bwa-mem compatibility).
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
 - `--accept-enable` : Override the ungapped ACCEPT shortcut.
@@ -143,6 +170,9 @@ default can be A/B'd without a rebuild.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `KIRA_LEFT_NORM` | on | Left-normalize indel placement in emitted CIGARs (GATK `LeftAlignIndels` / `bcftools norm` convention) so equivalent gap placements emit identical CIGARs. `0`/`off` emits traceback-native CIGARs. |
+| `KIRA_MAPQ_MULT` | 6.585 | Multiplicity penalty slope on competing loci: MAPQ drops by `γ·ln(n)` when `n` above-floor competitors exist (bwa-mem `mem_approx_mapq_se` term). `0` disables. |
+| `KIRA_MAPQ_BETA` | 22.5 | Slope of the MAPQ score-gap posterior model; sweep against `kira_ls_aligner eval` output on truth-in-name simulations to calibrate. |
 | `KIRA_MATE_GUIDE` | on | Promote the candidate locus that has a plausible mate partner, when exactly one candidate has one. `0` disables. |
 | `KIRA_ANCHOR_CAP_K` | on | Never require an anchor to be longer than the seed length `k`. `0` restores the old `min_anchor_len` behaviour. |
 | `KIRA_TWOTIER` | on | Rank ambiguous candidate loci by bounded Myers edit cost instead of chain score. |
