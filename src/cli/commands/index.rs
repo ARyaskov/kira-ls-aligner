@@ -42,16 +42,14 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     };
 
     let wall_start = Instant::now();
-    eprintln!(
-        "[KIRA_INDEX] reading reference {}...",
+    crate::kira_info!("[KIRA_INDEX] reading reference {}...",
         args.reference.display()
     );
     let t = Instant::now();
     let reference = read_reference(&args.reference)?;
     let n_seqs = reference.sequences.len();
     let total_bp: usize = reference.sequences.iter().map(|s| s.len(None)).sum();
-    eprintln!(
-        "[KIRA_INDEX] read {} sequence(s), {:.2} Mbp in {:.2}s",
+    crate::kira_info!("[KIRA_INDEX] read {} sequence(s), {:.2} Mbp in {:.2}s",
         n_seqs,
         total_bp as f64 / 1e6,
         t.elapsed().as_secs_f64()
@@ -59,8 +57,7 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
 
     let t = Instant::now();
     let index = Index::build(reference, cfg);
-    eprintln!(
-        "[KIRA_INDEX] Index::build done in {:.2}s",
+    crate::kira_info!("[KIRA_INDEX] Index::build done in {:.2}s",
         t.elapsed().as_secs_f64()
     );
 
@@ -70,10 +67,9 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         p
     });
     let t = Instant::now();
-    eprintln!("[KIRA_INDEX] writing index to {}...", output.display());
+    crate::kira_info!("[KIRA_INDEX] writing index to {}...", output.display());
     index.save(&output)?;
-    eprintln!(
-        "[KIRA_INDEX] save done in {:.2}s (total wall time: {:.2}s)",
+    crate::kira_info!("[KIRA_INDEX] save done in {:.2}s (total wall time: {:.2}s)",
         t.elapsed().as_secs_f64(),
         wall_start.elapsed().as_secs_f64()
     );

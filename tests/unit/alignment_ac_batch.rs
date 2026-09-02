@@ -32,6 +32,7 @@ fn read(id: &str, seq: &[u8]) -> ReadRecord {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 

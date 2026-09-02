@@ -711,9 +711,9 @@ dependencies = [
 
 [[package]]
 name = "kira-bam"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ac51aa6f61bd3ae46885b70a9ba17274601906086dd1c1f7389960ec9c17cf9"
+checksum = "55c9bb88999785eed5f654d5b12746803d4660599de7d8f6483cde383e266ed6"
 dependencies = [
  "anyhow",
  "bstr",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "kira-ls-aligner"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -756,6 +756,7 @@ dependencies = [
  "criterion",
  "cudarc",
  "find_cuda_helper",
+ "flate2",
  "indicatif",
  "kira-bam",
  "kira-fastq",
@@ -764,6 +765,7 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "needletail",
+ "noodles-sam",
  "rayon",
  "rustc-hash",
  "sysinfo",

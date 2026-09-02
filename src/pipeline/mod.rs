@@ -40,7 +40,6 @@ use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
     AlignmentBatchStats, AlignmentStageConfig, run as align_run,
 };
-use crate::pipeline::stage5_scoring::run as score_run;
 use crate::pipeline::stage6_output::serialize_into as output_serialize_into;
 use crate::seeding::SeedingConfig;
 
@@ -73,6 +72,32 @@ pub struct PipelineConfig {
     pub paired: PairedConfig,
     /// Splice-aware alignment policy.
     pub splice: SpliceConfig,
+    /// bwa-mem `-T`: alignments scoring below this are dropped before pairing
+    /// and output; a read whose best alignment falls under it is unmapped.
+    pub min_output_score: i32,
+    /// bwa-mem `-S`: skip mate rescue.
+    pub skip_mate_rescue: bool,
+    /// bwa-mem `-P`: skip pairing — no joint re-rank, no discordant rescue.
+    /// Pair flags/TLEN are still stamped from each mate's own best hit.
+    pub skip_pairing: bool,
+    /// bwa-mem `-5`: for a split read, the segment with the smallest read
+    /// coordinate is the primary record.
+    pub primary_5p: bool,
+    /// Per-contig ALT flag from `REF.alt` (also carried in `mapq`). With it,
+    /// a read whose best hit is on an ALT contig but which has an equivalent
+    /// primary-assembly hit is reported on the primary assembly, as
+    /// `bwa-postalt` does.
+    pub alt_mask: Option<&'static [bool]>,
+}
+
+impl PipelineConfig {
+    /// Install the ALT-contig mask (both the placement policy and the MAPQ
+    /// model read it). Re-applied whenever a read-mode profile replaces the
+    /// config, since profiles are built before the index is known.
+    pub fn set_alt_mask(&mut self, mask: Option<&'static [bool]>) {
+        self.alt_mask = mask;
+        self.mapq.alt_mask = mask;
+    }
 }
 
 /// Per-batch stage timing results (stages 1-6).
@@ -291,11 +316,6 @@ impl Pipeline {
             .unwrap_or(self.config.paired);
 
         let t3 = Instant::now();
-        let t_stage4;
-        let t_rescue_unmapped;
-        let t_pair_rerank;
-        let t_rescue_discordant;
-        let t_apply_pairing;
         let ts4 = Instant::now();
         // Stage 4 alignment — banded SW / spectral / WFA, the hottest
         // SIMD path in the whole pipeline → P-pool.
@@ -337,11 +357,10 @@ impl Pipeline {
             }
         });
         merge_ac_alignments(&mut align.alignments, ac);
-        t_stage4 = ts4.elapsed();
+        let t_stage4 = ts4.elapsed();
 
         if std::env::var_os("KIRA_STATS").is_some() {
-            eprintln!(
-                "[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
+            crate::kira_info!("[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
                 ac_stats.n_reads,
                 ac_stats.reads_eligible,
                 ac_stats.reads_resolved,
@@ -354,7 +373,7 @@ impl Pipeline {
         }
 
         let tru = Instant::now();
-        {
+        if !self.config.skip_mate_rescue {
             let reads = &align.reads;
             let alns = &mut align.alignments;
             let pcfg = paired_cfg;
@@ -363,19 +382,21 @@ impl Pipeline {
                 rescue_unmapped_mates(reads, alns, index, &pcfg, acfg, RescueConfig::default())
             });
         }
-        t_rescue_unmapped = tru.elapsed();
+        let t_rescue_unmapped = tru.elapsed();
 
         let tpr = Instant::now();
-        pair_rerank(
-            &align.reads,
-            &mut align.alignments,
-            &paired_cfg,
-            self.config.dp_topk.max(2),
-        );
-        t_pair_rerank = tpr.elapsed();
+        if !self.config.skip_pairing {
+            pair_rerank(
+                &align.reads,
+                &mut align.alignments,
+                &paired_cfg,
+                self.config.dp_topk.max(2),
+            );
+        }
+        let t_pair_rerank = tpr.elapsed();
 
         let trd = Instant::now();
-        {
+        if !self.config.skip_mate_rescue && !self.config.skip_pairing {
             let reads = &align.reads;
             let alns = &mut align.alignments;
             let pcfg = paired_cfg;
@@ -384,7 +405,24 @@ impl Pipeline {
                 rescue_discordant_pairs(reads, alns, index, &pcfg, acfg, RescueConfig::default())
             });
         }
-        t_rescue_discordant = trd.elapsed();
+        let t_rescue_discordant = trd.elapsed();
+
+        // bwa-mem `-T`: the score floor applies to everything the stages above
+        // produced, rescued placements included, and runs before pairing so
+        // the mate's RNEXT/PNEXT never point at a record that is not emitted.
+        if self.config.min_output_score > i32::MIN {
+            apply_min_output_score(&mut align.alignments, self.config.min_output_score);
+        }
+        // bwa-mem `-5`: choose the primary segment of a split read by read
+        // coordinate, also before pairing for the same reason.
+        if self.config.primary_5p {
+            apply_primary_5p(&align.reads, &mut align.alignments);
+        }
+        // ALT contigs: prefer an equivalent primary-assembly placement over an
+        // ALT one (bwa-postalt), before pairing sees the coordinates.
+        if let Some(mask) = self.config.alt_mask {
+            apply_alt_primary_policy(&align.reads, &mut align.alignments, mask, self.config.alignment.mismatch);
+        }
 
         // Indel left-normalization: canonicalise gap placement so equivalent
         // alignments of the same variant emit identical CIGARs (GATK
@@ -410,7 +448,7 @@ impl Pipeline {
             &mut align.unmapped_mate_info,
             &paired_cfg,
         );
-        t_apply_pairing = tap.elapsed();
+        let t_apply_pairing = tap.elapsed();
 
         let refined_after = if paired_cfg.is_paired() {
             self.insert_estimator
@@ -424,8 +462,7 @@ impl Pipeline {
 
         stages[3] = t3.elapsed();
         if std::env::var_os("KIRA_STATS").is_some() {
-            eprintln!(
-                "[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",
+            crate::kira_info!("[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",
                 t_stage4.as_secs_f64() * 1000.0,
                 t_rescue_unmapped.as_secs_f64() * 1000.0,
                 t_pair_rerank.as_secs_f64() * 1000.0,
@@ -445,10 +482,17 @@ impl Pipeline {
         } else {
             None
         };
-        // Stage 5 MAPQ — light scalar math.
-        let scored = self
-            .pool
-            .install_light(|| score_run(align, self.config.mapq, pair_ctx));
+        // Stage 5 MAPQ — light scalar math. The primary is kept as chosen
+        // when an earlier policy picked it on grounds other than score.
+        let preserve_primary = self.config.primary_5p || self.config.alt_mask.is_some();
+        let scored = self.pool.install_light(|| {
+            stage5_scoring::run_with_primary_policy(
+                align,
+                self.config.mapq,
+                pair_ctx,
+                preserve_primary,
+            )
+        });
         let align_stats = scored.stats.clone();
         stages[4] = t4.elapsed();
 
@@ -488,6 +532,211 @@ impl Pipeline {
         );
         stats.times.stages[5] = t5.elapsed();
         Ok(stats)
+    }
+}
+
+/// bwa-mem `-T`: drop alignments below `min_score`. If the primary (slot 0)
+/// falls under the floor the read becomes unmapped — a secondary or
+/// supplementary segment never gets promoted past a rejected primary.
+fn apply_min_output_score(alignments: &mut [Vec<crate::types::Alignment>], min_score: i32) {
+    for alns in alignments.iter_mut() {
+        if alns.first().is_some_and(|a| a.score < min_score) {
+            alns.clear();
+        } else {
+            alns.retain(|a| a.score >= min_score);
+        }
+    }
+}
+
+/// bwa-mem `-5`: among the primary and its supplementary segments, the one
+/// covering the smallest read coordinate (in original read orientation)
+/// becomes the primary. Secondaries are untouched.
+fn apply_primary_5p(
+    reads: &[crate::types::ReadRecord],
+    alignments: &mut [Vec<crate::types::Alignment>],
+) {
+    for (alns, read) in alignments.iter_mut().zip(reads) {
+        if alns.len() < 2 || !alns.iter().any(|a| a.is_supplementary) {
+            continue;
+        }
+        let read_len = read.seq.len() as u32;
+        let oriented_start = |a: &crate::types::Alignment| -> u32 {
+            if a.is_rev {
+                read_len.saturating_sub(a.read_end)
+            } else {
+                a.read_start
+            }
+        };
+        let best = alns
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.is_secondary)
+            .min_by_key(|(i, a)| (oriented_start(a), *i))
+            .map(|(i, _)| i);
+        if let Some(i) = best
+            && i != 0
+        {
+            alns.swap(0, i);
+            alns[0].is_supplementary = false;
+            alns[i].is_supplementary = true;
+        }
+    }
+}
+
+/// bwa-postalt lite: when the best hit is on an ALT contig and a
+/// primary-assembly hit covering the same read region scores within one
+/// mismatch of it, the primary-assembly hit becomes the primary record. The
+/// ALT hit stays as a competitor (it still counts against an ALT primary in
+/// the MAPQ model, and never against a primary-assembly one).
+fn apply_alt_primary_policy(
+    reads: &[crate::types::ReadRecord],
+    alignments: &mut [Vec<crate::types::Alignment>],
+    mask: &[bool],
+    mismatch: i32,
+) {
+    let is_alt = |ref_id: u32| mask.get(ref_id as usize).copied().unwrap_or(false);
+    for (alns, read) in alignments.iter_mut().zip(reads) {
+        if alns.len() < 2 || !is_alt(alns[0].ref_id) {
+            continue;
+        }
+        let read_len = read.seq.len() as u32;
+        let interval = |a: &crate::types::Alignment| -> (u32, u32) {
+            if a.is_rev {
+                (read_len.saturating_sub(a.read_end), read_len.saturating_sub(a.read_start))
+            } else {
+                (a.read_start, a.read_end)
+            }
+        };
+        let (ps, pe) = interval(&alns[0]);
+        let floor = alns[0].score - mismatch.max(1);
+        let pick = alns
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, a)| !is_alt(a.ref_id) && !a.is_supplementary && a.score >= floor)
+            .filter(|(_, a)| {
+                let (s, e) = interval(a);
+                let overlap = e.min(pe).saturating_sub(s.max(ps));
+                overlap.saturating_mul(100) / (pe - ps).max(1) >= 50
+            })
+            .max_by_key(|(i, a)| (a.score, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i);
+        if let Some(i) = pick {
+            alns.swap(0, i);
+            alns[0].is_secondary = false;
+            alns[0].is_supplementary = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{apply_alt_primary_policy, apply_min_output_score, apply_primary_5p};
+    use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, ReadRecord};
+
+    fn aln(ref_id: u32, score: i32, read_start: u32, read_end: u32, is_rev: bool) -> Alignment {
+        Alignment {
+            kind: AlignmentKind::DpAligned,
+            ref_id,
+            ref_start: 1000,
+            ref_end: 1000 + (read_end - read_start),
+            read_start,
+            read_end,
+            cigar: vec![CigarOp {
+                len: read_end - read_start,
+                op: CigarKind::Match,
+            }],
+            score,
+            mapq: 0,
+            is_rev,
+            is_secondary: false,
+            is_supplementary: false,
+            nm: 0,
+            md: String::new(),
+            as_score: score,
+            xs_score: None,
+            xs_strand: None,
+            mate: MateInfo::default(),
+        }
+    }
+
+    fn read(len: usize) -> ReadRecord {
+        ReadRecord::new_unpaired("r".into(), vec![b'A'; len], None)
+    }
+
+    #[test]
+    fn min_output_score_unmaps_read_when_primary_is_below_floor() {
+        let mut alns = vec![vec![aln(0, 25, 0, 150, false), aln(1, 40, 0, 150, false)]];
+        apply_min_output_score(&mut alns, 30);
+        assert!(alns[0].is_empty(), "a rejected primary never promotes a runner-up");
+    }
+
+    #[test]
+    fn min_output_score_prunes_only_low_secondaries_otherwise() {
+        let mut alns = vec![vec![aln(0, 140, 0, 150, false), aln(1, 20, 0, 150, false)]];
+        apply_min_output_score(&mut alns, 30);
+        assert_eq!(alns[0].len(), 1);
+        assert_eq!(alns[0][0].score, 140);
+    }
+
+    #[test]
+    fn primary_5p_picks_smallest_read_coordinate_in_original_orientation() {
+        // Primary covers read 80..150 on the reverse strand (original 0..70);
+        // supplementary covers 0..70 forward (original 0..70 too? no: 0..70).
+        // Make the supplementary the 5'-most in *original* coordinates.
+        let mut primary = aln(0, 70, 80, 150, false); // original 80..150
+        let mut supp = aln(1, 60, 0, 70, false); // original 0..70
+        primary.is_supplementary = false;
+        supp.is_supplementary = true;
+        let mut alns = vec![vec![primary, supp]];
+        apply_primary_5p(&[read(150)], &mut alns);
+        assert_eq!(alns[0][0].ref_id, 1, "the 5'-most segment becomes primary");
+        assert!(!alns[0][0].is_supplementary);
+        assert!(alns[0][1].is_supplementary);
+    }
+
+    #[test]
+    fn primary_5p_accounts_for_reverse_strand_segments() {
+        // Reverse-strand segment at read 0..70 sits at original 80..150.
+        let mut primary = aln(0, 70, 0, 70, true); // original 80..150
+        let mut supp = aln(1, 60, 70, 150, false); // original 70..150 — 5'-most is 70
+        primary.is_supplementary = false;
+        supp.is_supplementary = true;
+        let mut alns = vec![vec![primary, supp]];
+        apply_primary_5p(&[read(150)], &mut alns);
+        assert_eq!(alns[0][0].ref_id, 1);
+    }
+
+    #[test]
+    fn alt_policy_moves_equivalent_primary_assembly_hit_to_primary() {
+        let mask = &[false, true][..];
+        // Best hit on the ALT contig (ref 1), primary-assembly hit one mismatch worse.
+        let mut alns = vec![vec![aln(1, 150, 0, 150, false), aln(0, 146, 0, 150, false)]];
+        apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
+        assert_eq!(alns[0][0].ref_id, 0);
+        assert!(!alns[0][0].is_secondary);
+        assert_eq!(alns[0][1].ref_id, 1);
+    }
+
+    #[test]
+    fn alt_policy_keeps_alt_primary_when_primary_assembly_hit_is_clearly_worse() {
+        let mask = &[false, true][..];
+        let mut alns = vec![vec![aln(1, 150, 0, 150, false), aln(0, 130, 0, 150, false)]];
+        apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
+        assert_eq!(alns[0][0].ref_id, 1, "a 5-mismatch gap is real divergence, not an ALT tie");
+    }
+
+    #[test]
+    fn alt_policy_ignores_non_alt_primaries_and_disjoint_segments() {
+        let mask = &[false, true][..];
+        let mut alns = vec![vec![aln(0, 150, 0, 150, false), aln(1, 150, 0, 150, false)]];
+        apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
+        assert_eq!(alns[0][0].ref_id, 0, "a primary-assembly primary is left alone");
+
+        // ALT primary whose only primary-assembly hit covers a different read region.
+        let mut alns = vec![vec![aln(1, 70, 0, 70, false), aln(0, 70, 80, 150, false)]];
+        apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
+        assert_eq!(alns[0][0].ref_id, 1, "disjoint segments are not alternatives");
     }
 }
 

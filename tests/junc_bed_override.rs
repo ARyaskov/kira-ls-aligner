@@ -58,6 +58,7 @@ fn two_exon_chain() -> (Vec<u8>, ReadRecord, Chain) {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     };
     let chain = Chain {
         ref_id: 0,

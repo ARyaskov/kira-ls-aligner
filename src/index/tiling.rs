@@ -74,8 +74,7 @@ pub fn plan_tiles(reference: &Reference, target_bytes: u64) -> TilePlan {
         }
 
         if contig_bytes > target && acc_bytes == 0 {
-            eprintln!(
-                "[KIRA_TILE] warning: contig {:?} ({} bp) exceeds --tile-bytes ({}) — \
+            crate::kira_warn!("[KIRA_TILE] warning: contig {:?} ({} bp) exceeds --tile-bytes ({}) — \
                  making it a singleton tile",
                 reference.sequences[i].name, contig_bytes, target
             );

@@ -18,6 +18,18 @@ pub struct ScoredBatch {
 
 /// Run stage 5 (MAPQ assignment + primary selection).
 pub fn run(input: AlignBatch, cfg: MapqConfig, pair_ctx: Option<PairMapqContext>) -> ScoredBatch {
+    run_with_primary_policy(input, cfg, pair_ctx, false)
+}
+
+/// [`run`] with `preserve_primary` forcing slot 0 to stay primary for
+/// unpaired reads too — needed when an earlier stage chose the primary on
+/// grounds other than score (bwa-mem `-5`: smallest read coordinate).
+pub fn run_with_primary_policy(
+    input: AlignBatch,
+    cfg: MapqConfig,
+    pair_ctx: Option<PairMapqContext>,
+    preserve_primary: bool,
+) -> ScoredBatch {
     let reads = input.reads;
     let mut alignments = input.alignments;
     let unmapped_mate_info = input.unmapped_mate_info;
@@ -27,7 +39,7 @@ pub fn run(input: AlignBatch, cfg: MapqConfig, pair_ctx: Option<PairMapqContext>
         .par_iter_mut()
         .zip(reads.par_iter())
         .for_each(|(alns, read)| {
-            if read.pair_role == PairRole::Unpaired {
+            if read.pair_role == PairRole::Unpaired && !preserve_primary {
                 assign_mapq_with_qual(
                     alns,
                     read.seq.len(),

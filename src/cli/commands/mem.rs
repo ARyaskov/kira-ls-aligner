@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::aligner_core::{Aligner, AlignerConfig};
 use crate::alignment::AlignmentConfig;
 use crate::chaining::ChainingConfig;
-use crate::index::IndexConfig;
+use crate::index::{Index, IndexConfig};
 use std::sync::Arc;
 
 use crate::alignment::junc_bed::JunctionIndex;
@@ -124,6 +124,7 @@ pub fn build_short_pe_aligner(
         short_read_len: 500,
         mapq_cap_short: 60,
         mapq_cap_long: 60,
+        alt_mask: None,
     };
 
     let (paired_mode, _auto) = resolve_paired_mode(p.paired, p.interleaved, p.n_read_files)?;
@@ -160,6 +161,11 @@ pub fn build_short_pe_aligner(
         output: OutputConfig::full(),
         paired: paired_cfg,
         splice: SpliceConfig::default(),
+        min_output_score: 30,
+        skip_mate_rescue: false,
+        skip_pairing: false,
+        primary_5p: false,
+        alt_mask: None,
     };
 
     let mut header = HeaderConfig::default();
@@ -181,6 +187,8 @@ pub fn build_short_pe_aligner(
         header: Some(header),
         junctions: None,
         junc_bed_tolerance: 2,
+        keep_comment: false,
+        alt_contigs: load_alt_contigs(&p.reference, false)?,
     };
 
     let resolved_index = p.index.clone().or_else(|| {
@@ -192,11 +200,31 @@ pub fn build_short_pe_aligner(
 }
 
 pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
+    crate::log::set_verbosity(args.verbosity);
+    // Tuning-knob overrides go into the environment before anything reads a
+    // knob: every `KIRA_*` is a lazily initialised `OnceLock`, and nothing has
+    // touched one yet at this point.
+    apply_knob_overrides(args.config.as_deref(), &args.set)?;
+    let ignored = args.ignored_compat_flags();
+    if !ignored.is_empty() {
+        crate::kira_warn!(
+            "[KIRA] note: bwa-mem flags accepted without effect: {}",
+            ignored.join(" ")
+        );
+    }
+
     if let Some(rg) = args.read_group.as_deref() {
         if rg.contains("\\t") {
             args.read_group = Some(rg.replace("\\t", "\t"));
         }
     }
+    let max_alignments = if args.output_all {
+        // bwa-mem `-a`: report every alignment found. Stage 4 keeps at most
+        // `max_chains` (5) candidates, so that is the ceiling worth asking for.
+        args.max_alignments.max(5)
+    } else {
+        args.max_alignments
+    };
 
     let preset = args.preset.to_lowercase();
     let short_preset = preset == "short";
@@ -274,7 +302,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         gap_open: args.gap_open,
         gap_extend: args.gap_extend,
         bandwidth,
-        xdrop: 100,
+        xdrop: args.xdrop,
         clip_penalty: args.clip_penalty,
     };
 
@@ -282,6 +310,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         short_read_len: args.long_read_threshold,
         mapq_cap_short: 60,
         mapq_cap_long: 60,
+        alt_mask: None,
     };
 
     let (short_chaining, short_align, short_dp_topk) = if preset == "long" {
@@ -304,7 +333,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
                 bandwidth: 50,
-                xdrop: 100,
+                xdrop: args.xdrop,
                 clip_penalty: args.clip_penalty,
             },
             1,
@@ -330,7 +359,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
                 bandwidth: 200,
-                xdrop: 100,
+                xdrop: args.xdrop,
                 clip_penalty: args.clip_penalty,
             },
             2,
@@ -342,19 +371,24 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     let hybrid_dp_topk = args.dp_topk;
 
     let emit_lower = args.emit.to_ascii_lowercase();
-    let output_cfg = match emit_lower.as_str() {
+    let mut output_cfg = match emit_lower.as_str() {
         "paf" => OutputConfig::paf(),
         _ if args.fast_output => OutputConfig::fast(),
         _ => OutputConfig::full(),
     };
+    if emit_lower != "paf" {
+        output_cfg.split_as_secondary = args.mark_split_secondary;
+        output_cfg.soft_clip_supplementary = args.soft_clip_supplementary;
+        output_cfg.xa_max = args.xa_max;
+        output_cfg.append_comment = args.append_comment;
+    }
 
     let accept_enable = resolve_accept_enable(args.accept_enable, args.fast_output);
 
     let (paired_mode, auto_detected_pe) =
         resolve_paired_mode(args.paired, args.interleaved, args.reads.len())?;
     if auto_detected_pe {
-        eprintln!(
-            "[KIRA] auto-detected 2 FASTQ inputs as paired R1+R2 (bwa-mem convention). \
+        crate::kira_info!("[KIRA] auto-detected 2 FASTQ inputs as paired R1+R2 (bwa-mem convention). \
              Pass --paired to silence this notice, or provide >2 files / 1 file for \
              single-end concatenation."
         );
@@ -406,8 +440,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
             let idx = JunctionIndex::from_bed_path(path, &reference)
                 .with_context(|| format!("parse --junc-bed {}", path.display()))?;
             if idx.is_empty() {
-                eprintln!(
-                    "[KIRA_JUNCBED] warning: 0 usable junctions loaded from {}; \
+                crate::kira_warn!("[KIRA_JUNCBED] warning: 0 usable junctions loaded from {}; \
                      splice path will rely on signal detection only",
                     path.display()
                 );
@@ -435,13 +468,18 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         debug_force_accept: args.debug_force_accept,
         debug_force_accept_n: args.debug_force_accept_n,
         long_read_threshold: args.long_read_threshold,
-        max_alignments: args.max_alignments,
+        max_alignments,
         min_chain_ratio: args.min_chain_ratio,
         short_preset,
         mapq: mapq_cfg,
         output: output_cfg,
         paired: paired_cfg,
         splice: splice_cfg,
+        min_output_score: args.min_score,
+        skip_mate_rescue: args.skip_mate_rescue,
+        skip_pairing: args.skip_pairing,
+        primary_5p: args.primary_5p,
+        alt_mask: None,
     };
 
     let auto_profiles = if auto_preset {
@@ -493,6 +531,28 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     for pg in &args.pg {
         header.pg_lines.push(pg.clone());
     }
+    for item in &args.header_insert {
+        header.extra_lines.extend(header_insert_lines(item)?);
+    }
+    if !args.no_pg {
+        // Provenance the `@PG CL` cannot carry: the tuning knobs in force and
+        // the effective pipeline parameters. With these a BAM header alone
+        // reproduces the run.
+        let knobs: Vec<String> = {
+            let mut v: Vec<(String, String)> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("KIRA_"))
+                .collect();
+            v.sort();
+            v.into_iter().map(|(k, val)| format!("{k}={val}")).collect()
+        };
+        if !knobs.is_empty() {
+            header.co_lines.push(format!("kira-env:{}", knobs.join(" ")));
+        }
+        header.co_lines.push(format!(
+            "kira-config:{}",
+            crate::aligner_core::config_fingerprint(&pipeline_cfg, args.threads, args.batch_bases)
+        ));
+    }
     for co in &args.co {
         header.co_lines.push(co.clone());
     }
@@ -509,6 +569,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         header: Some(header),
         junctions: junctions_arc.clone(),
         junc_bed_tolerance: args.junc_bed_tolerance,
+        keep_comment: args.append_comment,
+        alt_contigs: load_alt_contigs(&args.reference, args.ignore_alt)?,
     };
 
     if let Some(split_prefix) = args.split_prefix.clone() {
@@ -523,7 +585,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 args.tile_bytes
             ));
         }
-        if matches!(emit_lower.as_str(), "bam" | "sorted-bam") {
+        if super::emit::EmitKind::parse(&emit_lower).is_some() {
             return Err(anyhow::anyhow!(
                 "--split-prefix with --emit {} is not yet supported; emit SAM and convert externally",
                 emit_lower
@@ -536,8 +598,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     let resolved_index: Option<std::path::PathBuf> = if splice_preset {
         if args.index.is_some() {
-            eprintln!(
-                "[KIRA] warning: --index is being ignored in splice mode \
+            crate::kira_warn!("[KIRA] warning: --index is being ignored in splice mode \
                  (k/w mismatch would produce zero alignments). Building \
                  a fresh splice-tuned index in memory."
             );
@@ -547,8 +608,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         args.index.clone().or_else(|| {
             let candidate = args.reference.with_extension("kiraidx");
             if candidate.is_file() {
-                eprintln!(
-                    "[KIRA] auto-detected sidecar index {} for {}",
+                crate::kira_info!("[KIRA] auto-detected sidecar index {} for {}",
                     candidate.display(),
                     args.reference.display()
                 );
@@ -560,116 +620,165 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     };
 
     let emit = emit_lower.as_str();
-    let want_bam = matches!(emit, "bam" | "sorted-bam");
-    let want_sort = emit == "sorted-bam";
-    if !matches!(emit, "" | "sam" | "paf" | "bam" | "sorted-bam") {
+    let fused_kind = super::emit::EmitKind::parse(emit);
+    if fused_kind.is_none() && !matches!(emit, "" | "sam" | "paf") {
         return Err(anyhow::anyhow!(
-            "unknown --emit value {:?} (accepted: sam, paf, bam, sorted-bam)",
+            "unknown --emit value {:?} (accepted: sam, paf, bam, sorted-bam, cram, sorted-cram)",
             args.emit
         ));
     }
 
-    if !want_bam {
+    let Some(kind) = fused_kind else {
         return if let Some(index_path) = resolved_index.as_ref() {
             aligner.run_with_index_file(index_path, &args.reads, args.output.as_ref())
         } else {
             aligner.run(&args.reference, &args.reads, args.output.as_ref())
         };
-    }
+    };
 
     let final_path = args
         .output
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("--emit bam/sorted-bam requires -o <out.bam>"))?;
-
-    let tmp_dir = final_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
-    let tmp = tempfile::Builder::new()
-        .prefix("kira-ls-aligner-")
-        .suffix(".sam")
-        .tempfile_in(&tmp_dir)
-        .with_context(|| format!("create tmp SAM in {}", tmp_dir.display()))?;
-    let tmp_path = tmp.into_temp_path();
-    let tmp_sam: std::path::PathBuf = (&tmp_path as &std::path::Path).to_path_buf();
-
-    eprintln!(
-        "[KIRA] --emit {} → writing intermediate SAM to {}",
-        emit,
-        tmp_sam.display()
-    );
-
-    if let Some(index_path) = resolved_index.as_ref() {
-        aligner.run_with_index_file(index_path, &args.reads, Some(&tmp_sam))?;
-    } else {
-        aligner.run(&args.reference, &args.reads, Some(&tmp_sam))?;
+        .ok_or_else(|| anyhow::anyhow!("--emit {emit} requires -o <output>"))?;
+    if kind.is_cram()
+        && !final_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cram"))
+    {
+        return Err(anyhow::anyhow!(
+            "--emit {emit} requires the output path to end in .cram (got {})",
+            final_path.display()
+        ));
+    }
+    if args.markdup && !kind.is_sorted() {
+        crate::kira_warn!("[KIRA] warning: --markdup requires --emit sorted-bam/sorted-cram; skipping");
     }
 
-    eprintln!("[KIRA] aligner done, converting via kira-bam...");
+    // The fused path drives the pipeline itself, so it needs the index in hand.
+    let index = match resolved_index.as_ref() {
+        Some(p) => Index::load(p).with_context(|| format!("load index {}", p.display()))?,
+        None => {
+            let reference = read_reference(&args.reference).context("load reference")?;
+            Index::build(reference, index_cfg)
+        }
+    };
 
-    if want_sort {
-        kira_bam::sort::run(kira_bam::cli::SortArgs {
-            input: tmp_sam.clone(),
-            output: Some(final_path.clone()),
-            name_sort: false,
+    super::emit::run_fused(
+        &aligner,
+        index,
+        &args.reads,
+        super::emit::EmitOptions {
+            kind,
+            output: final_path,
+            reference: args.reference.clone(),
             threads: args.threads,
-            memory: "auto".to_string(),
-            tmpdir: None,
-            uncompressed: false,
-            compression_level: None,
-            require_flags: 0,
-            filter_flags: 0,
-            no_pg: false,
-            reference: None,
-            markdup: args.markdup,
-            markdup_barcode_tag: None,
-            markdup_mode_ancient: false,
-        })?;
-    } else {
-        kira_bam::view::run(kira_bam::cli::ViewArgs {
-            input: tmp_sam.clone(),
-            regions: Vec::new(),
-            exclude_regions: Vec::new(),
-            output: Some(final_path.clone()),
-            bam: true,
-            sam: false,
-            uncompressed: false,
-            with_header: true,
-            header_only: false,
-            require_flags: 0,
-            filter_flags: 0,
-            min_mapq: 0,
-            threads: args.threads,
-            count: false,
-            drop_tags: false,
-            no_pg: false,
-            cram: false,
-            reference: None,
-        })?;
-        if args.markdup {
-            eprintln!("[KIRA] warning: --markdup requires sorted input; skipping");
+            markdup: args.markdup && kind.is_sorted(),
+            bai: args.bai,
+            sort_memory: args.sort_memory.clone(),
+            no_pg: args.no_pg,
+        },
+    )
+}
+
+/// Apply `--config FILE` then `--set KEY=VALUE` to the process environment.
+///
+/// Only `KIRA_*` names are accepted: the file is a knob file, not a general
+/// environment, and a typo should fail loudly rather than set a dead variable.
+fn apply_knob_overrides(config: Option<&std::path::Path>, sets: &[String]) -> Result<()> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(path) = config {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read --config {}", path.display()))?;
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (k, v) = line.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}:{}: expected KIRA_KNOB=value, got {:?}",
+                    path.display(),
+                    lineno + 1,
+                    raw
+                )
+            })?;
+            pairs.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-
-    if args.bai {
-        kira_bam::index::run(kira_bam::cli::IndexArgs {
-            input: final_path.clone(),
-            output: None,
-            bai: true,
-            csi: false,
-            min_shift: 14,
-            depth: 5,
-            threads: args.threads,
-        })?;
+    for s in sets {
+        let (k, v) = s
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set expects KIRA_KNOB=value, got {s:?}"))?;
+        pairs.push((k.trim().to_string(), v.trim().to_string()));
     }
-
-    drop(tmp_path);
-    eprintln!("[KIRA] BAM pipeline complete → {}", final_path.display());
+    for (k, v) in pairs {
+        if !k.starts_with("KIRA_") || k.len() <= 5 {
+            return Err(anyhow::anyhow!(
+                "tuning knob {k:?} must be a KIRA_* name (see README, \"Tuning knobs\")"
+            ));
+        }
+        // SAFETY: called from `cmd_mem` before any worker thread exists —
+        // argument parsing is the only thing that has run — so no other
+        // thread can be reading the environment concurrently.
+        unsafe { std::env::set_var(&k, &v) };
+    }
     Ok(())
+}
+
+/// `REF.alt` (bwa-mem convention, shipped with the GRCh38 full analysis set):
+/// a SAM-format file whose QNAMEs are the ALT contigs. Absent file ⇒ no ALT
+/// handling; `-j` skips it.
+fn load_alt_contigs(
+    reference: &std::path::Path,
+    ignore: bool,
+) -> Result<Option<Arc<std::collections::HashSet<String>>>> {
+    let mut alt = reference.as_os_str().to_os_string();
+    alt.push(".alt");
+    let alt = std::path::PathBuf::from(alt);
+    if ignore || !alt.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&alt)
+        .with_context(|| format!("read ALT contig file {}", alt.display()))?;
+    let names: std::collections::HashSet<String> = text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('@'))
+        .filter_map(|l| l.split('\t').next())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        crate::kira_warn!("[KIRA] warning: {} lists no ALT contigs", alt.display());
+        return Ok(None);
+    }
+    crate::kira_info!("[KIRA] {} ALT contigs from {}", names.len(), alt.display());
+    Ok(Some(Arc::new(names)))
+}
+
+/// bwa-mem `-H STR|FILE`: header lines to insert verbatim. A value starting
+/// with `@` is one line (literal `\t` becomes a tab); anything else is a file
+/// of such lines.
+fn header_insert_lines(item: &str) -> Result<Vec<String>> {
+    if let Some(rest) = item.strip_prefix('@') {
+        return Ok(vec![format!("@{}", rest.replace("\\t", "\t"))]);
+    }
+    let text = std::fs::read_to_string(item)
+        .with_context(|| format!("read -H header file {item}"))?;
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            if l.starts_with('@') {
+                Ok(l.to_string())
+            } else {
+                Err(anyhow::anyhow!(
+                    "-H {item}: header lines must start with '@', got {l:?}"
+                ))
+            }
+        })
+        .collect::<Result<_>>()?;
+    Ok(lines)
 }
 
 /// Split-prefix entry point.
@@ -687,8 +796,7 @@ fn run_split_prefix(
         ));
     }
     if tile_plan.is_trivial() {
-        eprintln!(
-            "[KIRA_TILE] note: reference fits in a single tile ({} bytes ≤ tile-bytes {}). \
+        crate::kira_info!("[KIRA_TILE] note: reference fits in a single tile ({} bytes ≤ tile-bytes {}). \
              Tiled pipeline still runs but it's equivalent to the single-pass path.",
             tile_plan.tiles[0].total_bytes, args.tile_bytes
         );

@@ -135,10 +135,16 @@ fn full_pipeline_cfg() -> PipelineConfig {
             short_read_len: 300,
             mapq_cap_short: 60,
             mapq_cap_long: 60,
+            alt_mask: None,
         },
         output: OutputConfig::full(),
         paired,
         splice: SpliceConfig::default(),
+        min_output_score: i32::MIN,
+        skip_mate_rescue: false,
+        skip_pairing: false,
+        primary_5p: false,
+        alt_mask: None,
     }
 }
 

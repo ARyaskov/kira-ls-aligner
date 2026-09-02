@@ -32,7 +32,7 @@ pub fn start() -> Result<(), CudaError> {
             let mut backend = match CudaBackend::new() {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("[KIRA_GPU_DISPATCHER] init failed: {e}");
+                    crate::kira_info!("[KIRA_GPU_DISPATCHER] init failed: {e}");
                     while let Ok((_, reply)) = rx.recv() {
                         let _ = reply.send(Err(CudaError::Driver(format!(
                             "GPU worker thread is dead: {e}"
@@ -69,7 +69,7 @@ pub fn dispatch(jobs: Vec<CudaJob>) -> Option<Vec<CudaResult>> {
     match reply_rx.recv() {
         Ok(Ok(results)) => Some(results),
         Ok(Err(e)) => {
-            eprintln!("[KIRA_GPU_DISPATCHER] batch failed: {e}");
+            crate::kira_info!("[KIRA_GPU_DISPATCHER] batch failed: {e}");
             None
         }
         Err(_) => None, // worker disappeared

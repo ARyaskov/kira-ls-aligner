@@ -11,6 +11,7 @@ pub mod eval;
 pub mod exec;
 pub mod index;
 pub mod io;
+pub mod log;
 pub mod mapq;
 pub mod pipeline;
 pub mod seeding;

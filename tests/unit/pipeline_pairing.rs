@@ -33,6 +33,7 @@ fn dummy_read(id: &str, role: PairRole) -> ReadRecord {
         qual: None,
         pair_role: role,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 

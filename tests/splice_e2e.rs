@@ -80,6 +80,7 @@ fn two_exon_alignment_emits_n_op_and_forward_xs_strand() {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     };
 
     // Hand-crafted two-anchor chain — one anchor per exon. In a real
@@ -174,6 +175,7 @@ fn small_gap_below_min_intron_stays_as_d_op() {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     };
 
     let chain = Chain {
@@ -250,6 +252,7 @@ fn non_canonical_signal_with_require_emits_d_not_n() {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     };
 
     let chain = Chain {

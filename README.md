@@ -2,8 +2,6 @@
 
 `kira-ls-aligner` is a unified short- and long-read sequence aligner written in Rust 2024. It combines minimap2-style minimizers and chaining with BWA-MEM2-style exact-match anchoring and output semantics. The goal is drop-in compatibility with bwa-mem pipelines while supporting long reads efficiently.
 
-**We are in progress now. Please don't use this aligner for real tasks!**
-
 ## Features
 
 - Multi-resolution minimizer index for short and long reads.
@@ -140,39 +138,94 @@ set (alternating arms, minimum per stage) use this plus `KIRA_STATS=1`.
 [EVAL] mapq>=13: correct=... wrong=... precision=..% recall_of_correct=..%
 ```
 
-## CLI Options (bwa-mem compatible subset)
+## CLI Options (bwa-mem compatible)
+
+The `mem` command line is a drop-in for `bwa mem`: the flags below carry
+bwa-mem's letters and meanings, an unmodified `bwa mem` invocation parses, and
+reads may come from stdin (`-`, plain or gzip). Flags bwa-mem has for
+heuristics this pipeline does not run (`-r -y -D -W -m -U -e -c -j`) are
+accepted without effect and listed once on stderr.
 
 - `index REF` : Build a minimizer index.
-- `mem REF READS...` : Align reads to reference (one or more FASTQ/FASTA files).
+- `mem REF READS...` : Align reads (one or more FASTQ/FASTA files, or `-`).
 - `eval SAM` : Evaluate placement accuracy against truth-in-name read ids (simulation regression tool).
 - `--index` : Use a prebuilt index file (REF is kept for bwa-mem compatibility).
+- `-o, --output` : Output path (stdout if omitted).
+- `--emit` : `sam` (default), `paf`, `bam`, `sorted-bam`, `cram`, `sorted-cram`. See [Output formats](#output-formats).
+- `-t, --threads` : Number of threads.
+- `-K, --batch` : Batch size in bases.
+- `-p` : Smart pairing — the single input is interleaved R1/R2 (bwa-mem `-p`). Two inputs are R1/R2 files automatically; `--paired` states it explicitly.
+- `-R, --read-group` : Read group line (e.g. `ID:rg1\tSM:sample`).
+- `-H STR|FILE` : Insert header lines (a `@…` string or a file of them).
+- `-C` : Append the FASTQ comment to each record (keeps `BC:Z:`/`RX:Z:` from the demultiplexer).
+- `-v INT` : Verbosity, 1 errors … 3 messages (default) … 4 debug.
+- `-T INT` : Minimum alignment score to output (30).
+- `-a` : Output all found alignments (secondaries included).
+- `-h INT[,INT]` : Emit `XA` only when the read has at most INT close secondary hits (5). `XA` needs secondaries to exist, i.e. `--dp-topk 2` or `-a`.
+- `-M` : Flag supplementary segments as secondary (0x100) for Picard-era tools.
+- `-Y` : Soft-clip supplementary segments; the default hard-clips them, as bwa-mem does.
+- `-5` : For a split read, the segment with the smallest read coordinate is primary.
+- `-S` / `-P` : Skip mate rescue / skip pairing.
+- `-A -B -O -E -L -d` : Match, mismatch, gap open, gap extend, clip penalty, z-dropoff. `-O`/`-E`/`-L` accept bwa's `INT,INT` form (first value applies).
+- `-k, --seed-len` / `-w, --window-len` : Seed length and minimizer window (note: bwa-mem's `-w` is a band width).
+- `-x, --preset` : `short`, `long`, or `auto` (default; auto-selects mode at runtime).
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
 - `--accept-enable` : Override the ungapped ACCEPT shortcut.
 - `--seed-occ-cap` : Maximum reference occurrences retained per read minimizer.
 - `--min-chain-ratio` : Keep chains within this score ratio of the best chain.
-- `-t, --threads` : Number of threads.
-- `-k, --seed-len` : Seed length (overrides preset).
-- `-w, --window-len` : Minimizer window length (overrides preset).
-- `-A` : Match score.
-- `-B` : Mismatch penalty.
-- `-O` : Gap open penalty.
-- `-E` : Gap extend penalty.
-- `-K, --batch` : Batch size in bases.
-- `-x, --preset` : `short`, `long`, or `auto` (default; auto-selects mode at runtime).
 - `--long-threshold` : Read length cutoff for long-read settings.
-- `-R, --read-group` : Read group line (e.g. `ID:rg1\tSM:sample`).
-- `-o, --output` : Output SAM path (stdout if omitted).
+- `--config FILE` / `--set KIRA_KNOB=value` : Tuning knobs (below) from a file or the command line, recorded in the header.
+
+Every record of a paired run carries `MC:Z` / `MQ:i` / `ms:i` (the mate's
+CIGAR, MAPQ and score — what `samtools fixmate -m` adds), so
+`samtools markdup` runs directly on the output.
+
+### Output formats
+
+`--emit bam|sorted-bam|cram|sorted-cram` streams alignment batches straight
+into the embedded kira-bam writer — no intermediate SAM file. `sorted-*` sorts
+in memory within `--sort-memory` (default a quarter of RAM) and fuses
+`--markdup` into that pass; a run that outgrows the budget spills to an
+unsorted BAM beside the output and finishes with kira-bam's external sort.
+`--bai` indexes BAM output. CRAM uses `REF` and builds `REF.fai` if missing.
+
+```bash
+kira_ls_aligner mem ref.fa R1.fq.gz R2.fq.gz -t 16 --emit sorted-bam --markdup --bai -o out.bam
+```
+
+### ALT contigs (GRCh38 full analysis set)
+
+If `REF.alt` exists next to the reference (the bwa-mem convention; shipped
+with `GRCh38_full_analysis_set_plus_decoy_hla.fa`), its contigs are ALT:
+
+- a primary-assembly placement is not made ambiguous by its ALT copies —
+  competitors on ALT contigs are left out of the MAPQ model unless the read's
+  own best hit is on an ALT contig;
+- a read whose best hit is on an ALT contig but which has a primary-assembly
+  hit within one mismatch is reported on the primary assembly (`bwa-postalt`).
+
+`-j` ignores the file. On a synthetic ALT copy at 0.5 % divergence this takes
+primary-assembly reads from 0 to 96.9 % at MAPQ 60.
+
+### Provenance
+
+Unless `--no-PG`, the header records what the `@PG CL` cannot: every `KIRA_*`
+knob in force (`@CO kira-env:…`) and the effective pipeline parameters
+(`@CO kira-config:…`). A run is reproducible from its BAM header alone.
 
 ### Tuning knobs (environment)
 
 Defaults are what the numbers below were measured with; each knob exists so the
-default can be A/B'd without a rebuild.
+default can be A/B'd without a rebuild. Set them in the environment, with
+`--set`, or in a `--config` file of `KIRA_KNOB=value` lines.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `KIRA_LEFT_NORM` | on | Left-normalize indel placement in emitted CIGARs (GATK `LeftAlignIndels` / `bcftools norm` convention) so equivalent gap placements emit identical CIGARs. `0`/`off` emits traceback-native CIGARs. |
-| `KIRA_MAPQ_MULT` | 6.585 | Multiplicity penalty slope on competing loci: MAPQ drops by `γ·ln(n)` when `n` above-floor competitors exist (bwa-mem `mem_approx_mapq_se` term). `0` disables. |
-| `KIRA_MAPQ_BETA` | 22.5 | Slope of the MAPQ score-gap posterior model; sweep against `kira_ls_aligner eval` output on truth-in-name simulations to calibrate. |
+| `KIRA_LEFT_NORM` | on | Left-normalize indel placement in emitted CIGARs (GATK `LeftAlignIndels` / `bcftools norm` convention) so equivalent gap placements emit identical CIGARs. `0`/`off` emits traceback-native CIGARs. On truth-in-name simulations this took canonical indel CIGARs from 55 % to 92 % of indel-bearing reads. |
+| `KIRA_MAPQ_MULT` | 0 (off) | Multiplicity penalty slope on competing loci: MAPQ drops by `γ·ln(n)` when `n` above-floor competitors exist (bwa-mem `mem_approx_mapq_se`, γ = 6.585). Off because on the simulations every read it demoted was correctly placed — wrong-locus reads already sit below MAPQ 13 through the score-gap term. |
+| `KIRA_MAPQ_BETA` | 22.5 | Slope of the MAPQ score-gap posterior model. Swept 10–60 on a truth-in-name PE simulation: the MAPQ ≥ 13 trade-off is flat above 15 and MAPQ ≥ 30 carries a 0.1 % empirical mismap rate at 22.5, i.e. the default is calibrated. |
+| `KIRA_PAIR_BONUS_ALL` | off | Give the pair-concordance bonus to every alignment that forms a concordant pair, not only the winning pair, so a read whose mates are concordant at two loci scores as a tie (MAPQ 0) instead of MAPQ 20 on the tie-break. Off because on GIAB chr20 that tie-break is right ~72 % of the time and at the caller's MAPQ ≥ 13 floor keeping those reads is +61 true SNPs for +30 false (F1 0.9789 vs 0.9787); `1` for precision-first pipelines. |
+| `KIRA_AMBIG_DIV` | 5 | A runner-up chain within `best / DIV` of the best marks the read ambiguous and buys it a competing DP placement for MAPQ evidence. Smaller widens the band. |
 | `KIRA_MATE_GUIDE` | on | Promote the candidate locus that has a plausible mate partner, when exactly one candidate has one. `0` disables. |
 | `KIRA_ANCHOR_CAP_K` | on | Never require an anchor to be longer than the seed length `k`. `0` restores the old `min_anchor_len` behaviour. |
 | `KIRA_TWOTIER` | on | Rank ambiguous candidate loci by bounded Myers edit cost instead of chain score. |

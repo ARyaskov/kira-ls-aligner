@@ -138,26 +138,23 @@ fn ac_should_run(total_ref_bp: u64, batch_bases: u64) -> bool {
         let thr = ac_max_ref_bp() / 1_000_000;
         let batch_mb = batch_bases as f64 / 1e6;
         match mode {
-            AcMode::Auto if run => eprintln!(
-                "[KIRA_AC] auto: ENABLED (reference {mb:.1} Mbp ≤ {thr} Mbp; per-batch scan \
+            AcMode::Auto if run => crate::kira_info!("[KIRA_AC] auto: ENABLED (reference {mb:.1} Mbp ≤ {thr} Mbp; per-batch scan \
                  {:.1} Mbp ≤ {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp)",
                 scan_bp as f64 / 1e6,
             ),
-            AcMode::Auto if total_ref_bp > ac_max_ref_bp() => eprintln!(
-                "[KIRA_AC] auto: DISABLED (reference {mb:.1} Mbp > {thr} Mbp) — using indexed \
+            AcMode::Auto if total_ref_bp > ac_max_ref_bp() => crate::kira_info!("[KIRA_AC] auto: DISABLED (reference {mb:.1} Mbp > {thr} Mbp) — using indexed \
                  path. Force on: KIRA_AC_DISABLE=0; raise gate: KIRA_AC_MAX_REF_MB."
             ),
-            AcMode::Auto => eprintln!(
-                "[KIRA_AC] auto: DISABLED (per-batch scan {:.1} Mbp exceeds \
+            AcMode::Auto => crate::kira_info!("[KIRA_AC] auto: DISABLED (per-batch scan {:.1} Mbp exceeds \
                  {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp — the rescan would cost \
                  more than the seeding it saves) — using indexed path. Force on: \
                  KIRA_AC_DISABLE=0; or raise -K to enlarge batches.",
                 scan_bp as f64 / 1e6,
             ),
             AcMode::ForceOn => {
-                eprintln!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0), reference {mb:.1} Mbp")
+                crate::kira_info!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0), reference {mb:.1} Mbp")
             }
-            AcMode::ForceOff => eprintln!("[KIRA_AC] forced OFF (KIRA_AC_DISABLE=1)"),
+            AcMode::ForceOff => crate::kira_info!("[KIRA_AC] forced OFF (KIRA_AC_DISABLE=1)"),
         }
     });
     run

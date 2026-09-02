@@ -52,8 +52,7 @@ impl JunctionIndex {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!(
-                        "[KIRA_JUNCBED] warning: read error on line {}: {}",
+                    crate::kira_warn!("[KIRA_JUNCBED] warning: read error on line {}: {}",
                         lineno + 1,
                         e
                     );
@@ -76,8 +75,7 @@ impl JunctionIndex {
 
             let cols: Vec<&str> = trimmed.split('\t').collect();
             if cols.len() < 3 {
-                eprintln!(
-                    "[KIRA_JUNCBED] warning: line {} has <3 columns, skipping: {:?}",
+                crate::kira_warn!("[KIRA_JUNCBED] warning: line {} has <3 columns, skipping: {:?}",
                     lineno + 1,
                     trimmed
                 );
@@ -95,8 +93,7 @@ impl JunctionIndex {
             let chrom_start: u32 = match cols[1].parse() {
                 Ok(v) => v,
                 Err(_) => {
-                    eprintln!(
-                        "[KIRA_JUNCBED] warning: line {} bad chromStart, skipping",
+                    crate::kira_warn!("[KIRA_JUNCBED] warning: line {} bad chromStart, skipping",
                         lineno + 1
                     );
                     idx.n_skipped += 1;
@@ -106,8 +103,7 @@ impl JunctionIndex {
             let chrom_end: u32 = match cols[2].parse() {
                 Ok(v) => v,
                 Err(_) => {
-                    eprintln!(
-                        "[KIRA_JUNCBED] warning: line {} bad chromEnd, skipping",
+                    crate::kira_warn!("[KIRA_JUNCBED] warning: line {} bad chromEnd, skipping",
                         lineno + 1
                     );
                     idx.n_skipped += 1;
@@ -130,8 +126,7 @@ impl JunctionIndex {
                 let block_count: usize = match cols[9].parse() {
                     Ok(v) => v,
                     Err(_) => {
-                        eprintln!(
-                            "[KIRA_JUNCBED] warning: line {} bad blockCount, skipping",
+                        crate::kira_warn!("[KIRA_JUNCBED] warning: line {} bad blockCount, skipping",
                             lineno + 1
                         );
                         idx.n_skipped += 1;
@@ -145,8 +140,7 @@ impl JunctionIndex {
                 let sizes: Vec<u32> = match parse_csv_u32(cols[10]) {
                     Some(v) => v,
                     None => {
-                        eprintln!(
-                            "[KIRA_JUNCBED] warning: line {} bad blockSizes, skipping",
+                        crate::kira_warn!("[KIRA_JUNCBED] warning: line {} bad blockSizes, skipping",
                             lineno + 1
                         );
                         idx.n_skipped += 1;
@@ -156,8 +150,7 @@ impl JunctionIndex {
                 let starts: Vec<u32> = match parse_csv_u32(cols[11]) {
                     Some(v) => v,
                     None => {
-                        eprintln!(
-                            "[KIRA_JUNCBED] warning: line {} bad blockStarts, skipping",
+                        crate::kira_warn!("[KIRA_JUNCBED] warning: line {} bad blockStarts, skipping",
                             lineno + 1
                         );
                         idx.n_skipped += 1;
@@ -165,8 +158,7 @@ impl JunctionIndex {
                     }
                 };
                 if sizes.len() != block_count || starts.len() != block_count {
-                    eprintln!(
-                        "[KIRA_JUNCBED] warning: line {} block list length mismatch, skipping",
+                    crate::kira_warn!("[KIRA_JUNCBED] warning: line {} block list length mismatch, skipping",
                         lineno + 1
                     );
                     idx.n_skipped += 1;
@@ -192,8 +184,7 @@ impl JunctionIndex {
                 }
             }
         }
-        eprintln!(
-            "[KIRA_JUNCBED] loaded {} junctions from {} record(s); {} line(s) skipped",
+        crate::kira_info!("[KIRA_JUNCBED] loaded {} junctions from {} record(s); {} line(s) skipped",
             idx.n_junctions, idx.n_lines, idx.n_skipped
         );
         Ok(idx)

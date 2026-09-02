@@ -53,6 +53,7 @@ fn mk_paired_read(id: &str, seq: Vec<u8>, role: PairRole) -> ReadRecord {
         qual: None,
         pair_role: role,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 

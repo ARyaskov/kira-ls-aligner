@@ -29,6 +29,7 @@ fn mk_read(id: &str, seq_len: usize) -> ReadRecord {
         qual: None,
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 

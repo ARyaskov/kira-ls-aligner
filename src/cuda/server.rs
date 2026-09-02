@@ -13,29 +13,27 @@ use super::dispatcher;
 
 /// Run the interactive GPU server.
 pub fn run_gpu_server(default_threads: usize, default_batch_bases: usize) -> Result<(), CudaError> {
-    eprintln!("[KIRA_GPU] Initializing CUDA backend...");
+    crate::kira_info!("[KIRA_GPU] Initializing CUDA backend...");
     let init_start = std::time::Instant::now();
     {
         let mut backend = CudaBackend::new()?;
         if let Err(e) = warmup_kernel(&mut backend) {
-            eprintln!("[KIRA_GPU] main-thread warmup launch failed: {e}");
+            crate::kira_info!("[KIRA_GPU] main-thread warmup launch failed: {e}");
         }
     } // backend dropped — context handle released for the dispatcher thread
     dispatcher::start()?;
     let warmup = init_start.elapsed();
-    eprintln!(
-        "[KIRA_GPU] CUDA ready ({}.{:03} s warmup).",
+    crate::kira_info!("[KIRA_GPU] CUDA ready ({}.{:03} s warmup).",
         warmup.as_secs(),
         warmup.subsec_millis()
     );
 
-    eprintln!(
-        "[KIRA_GPU] Enter job parameters (one per line: `ref`, `reads`, \
+    crate::kira_info!("[KIRA_GPU] Enter job parameters (one per line: `ref`, `reads`, \
          `index`, `output`, `threads`, `batch`, `read-group`). Blank line \
          submits. `quit` to exit. If `index` is omitted, `<ref>.kiraidx` \
          is auto-detected when present."
     );
-    eprintln!("[KIRA_GPU_READY]");
+    crate::kira_info!("[KIRA_GPU_READY]");
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -49,7 +47,7 @@ pub fn run_gpu_server(default_threads: usize, default_batch_bases: usize) -> Res
 
         // Quit token (any case).
         if trimmed.eq_ignore_ascii_case("quit") || trimmed.eq_ignore_ascii_case("exit") {
-            eprintln!("[KIRA_GPU] shutting down.");
+            crate::kira_info!("[KIRA_GPU] shutting down.");
             break;
         }
 
@@ -76,7 +74,7 @@ pub fn run_gpu_server(default_threads: usize, default_batch_bases: usize) -> Res
             }
             let _ = stdout.flush();
             session = Session::default();
-            eprintln!("[KIRA_GPU_READY]");
+            crate::kira_info!("[KIRA_GPU_READY]");
             continue;
         }
 
@@ -161,14 +159,12 @@ impl Session {
             .or_else(|| auto_detect_sidecar_index(&reference));
         if self.index.is_none() {
             if let Some(idx) = resolved_index.as_ref() {
-                eprintln!(
-                    "[KIRA_GPU] auto-detected sidecar index {} for {}",
+                crate::kira_info!("[KIRA_GPU] auto-detected sidecar index {} for {}",
                     idx.display(),
                     reference.display()
                 );
             } else {
-                eprintln!(
-                    "[KIRA_GPU] no sidecar index found for {}; building in-memory \
+                crate::kira_info!("[KIRA_GPU] no sidecar index found for {}; building in-memory \
                      (this may take ~15 min for hg38-sized references). Run \
                      `kira_ls_aligner index <ref>` once to skip this on future jobs.",
                     reference.display()

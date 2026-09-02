@@ -6,6 +6,20 @@ pub struct MapqConfig {
     pub short_read_len: usize,
     pub mapq_cap_short: u8,
     pub mapq_cap_long: u8,
+    /// Per-contig ALT flag (`REF.alt`, bwa-mem convention), indexed by ref id.
+    /// A primary-assembly placement is not made ambiguous by its ALT-contig
+    /// copies: competitors on ALT contigs are left out of the score-gap model
+    /// unless the primary itself sits on an ALT contig.
+    pub alt_mask: Option<&'static [bool]>,
+}
+
+impl MapqConfig {
+    /// Is `ref_id` an ALT contig under this configuration?
+    #[inline]
+    pub fn is_alt(&self, ref_id: u32) -> bool {
+        self.alt_mask
+            .is_some_and(|m| m.get(ref_id as usize).copied().unwrap_or(false))
+    }
 }
 
 /// Insert-size context used to cap MAPQ on discordant pairs.
@@ -103,9 +117,14 @@ fn assign_mapq_impl(
     // regardless of the floor) so XS and the score-gap term are unchanged.
     let sub_floor = best / SUB_FLOOR_DIVISOR;
     let mut sub_count = 0u32;
+    // ALT-aware (bwa-mem `.alt` semantics): a primary-assembly hit keeps its
+    // confidence against its own ALT-contig copies; only when the primary is
+    // itself on an ALT contig do all competitors count.
+    let primary_is_alt = cfg.is_alt(alignments[0].ref_id);
     let sub_real = alignments
         .iter()
         .skip(1)
+        .filter(|a| primary_is_alt || !cfg.is_alt(a.ref_id))
         .filter_map(|a| {
             let (read_start, read_end) = original_read_interval(a, read_len);
             if read_overlap_pct(primary_read_start, primary_read_end, read_start, read_end) >= 50 {
@@ -360,16 +379,28 @@ fn compute_mapq(best: i32, sub: i32, cap: i32, read_len: usize, sub_count: u32) 
     // best runner-up alone, and the score gap to the *second* runner-up carries
     // no extra signal once both are near-best. γ·ln(n) with bwa's γ = 6.585 by
     // default; `KIRA_MAPQ_MULT=0` disables.
-    if sub_count > 1 {
-        let pen = (mapq_mult_gamma() * (sub_count as f64).ln()).round() as i32;
-        mapq = (mapq - pen).max(0);
-    }
+    mapq = (mapq - multiplicity_penalty(sub_count, mapq_mult_gamma())).max(0);
     mapq
 }
 
-/// Multiplicity-penalty slope γ (`KIRA_MAPQ_MULT`). Default 6.585 — the value
-/// bwa-mem fits in `mem_approx_mapq_se`. Invalid/negative values fall back to
-/// the default; 0 disables the penalty.
+/// bwa-mem's multiplicity term, `round(γ·ln(n))` for `n` competing loci above
+/// the sub floor; nothing for a single competitor or γ = 0.
+pub(crate) fn multiplicity_penalty(sub_count: u32, gamma: f64) -> i32 {
+    if sub_count <= 1 || gamma <= 0.0 {
+        return 0;
+    }
+    (gamma * (sub_count as f64).ln()).round() as i32
+}
+
+/// Multiplicity-penalty slope γ (`KIRA_MAPQ_MULT`). Default 0 (off).
+///
+/// bwa-mem's `mem_approx_mapq_se` uses γ = 6.585; measured here on
+/// truth-in-name simulations (E. coli 200k SE and a 4-copy paralog family),
+/// that value demoted 136 reads, every one correctly placed and none of the
+/// wrong-locus reads — those already sit below MAPQ 13 through the score-gap
+/// term, so the multiplicity term had nothing left to remove and cost recall
+/// alone. Set `KIRA_MAPQ_MULT=6.585` to re-enable for an A/B. Invalid or
+/// negative values fall back to the default.
 fn mapq_mult_gamma() -> f64 {
     use std::sync::OnceLock;
     static GAMMA: OnceLock<f64> = OnceLock::new();
@@ -378,7 +409,7 @@ fn mapq_mult_gamma() -> f64 {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(6.585)
+            .unwrap_or(0.0)
     })
 }
 

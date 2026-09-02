@@ -32,6 +32,7 @@ fn cfg() -> MapqConfig {
         short_read_len: 300,
         mapq_cap_short: 60,
         mapq_cap_long: 60,
+        alt_mask: None,
     }
 }
 
@@ -332,27 +333,35 @@ fn single_competitor_above_floor_has_no_multiplicity_penalty() {
 }
 
 #[test]
-fn two_competitors_above_floor_apply_multiplicity_penalty() {
-    // Two strong competitors (both > floor=75): γ·ln(2) ≈ 4.56 → −5 MAPQ.
+fn extra_competitors_above_floor_do_not_change_mapq_by_default() {
+    // The multiplicity penalty defaults to off (`KIRA_MAPQ_MULT=0`): on the
+    // truth-in-name simulations it only ever demoted correctly placed reads.
+    // Two or three strong competitors therefore score like one — the
+    // best/sub gap (sub stays 120) is the whole model.
     let primary = make_aln(150, 0, 150, 0);
     let second = make_aln(120, 0, 150, 1);
     let third = make_aln(110, 0, 150, 2);
     let mut alns = vec![primary, second, third];
     assign_mapq(&mut alns, 150, cfg(), None, 1);
-    assert_eq!(alns[0].mapq, 24 - 5);
-}
+    assert_eq!(alns[0].mapq, 24);
 
-#[test]
-fn three_competitors_penalize_more_than_two() {
-    // γ·ln(3) ≈ 7.23 → −7 MAPQ against the same best/sub gap as the
-    // two-competitor case (sub stays 120).
     let primary = make_aln(150, 0, 150, 0);
     let mut alns = vec![primary];
     for (i, score) in [120, 110, 100].into_iter().enumerate() {
         alns.push(make_aln(score, 0, 150, i as u32 + 1));
     }
     assign_mapq(&mut alns, 150, cfg(), None, 1);
-    assert_eq!(alns[0].mapq, 24 - 7);
+    assert_eq!(alns[0].mapq, 24);
+}
+
+#[test]
+fn multiplicity_penalty_matches_bwa_gamma_when_enabled() {
+    // With bwa's γ = 6.585: ln(2)·γ ≈ 4.56 → 5, ln(3)·γ ≈ 7.23 → 7.
+    assert_eq!(super::multiplicity_penalty(2, 6.585), 5);
+    assert_eq!(super::multiplicity_penalty(3, 6.585), 7);
+    // A lone competitor never pays, and γ = 0 (the default) disables it.
+    assert_eq!(super::multiplicity_penalty(1, 6.585), 0);
+    assert_eq!(super::multiplicity_penalty(3, 0.0), 0);
 }
 
 #[test]

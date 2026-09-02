@@ -68,6 +68,11 @@ pub struct ReadRecord {
     /// seed also occurs elsewhere, so the placement is ambiguous (repeat/paralog).
     /// Set in seeding (stage 2); used to cap MAPQ in stage 5.
     pub repeat_min_occ: u32,
+    /// FASTQ header text after the first whitespace (bwa-mem `-C`): appended
+    /// verbatim to every SAM record of the read, so barcode/UMI tags written
+    /// by the demultiplexer (`BC:Z:…`, `RX:Z:…`) survive alignment. `None`
+    /// unless the ingest was asked to keep comments.
+    pub comment: Option<String>,
 }
 
 impl ReadRecord {
@@ -79,6 +84,7 @@ impl ReadRecord {
             qual,
             pair_role: PairRole::Unpaired,
             repeat_min_occ: 1,
+            comment: None,
         }
     }
 }

@@ -423,6 +423,19 @@ pub fn pair_rerank(
             .collect();
 
         let mut best: Option<(usize, usize, i32, i32)> = None; // (i, j, joint, bonus)
+        // With `KIRA_PAIR_BONUS_ALL=1`, every alignment that takes part in
+        // *some* concordant pairing earns the bonus, not only the winning
+        // pair's two records. MAPQ is the gap between the primary and its best
+        // competitor: when a duplicated region hosts both mates twice, both
+        // loci are concordant and the read is a tie — bonusing only the winner
+        // turns that tie into a 30-point gap and MAPQ 20. The default keeps the
+        // winner-only bonus: on GIAB HG002 chr20 the tie-break is right ~72 %
+        // of the time (seeding/two-tier order carries evidence the joint score
+        // does not), and at the caller's MAPQ ≥ 13 floor those reads are worth
+        // +61 true SNPs for +30 false (F1 0.9789 vs 0.9787). Precision-first
+        // pipelines can flip it.
+        let mut r1_bonus = vec![0i32; r1_k];
+        let mut r2_bonus = vec![0i32; r2_k];
         for (ii, a1) in r1_snap.iter().enumerate() {
             for (jj, a2) in r2_snap.iter().enumerate() {
                 let concordant = pair_is_concordant(a1, a2, cfg);
@@ -431,6 +444,10 @@ pub fn pair_rerank(
                 } else {
                     0
                 };
+                if bonus > 0 {
+                    r1_bonus[ii] = r1_bonus[ii].max(bonus);
+                    r2_bonus[jj] = r2_bonus[jj].max(bonus);
+                }
                 let joint = a1.score.saturating_add(a2.score).saturating_add(bonus);
                 if best.map(|(_, _, bs, _)| joint > bs).unwrap_or(true) {
                     best = Some((ii, jj, joint, bonus));
@@ -440,8 +457,19 @@ pub fn pair_rerank(
 
         if let Some((ii, jj, _, bonus)) = best {
             if bonus > 0 {
-                alignments[r1_idx][ii].score = alignments[r1_idx][ii].score.saturating_add(bonus);
-                alignments[r2_idx][jj].score = alignments[r2_idx][jj].score.saturating_add(bonus);
+                if pair_bonus_all_enabled() {
+                    for (a, b) in alignments[r1_idx].iter_mut().zip(&r1_bonus) {
+                        a.score = a.score.saturating_add(*b);
+                    }
+                    for (a, b) in alignments[r2_idx].iter_mut().zip(&r2_bonus) {
+                        a.score = a.score.saturating_add(*b);
+                    }
+                } else {
+                    alignments[r1_idx][ii].score =
+                        alignments[r1_idx][ii].score.saturating_add(bonus);
+                    alignments[r2_idx][jj].score =
+                        alignments[r2_idx][jj].score.saturating_add(bonus);
+                }
             }
             if promote && bonus > 0 {
                 // Lock the joint optimum into slot 0 before rescue, mate
@@ -481,6 +509,18 @@ fn pair_promote_enabled() -> bool {
         std::env::var("KIRA_PAIR_PROMOTE")
             .map(|s| s != "0" && !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("off"))
             .unwrap_or(true)
+    })
+}
+
+/// `KIRA_PAIR_BONUS_ALL` — give the concordance bonus to every alignment that
+/// forms a concordant pair, not just the winning pair's records (default off;
+/// see the comment in [`pair_rerank`]).
+fn pair_bonus_all_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KIRA_PAIR_BONUS_ALL")
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
     })
 }
 

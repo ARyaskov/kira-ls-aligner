@@ -37,11 +37,46 @@ pub struct AlignerConfig {
     pub junctions: Option<Arc<JunctionIndex>>,
     /// Position tolerance for junction lookups (`--junc-bed-tolerance`).
     pub junc_bed_tolerance: u32,
+    /// Keep each read's FASTQ comment for `-C` output.
+    pub keep_comment: bool,
+    /// Names of ALT contigs (from `REF.alt`); resolved to ref ids once the
+    /// index is loaded. `None` = no ALT handling.
+    pub alt_contigs: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 /// Aligner orchestrator.
 pub struct Aligner {
     cfg: AlignerConfig,
+}
+
+impl Aligner {
+    /// The configuration this aligner runs with.
+    pub fn config(&self) -> &AlignerConfig {
+        &self.cfg
+    }
+
+    /// Resolve the configured ALT-contig names against `index` into a
+    /// per-ref-id mask, leaked to `'static` (a bool per contig, once per run)
+    /// so the `Copy` pipeline/MAPQ configs can carry it.
+    fn alt_mask_for(&self, index: &Index) -> Option<&'static [bool]> {
+        let names = self.cfg.alt_contigs.as_ref()?;
+        let mask: Vec<bool> = index
+            .reference
+            .sequences
+            .iter()
+            .map(|s| names.contains(&s.name))
+            .collect();
+        let n_alt = mask.iter().filter(|&&b| b).count();
+        if n_alt == 0 {
+            crate::kira_warn!(
+                "[KIRA] warning: none of the {} ALT contig names in the .alt file match a reference contig; ALT handling is off",
+                names.len()
+            );
+            return None;
+        }
+        crate::kira_info!("[KIRA] ALT-aware: {n_alt} of {} contigs are ALT", mask.len());
+        Some(Box::leak(mask.into_boxed_slice()))
+    }
 }
 
 fn adjust_auto_params(
@@ -80,7 +115,9 @@ fn adjust_auto_params(
     }
 }
 
-fn config_fingerprint(cfg: &PipelineConfig, threads: usize, batch_bases: usize) -> String {
+/// One-line summary of the effective pipeline parameters — logged under
+/// `KIRA_STATS` and written to the `@CO kira-config` header line.
+pub fn config_fingerprint(cfg: &PipelineConfig, threads: usize, batch_bases: usize) -> String {
     format!(
         "threads={} batch_bases={} seed_occ_cap={} match={} mismatch={} gap_open={} gap_extend={} bandwidth={} xdrop={} dp_topk={} dp_abort_margin={} accept_enable={} accept_only_top1={} accept_span_slack={} accept_min_id={:.2} accept_max_mism={} accept_score_margin={} max_alignments={} min_chain_ratio={:.2} short_preset={} write_nm={} write_md={} write_as={} write_xs={} write_xa={} write_sa={}",
         threads,
@@ -274,24 +311,25 @@ impl Aligner {
         // users notice when the auto-detected split disagrees with what
         // they expected (e.g. a misreported hybrid CPU falling back to a
         // single pool).
-        eprintln!(
-            "[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={}",
+        crate::kira_info!("[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={}",
             pool.is_hybrid(),
             pool.p_threads(),
             pool.e_threads(),
             pool.total_threads(),
         );
 
-        let stream = ReadStream::new_multi_with_mode(
+        let stream = ReadStream::new_multi_with_opts(
             reads_paths,
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
+            self.cfg.keep_comment,
         )?;
         let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+        let alt_mask = self.alt_mask_for(&index);
+        pipeline.config.set_alt_mask(alt_mask);
         if stats_enabled {
-            eprintln!(
-                "[KIRA_CONFIG] {}",
+            crate::kira_info!("[KIRA_CONFIG] {}",
                 config_fingerprint(&pipeline.config, self.cfg.threads, self.cfg.batch_bases)
             );
         }
@@ -377,9 +415,9 @@ impl Aligner {
                         profiles.decided = Some(mode);
                         mode_selected = Some((mode, features.read_len_p50));
                         pipeline.config = profiles.select(mode);
+                pipeline.config.set_alt_mask(alt_mask);
                         if stats_enabled {
-                            eprintln!(
-                                "[KIRA_MODE] selected={:?} p50={} p90={} before first alignment batch",
+                            crate::kira_info!("[KIRA_MODE] selected={:?} p50={} p90={} before first alignment batch",
                                 mode, features.read_len_p50, features.read_len_p90
                             );
                         }
@@ -436,8 +474,7 @@ impl Aligner {
                         progress.as_ref(),
                     );
                     print_algo_counters(&format!("batch {}", batch_idx), &batch_stats.align);
-                    eprintln!(
-                        "[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
+                    crate::kira_info!("[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                         batch_idx,
                         batch_stats.seed.anchors_before_prune,
                         batch_stats.seed.anchors_after_prune,
@@ -450,8 +487,7 @@ impl Aligner {
                         batch_stats.align.dp_early_abort as f32 * 100.0
                             / batch_stats.align.dp_attempts as f32
                     };
-                    eprintln!(
-                        "[KIRA_ALIGN_STATS] batch {}: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
+                    crate::kira_info!("[KIRA_ALIGN_STATS] batch {}: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
                         batch_idx,
                         (batch_stats.align.prefilter_accept as f32 * 100.0
                             / batch_stats.align.reads.max(1) as f32),
@@ -504,8 +540,7 @@ impl Aligner {
             );
             print_algo_counters("summary", &align_total);
             print_cascade_summary(&align_total);
-            eprintln!(
-                "[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
+            crate::kira_info!("[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                 seed_total_before, seed_total_after, chain_total_used, chain_total_pruned,
             );
             let dp_rate = if align_total.dp_attempts == 0 {
@@ -513,8 +548,7 @@ impl Aligner {
             } else {
                 align_total.dp_early_abort as f32 * 100.0 / align_total.dp_attempts as f32
             };
-            eprintln!(
-                "[KIRA_ALIGN_STATS] summary: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
+            crate::kira_info!("[KIRA_ALIGN_STATS] summary: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
                 (align_total.prefilter_accept as f32 * 100.0 / align_total.reads.max(1) as f32),
                 (align_total.prefilter_fallback as f32 * 100.0 / align_total.reads.max(1) as f32),
                 dp_rate
@@ -554,13 +588,16 @@ impl Aligner {
             .context("build hybrid-aware thread pools")?,
         );
 
-        let mut stream = ReadStream::new_multi_with_mode(
+        let mut stream = ReadStream::new_multi_with_opts(
             reads_paths,
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
+            self.cfg.keep_comment,
         )?;
         let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+        let alt_mask = self.alt_mask_for(&index);
+        pipeline.config.set_alt_mask(alt_mask);
         let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
@@ -571,6 +608,7 @@ impl Aligner {
                 let mode = classify(features);
                 profiles.decided = Some(mode);
                 pipeline.config = profiles.select(mode);
+                pipeline.config.set_alt_mask(alt_mask);
             }
             let input = stage0_input::run(reads);
             let (scored, stats) = pipeline.process_batch_scored(input, &index)?;
@@ -626,7 +664,12 @@ impl Aligner {
     /// (header + records) as a byte buffer — nothing is written to disk.
     ///
     /// Prefer [`Self::align_streaming`] for in-process consumers: this holds the
-    /// entire run's SAM text in memory at once.
+    /// entire run's SAM text in memory at once (5.2 GB for a 30× chr20), and
+    /// the consumer then parses it straight back into records.
+    #[deprecated(
+        since = "0.4.5",
+        note = "holds the whole run's SAM text in RAM; use `align_streaming` and consume batches as they are scored"
+    )]
     pub fn align_to_sam_bytes(
         &self,
         mut index: Index,
@@ -669,13 +712,16 @@ impl Aligner {
         }
         let formatter = writer.formatter_handle();
 
-        let mut stream = ReadStream::new_multi_with_mode(
+        let mut stream = ReadStream::new_multi_with_opts(
             reads_paths,
             self.cfg.batch_bases,
             self.cfg.pipeline.paired.mode,
+            self.cfg.keep_comment,
         )?;
         let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
+        let alt_mask = self.alt_mask_for(&index);
+        pipeline.config.set_alt_mask(alt_mask);
         let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
@@ -685,6 +731,7 @@ impl Aligner {
                     let mode = classify(features);
                     profiles.decided = Some(mode);
                     pipeline.config = profiles.select(mode);
+                pipeline.config.set_alt_mask(alt_mask);
                 }
             }
             let input = stage0_input::run(reads);
@@ -856,8 +903,7 @@ fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
         + stats.gpu_spectral_resolved
         + stats.prefilter_accept;
     let sw_total = stats.dp_simd + stats.dp_scalar;
-    eprintln!(
-        "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
+    crate::kira_info!("[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
         label,
         stats.reads,
         stats.exact_matches,
@@ -1012,8 +1058,7 @@ fn print_summary_stats(
         align_total.avg_read_len(),
     );
     if let Some((mode, p50)) = mode_selected {
-        eprintln!(
-            "[KIRA_MODE] summary: selected={:?} median_read_len={}",
+        crate::kira_info!("[KIRA_MODE] summary: selected={:?} median_read_len={}",
             mode, p50
         );
     }

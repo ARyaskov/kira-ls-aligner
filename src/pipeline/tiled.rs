@@ -60,8 +60,7 @@ pub fn run_tiled(
         })
         .context("build hybrid-aware thread pools for tiled run")?,
     );
-    eprintln!(
-        "[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={} (tiled)",
+    crate::kira_info!("[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={} (tiled)",
         pool.is_hybrid(),
         pool.p_threads(),
         pool.e_threads(),
@@ -82,8 +81,7 @@ fn run_tiled_inner(
         return Err(anyhow::anyhow!("tile plan is empty (no contigs?)"));
     }
 
-    eprintln!(
-        "[KIRA_TILE] running split-prefix pipeline with {} tile(s); temp prefix = {}",
+    crate::kira_info!("[KIRA_TILE] running split-prefix pipeline with {} tile(s); temp prefix = {}",
         tile_plan.n_tiles(),
         cfg.split_prefix.display()
     );
@@ -91,8 +89,7 @@ fn run_tiled_inner(
     let mut chunk_paths: Vec<PathBuf> = Vec::with_capacity(tile_plan.n_tiles());
     for (tile_idx, tile) in tile_plan.tiles.iter().enumerate() {
         let t0 = Instant::now();
-        eprintln!(
-            "[KIRA_TILE] tile {}/{}: contigs [{}..{}], {} bytes — building index",
+        crate::kira_info!("[KIRA_TILE] tile {}/{}: contigs [{}..{}], {} bytes — building index",
             tile_idx + 1,
             tile_plan.n_tiles(),
             tile.contig_start,
@@ -132,8 +129,7 @@ fn run_tiled_inner(
         }
         writer.finish()?;
 
-        eprintln!(
-            "[KIRA_TILE] tile {}/{} done in {:.1}s: {} reads, {} alignments written",
+        crate::kira_info!("[KIRA_TILE] tile {}/{} done in {:.1}s: {} reads, {} alignments written",
             tile_idx + 1,
             tile_plan.n_tiles(),
             t0.elapsed().as_secs_f64(),
@@ -143,8 +139,7 @@ fn run_tiled_inner(
     }
 
     let t_merge = Instant::now();
-    eprintln!(
-        "[KIRA_TILE] merging {} tile(s) → final SAM",
+    crate::kira_info!("[KIRA_TILE] merging {} tile(s) → final SAM",
         chunk_paths.len()
     );
 
@@ -285,16 +280,14 @@ fn run_tiled_inner(
     }
 
     writer.flush()?;
-    eprintln!(
-        "[KIRA_TILE] merge done in {:.1}s; cleaning up {} chunk file(s)",
+    crate::kira_info!("[KIRA_TILE] merge done in {:.1}s; cleaning up {} chunk file(s)",
         t_merge.elapsed().as_secs_f64(),
         chunk_paths.len()
     );
 
     for path in &chunk_paths {
         if let Err(e) = std::fs::remove_file(path) {
-            eprintln!(
-                "[KIRA_TILE] warning: could not remove {}: {}",
+            crate::kira_warn!("[KIRA_TILE] warning: could not remove {}: {}",
                 path.display(),
                 e
             );

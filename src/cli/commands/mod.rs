@@ -1,3 +1,4 @@
+pub mod emit;
 pub mod eval;
 pub mod index;
 pub mod mem;

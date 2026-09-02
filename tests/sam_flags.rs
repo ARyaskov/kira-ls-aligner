@@ -61,6 +61,7 @@ fn r1_record() -> ReadRecord {
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R1,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 
@@ -71,6 +72,7 @@ fn r2_record() -> ReadRecord {
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R2,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 
@@ -81,6 +83,7 @@ fn unpaired_record() -> ReadRecord {
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     }
 }
 
@@ -216,6 +219,7 @@ fn reverse_alignment_emits_reverse_complemented_seq_and_reversed_qual() {
         qual: Some(b"ABCDEF".to_vec()),
         pair_role: PairRole::Unpaired,
         repeat_min_occ: 1,
+        comment: None,
     };
     let mut aln = base_alignment(0, 100, 106, true);
     aln.read_end = 6;

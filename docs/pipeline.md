@@ -42,12 +42,44 @@ leftmost CIGAR, so the same variant emits one canonical CIGAR across reads
 sizes are untouched; NM/MD are recomputed for the moved records. Kill-switch:
 `KIRA_LEFT_NORM=0`.
 
+Three record-level policies also run there, after mate rescue and pair
+re-ranking but before pairing stamps mate fields, so RNEXT/PNEXT always point
+at a record that is emitted: the bwa-mem `-T` score floor (a rejected primary
+unmaps the read; a runner-up is never promoted past it), the `-5` rule
+(smallest read coordinate of a split read is primary) and the ALT policy (an
+ALT-contig primary with a primary-assembly hit within one mismatch is swapped,
+as `bwa-postalt` does). Pair re-ranking gives the concordance bonus to the
+winning pair only; `KIRA_PAIR_BONUS_ALL=1` extends it to every concordant
+combination, so a read whose mates are concordant at two loci becomes a MAPQ
+tie instead of MAPQ 20 on the tie-break (more precise, fewer callable reads —
+see the README knob table for the GIAB trade-off).
+
 6. **Stage 5 - Scoring** (`stage5_scoring.rs`)
    - Assigns MAPQ, primary/secondary flags, and suboptimal score (`XS`).
+   - Competitors on ALT contigs are left out of the score-gap model for a
+     primary-assembly placement.
    - Output: `ScoredBatch { reads, alignments }`.
 
 7. **Stage 6 - Output** (`stage6_output.rs`)
-   - Writes SAM records with bwa-mem compatible flags and tags (NM, MD, AS, XS, RG).
+   - Writes SAM records with bwa-mem compatible flags and tags (NM, MD, AS, XS, RG,
+     XA/SA) plus the mate tags `MC`/`MQ`/`ms` on paired records, built from the
+     adjacent mate's primary in a pre-pass so the parallel chunks stay independent.
+   - Supplementary segments are hard-clipped unless `-Y`; `-M` flags them 0x100;
+     `-C` appends the FASTQ comment.
+
+## Fused binary output (`--emit bam | sorted-bam | cram | sorted-cram`)
+
+`src/cli/commands/emit.rs` drives the pipeline through `Aligner::align_streaming`
+and hands each scored batch, serialised by stage 6, to a converter thread that
+parses the SAM text into kira-bam records in parallel (line-aligned chunks on
+the rayon pool). Unsorted output streams straight into kira-bam's multi-threaded
+BGZF (or CRAM) writer. Sorted output collects records up to `--sort-memory`,
+then runs kira-bam's in-memory coordinate sort with fused markdup and writes
+once; past the budget everything collected so far is spilled to an unsorted
+BAM beside the output, later batches stream into it, and kira-bam's external
+sort (plus its two-pass markdup when `--markdup`) finishes the file. No
+intermediate SAM is written on either path. `--bai` indexes BAM output;
+CRAM takes `REF` and builds `REF.fai` if missing.
 
 ## Auto Mode Selection
 
@@ -57,6 +89,25 @@ When `-x auto` (default), the first batch is used to classify the dataset as sho
 - Chain density (chains/read) and minimizer density
 
 The selected mode is applied to subsequent batches and logged once when `KIRA_STATS=1`.
+
+## Where the time goes (chr20, 30×, 16 threads, SAM output)
+
+Measured 2026-09-01 with `KIRA_STATS=1` on HG002 chr20 (12.44M reads, 99 s wall):
+
+| Stage | Sum over batches | Share |
+|---|---|---|
+| seeding | 29.8 s | 34 % |
+| alignment (stage 4 incl. rescue) | 30.7 s | 35 % |
+| sketch | 10.7 s | 12 % |
+| chaining | 6.4 s | 7 % |
+| output | 3.9 s | 4 % |
+| scoring | 2.9 s | 3 % |
+
+Inside stage 4, mate rescue is 6.9 s of the 30.7 s. 71 % of reads resolve as
+exact matches, 16 % on the packed-spectral certificate, 17 % through WFA and
+0.1 % through banded SW. The sketch stage spends ~14 µs per read against a
+~0.7 µs minimizer kernel, so the next performance work is allocation and
+memory traffic in sketch/seeding, not the DP kernels.
 
 ## Stage Details
 
