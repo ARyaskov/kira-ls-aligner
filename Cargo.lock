@@ -531,7 +531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
 dependencies = [
  "crc32fast",
- "miniz_oxide 0.8.9",
+ "miniz_oxide",
  "zlib-rs 0.5.5",
 ]
 
@@ -734,20 +734,19 @@ dependencies = [
 
 [[package]]
 name = "kira-fastq"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5defe874d1dd086d1fb746a61c7b70b0bdaf84d40fa276eb67c997d689c62ab3"
+checksum = "136c3b3bad334671c1cfa71b648104c792df30fbcfa7cc14e5a7155bcbb4caa1"
 dependencies = [
  "crc32fast",
  "flate2",
  "memchr",
  "memmap2",
- "miniz_oxide 0.9.0",
 ]
 
 [[package]]
 name = "kira-ls-aligner"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -782,9 +781,9 @@ checksum = "02a7de5f0cf02d66f73b1b1289df74ad96b465546fe5a184d78e57fa6df608d3"
 
 [[package]]
 name = "kira_kv_engine"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9b57415f77269b4f54d9b974e8eef9e36dbe4d05477f4fa035a7ddbe7765e2b"
+checksum = "0d5eb186502f90aefb595bd2381281db38633ee6c527d8c666b9157fb0d4c948"
 dependencies = [
  "core_affinity",
  "hashbrown 0.16.1",
@@ -979,15 +978,6 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "miniz_oxide"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5faa9f23e86bd5768d76def086192ff5f869fb088da12a976ea21e9796b975f6"
-dependencies = [
- "adler2",
 ]
 
 [[package]]

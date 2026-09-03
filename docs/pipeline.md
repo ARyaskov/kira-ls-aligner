@@ -90,6 +90,30 @@ When `-x auto` (default), the first batch is used to classify the dataset as sho
 
 The selected mode is applied to subsequent batches and logged once when `KIRA_STATS=1`.
 
+## Input decoding
+
+FASTQ input goes through kira-fastq, which picks its backend from the file's
+magic bytes rather than its name — `bgzip` writes BGZF into plain `.gz` names.
+BGZF blocks are independently deflated, so BGZF input is inflated on
+`KIRA_BGZF_THREADS` workers (default 2, per input file): HG002 R1, 748 MB,
+decodes in 5.0 s on one thread and 2.1 s on two, producing identical records
+either way — chr20 30× end to end, 98.8 s to 83.6 s for a byte-identical BAM
+body. Plain gzip has no such structure and stays single-threaded.
+
+`-` reads standard input, sniffing gzip/BGZF from the first bytes. The stream
+is passed through a CRLF-normalising adapter first: kira-fastq strips `\r`
+only when it sits in the same buffer fill as its `\n`, so a `\r\n` split across
+two pipe reads otherwise reaches the parser as a stray `\r` and fails the
+record as a sequence/quality length mismatch (verified against kira-fastq
+0.4.0). File-backed inputs are memory-mapped or block-decoded and never hit
+that path.
+
+Progress accounting follows the backend, since `tell()` means different things
+per source: a file offset for plain input, a BGZF virtual offset (whose block
+offset is the real file position) for single-threaded BGZF, and decoded bytes
+for gzip and the parallel BGZF reader — the last is scaled back into file bytes
+by an assumed FASTQ compression ratio, because only the progress bar consumes it.
+
 ## Where the time goes (chr20, 30×, 16 threads, SAM output)
 
 Measured 2026-09-01 with `KIRA_STATS=1` on HG002 chr20 (12.44M reads, 99 s wall):

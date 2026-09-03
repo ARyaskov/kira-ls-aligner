@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -179,11 +179,7 @@ impl ReadStream {
                     comment,
                 });
 
-                let consumed = self.readers[idx]
-                    .reader
-                    .tell()
-                    .0
-                    .min(self.readers[idx].total_bytes);
+                let consumed = self.readers[idx].consumed();
                 self.progress.read_bytes = self.completed_bytes.saturating_add(consumed);
 
                 if bases >= self.batch_bases {
@@ -256,16 +252,8 @@ impl ReadStream {
                         comment: c2,
                     });
 
-                    let consumed1 = self.readers[0]
-                        .reader
-                        .tell()
-                        .0
-                        .min(self.readers[0].total_bytes);
-                    let consumed2 = self.readers[1]
-                        .reader
-                        .tell()
-                        .0
-                        .min(self.readers[1].total_bytes);
+                    let consumed1 = self.readers[0].consumed();
+                    let consumed2 = self.readers[1].consumed();
                     self.progress.read_bytes = consumed1.saturating_add(consumed2);
 
                     if bases >= self.batch_bases {
@@ -316,12 +304,7 @@ impl ReadStream {
                         comment: c2,
                     });
 
-                    let consumed = self.readers[0]
-                        .reader
-                        .tell()
-                        .0
-                        .min(self.readers[0].total_bytes);
-                    self.progress.read_bytes = consumed;
+                    self.progress.read_bytes = self.readers[0].consumed();
 
                     if bases >= self.batch_bases {
                         break;
@@ -380,6 +363,97 @@ fn open_fastx_reader<P: AsRef<Path>>(path: P) -> Result<FastxReaderWithProgress>
 struct FastqReaderWithProgress {
     reader: KiraFastqReader,
     total_bytes: u64,
+    basis: ProgressBasis,
+}
+
+impl FastqReaderWithProgress {
+    /// Position in the file's own bytes, for the progress bar. `tell()` means
+    /// different things per backend, so the conversion lives here rather than
+    /// at the three call sites.
+    fn consumed(&self) -> u64 {
+        let voff = self.reader.tell();
+        let bytes = match self.basis {
+            ProgressBasis::FileBytes => voff.get(),
+            ProgressBasis::BgzfVirtual => voff.compressed(),
+            ProgressBasis::Decoded => voff.get() / FASTQ_GZIP_RATIO,
+        };
+        bytes.min(self.total_bytes)
+    }
+}
+
+/// How a reader's `tell()` maps onto progress through the file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgressBasis {
+    /// A byte offset into the file itself (plain FASTQ).
+    FileBytes,
+    /// A BGZF virtual offset — its block offset is a real file position.
+    BgzfVirtual,
+    /// Decoded bytes consumed (gzip, and the parallel BGZF reader). Scaled
+    /// back into file bytes by [`FASTQ_GZIP_RATIO`].
+    Decoded,
+}
+
+/// Decompressed-to-compressed size ratio assumed when a reader reports decoded
+/// bytes: 2.9x on HG002 (748 MB of BGZF holding 2.2 GB of FASTQ). Only scales
+/// the progress bar, which clamps at the file size either way.
+const FASTQ_GZIP_RATIO: u64 = 3;
+
+/// Compression of an input file, from its magic bytes rather than its name —
+/// `bgzip` writes BGZF into plain `.gz` names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputCompression {
+    Plain,
+    Gzip,
+    Bgzf,
+}
+
+/// BGZF is gzip with an `FEXTRA` field carrying the `BC` subfield (SAM spec
+/// §4.1); anything else with the gzip magic is ordinary gzip.
+fn detect_compression(path: &Path) -> Result<InputCompression> {
+    let mut head = [0u8; 16];
+    let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match f.read(&mut head[filled..]).context("read FASTQ header bytes")? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    if filled < 2 || head[0] != 0x1f || head[1] != 0x8b {
+        return Ok(InputCompression::Plain);
+    }
+    let has_extra = filled >= 4 && (head[3] & 0x04) != 0;
+    if has_extra && filled >= 14 && head[12] == b'B' && head[13] == b'C' {
+        return Ok(InputCompression::Bgzf);
+    }
+    Ok(InputCompression::Gzip)
+}
+
+/// `KIRA_BGZF_THREADS` — workers used to inflate a BGZF input, samtools' `-@`
+/// for FASTQ input. BGZF blocks are independent, so this scales: HG002 R1
+/// decodes in 5.0 s on one thread, 2.1 s on two and 1.1 s on four. Decoding
+/// overlaps alignment, so the default stops at 2 rather than taking cores the
+/// aligner wants — and it is *per input file*, so a two-file paired run spends
+/// twice this. `1` keeps the single-threaded backend (and exact, unestimated
+/// BGZF progress); `0` selects the default.
+fn bgzf_decode_threads() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let requested = std::env::var("KIRA_BGZF_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if requested > 0 {
+            requested.min(cores.max(1))
+        } else if cores >= 4 {
+            2
+        } else {
+            1
+        }
+    })
 }
 
 /// `(id, seq, qual, comment)` as pulled off one FASTQ record.
@@ -394,11 +468,30 @@ fn open_fastq_reader<P: AsRef<Path>>(path: P) -> Result<FastqReaderWithProgress>
         .and_then(|f| f.metadata())
         .context("stat FASTQ")?
         .len();
-    let reader = KiraFastqReader::from_path_auto(path)
-        .map_err(|e| anyhow::anyhow!("open FASTQ/FASTQ.GZ/BGZF: {e:?}"))?;
+    let open_err = |e| anyhow::anyhow!("open FASTQ/FASTQ.GZ/BGZF: {e:?}");
+    let threads = bgzf_decode_threads();
+    let (reader, basis) = match detect_compression(path)? {
+        InputCompression::Bgzf if threads > 1 => (
+            KiraFastqReader::from_bgzf_path_parallel(path, threads).map_err(open_err)?,
+            ProgressBasis::Decoded,
+        ),
+        InputCompression::Bgzf => (
+            KiraFastqReader::from_path_auto(path).map_err(open_err)?,
+            ProgressBasis::BgzfVirtual,
+        ),
+        InputCompression::Gzip => (
+            KiraFastqReader::from_path_auto(path).map_err(open_err)?,
+            ProgressBasis::Decoded,
+        ),
+        InputCompression::Plain => (
+            KiraFastqReader::from_path_auto(path).map_err(open_err)?,
+            ProgressBasis::FileBytes,
+        ),
+    };
     Ok(FastqReaderWithProgress {
         reader,
         total_bytes,
+        basis,
     })
 }
 
@@ -424,6 +517,7 @@ fn open_stdin_reader() -> Result<FastqReaderWithProgress> {
     Ok(FastqReaderWithProgress {
         reader,
         total_bytes: 0,
+        basis: ProgressBasis::Decoded,
     })
 }
 
@@ -1396,7 +1490,6 @@ fn is_softclip(op: &CigarOp) -> bool {
 mod format_tests {
     use super::*;
     use crate::types::{AlignmentKind, RefBases, RefSeq};
-    use std::io::Read as _;
 
     fn reference() -> Reference {
         Reference {
@@ -1534,6 +1627,49 @@ mod format_tests {
         buf.clear();
         assert!(!fmt.append_xa_capped(&mut buf, &alns, 2));
         assert!(buf.is_empty());
+    }
+
+    /// The BGZF magic is what selects the parallel inflate path, and `bgzip`
+    /// writes BGZF under a plain `.gz` name, so the test uses bytes not names.
+    #[test]
+    fn compression_is_detected_from_magic_not_extension() {
+        let dir = std::env::temp_dir().join("kira_detect_compression");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = dir.join("a.fastq");
+        std::fs::write(&plain, b"@r\nACGT\n+\n!!!!\n").unwrap();
+        assert_eq!(detect_compression(&plain).unwrap(), InputCompression::Plain);
+
+        // gzip magic, deflate, no FEXTRA.
+        let gz = dir.join("b.fastq.gz");
+        std::fs::write(&gz, [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff, 1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(detect_compression(&gz).unwrap(), InputCompression::Gzip);
+
+        // BGZF: FEXTRA set (flag 0x04) with the `BC` subfield at bytes 12..14.
+        let bgzf = dir.join("c.fastq.gz");
+        std::fs::write(
+            &bgzf,
+            [0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00],
+        )
+        .unwrap();
+        assert_eq!(detect_compression(&bgzf).unwrap(), InputCompression::Bgzf);
+
+        // A file too short to carry magic is plain, not an error.
+        let tiny = dir.join("d.fastq");
+        std::fs::write(&tiny, b"@").unwrap();
+        assert_eq!(detect_compression(&tiny).unwrap(), InputCompression::Plain);
+    }
+
+    #[test]
+    fn progress_basis_converts_tell_into_file_bytes() {
+        // A BGZF virtual offset packs the block's compressed offset above the
+        // low 16 bits; reading it raw saturates the bar instantly.
+        let voff = kira_fastq::offset::VirtualOffset::new(4096, 300);
+        assert_eq!(voff.compressed(), 4096);
+        assert!(voff.get() > 1 << 20, "raw virtual offset dwarfs the file position");
+
+        // Decoded bytes are scaled back down by the assumed FASTQ ratio.
+        assert_eq!(3_000u64 / FASTQ_GZIP_RATIO, 1_000);
     }
 
     #[test]
