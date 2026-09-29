@@ -123,13 +123,16 @@ pub fn left_normalize_indels(
             shift_max += 1;
         }
 
-        // Maximal equivalent left shift, one base per step.
+        // Maximal equivalent left shift, one base per step. After `shift`
+        // steps the gap block sits at ref `br - shift` / read `bq - shift`;
+        // one more step is exact iff the base entering the block on the left
+        // equals the base leaving it on the right (the block rotates by one).
         let mut shift = 0usize;
         while shift < shift_max {
             let before = ref_slice.get(rs + br - shift - 1).copied();
             let ok = match kind {
                 CigarKind::Del => before == ref_slice.get(rs + br + g - shift - 1).copied(),
-                _ => before == read_oriented.get(bq + g - 1).copied(),
+                _ => before == read_oriented.get(bq + g - shift - 1).copied(),
             };
             if !ok {
                 break;
@@ -375,5 +378,126 @@ mod tests {
         let out = left_normalize_indels(&cigar, reference, 0, read).unwrap();
         assert_eq!(consumed(&cigar), consumed(&out));
         assert_eq!(consumed(&out) as usize, read.len());
+    }
+
+    /// Regression: the insertion arm compared against a fixed read base
+    /// instead of the rotating block, so a period-2 insertion (`CA` after
+    /// `GAA`) was slid one base too far and created a new mismatch.
+    #[test]
+    fn dinucleotide_insertion_stops_at_exact_placement() {
+        let reference = b"GAATT";
+        let read = b"GAACATT";
+        let cigar = ops(&[(3, M), (2, I), (2, M)]);
+        let out = left_normalize_indels(&cigar, reference, 0, read).expect("should move");
+        assert_eq!(cigar_string(&out), "2M2I3M");
+    }
+
+    /// Replays the aligned columns of random indel-bearing alignments before
+    /// and after normalization: the number of mismatching columns must be
+    /// unchanged, because the transformation is exact.
+    #[test]
+    fn random_normalization_preserves_mismatch_count() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let count_mismatches = |cigar: &[CigarOp], reference: &[u8], read: &[u8]| -> usize {
+            let (mut q, mut r, mut mm) = (0usize, 0usize, 0usize);
+            for op in cigar {
+                match op.op {
+                    M => {
+                        for k in 0..op.len as usize {
+                            if read[q + k] != reference[r + k] {
+                                mm += 1;
+                            }
+                        }
+                        q += op.len as usize;
+                        r += op.len as usize;
+                    }
+                    I | S => q += op.len as usize,
+                    D | CigarKind::Skipped => r += op.len as usize,
+                }
+            }
+            assert_eq!(q, read.len(), "cigar must consume the read");
+            mm
+        };
+        let push = |cigar: &mut Vec<CigarOp>, len: u32, op: CigarKind| {
+            if len == 0 {
+                return;
+            }
+            if let Some(last) = cigar.last_mut()
+                && last.op == op
+            {
+                last.len += len;
+                return;
+            }
+            cigar.push(CigarOp { len, op });
+        };
+        for _ in 0..2000 {
+            // Low-entropy reference so indels have room to slide.
+            let alphabet: &[u8] = match next() % 3 {
+                0 => b"AC",
+                1 => b"ACG",
+                _ => b"ACGT",
+            };
+            let ref_len = 20 + (next() % 30) as usize;
+            let reference: Vec<u8> = (0..ref_len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            // Walk the reference emitting M/I/D runs; build the read alongside.
+            let mut read = Vec::new();
+            let mut cigar: Vec<CigarOp> = Vec::new();
+            let mut r = 0usize;
+            while r < ref_len {
+                let m = ((1 + next() % 6) as usize).min(ref_len - r);
+                for k in 0..m {
+                    let b = if next() % 12 == 0 {
+                        alphabet[(next() % alphabet.len() as u64) as usize]
+                    } else {
+                        reference[r + k]
+                    };
+                    read.push(b);
+                }
+                push(&mut cigar, m as u32, M);
+                r += m;
+                if r >= ref_len {
+                    break;
+                }
+                match next() % 3 {
+                    0 => {
+                        let g = (1 + next() % 3) as usize;
+                        for _ in 0..g {
+                            read.push(alphabet[(next() % alphabet.len() as u64) as usize]);
+                        }
+                        push(&mut cigar, g as u32, I);
+                    }
+                    1 => {
+                        let g = ((1 + next() % 3) as usize).min(ref_len - r - 1);
+                        push(&mut cigar, g as u32, D);
+                        r += g;
+                    }
+                    _ => {}
+                }
+            }
+            if cigar.last().map(|o| o.op) != Some(M) {
+                continue;
+            }
+            let before = count_mismatches(&cigar, &reference, &read);
+            if let Some(out) = left_normalize_indels(&cigar, &reference, 0, &read) {
+                let after = count_mismatches(&out, &reference, &read);
+                assert_eq!(
+                    before,
+                    after,
+                    "mismatch count changed: {} -> {} (ref {:?}, read {:?})",
+                    cigar_string(&cigar),
+                    cigar_string(&out),
+                    String::from_utf8_lossy(&reference),
+                    String::from_utf8_lossy(&read)
+                );
+            }
+        }
     }
 }
