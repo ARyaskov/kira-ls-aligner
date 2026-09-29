@@ -35,6 +35,22 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// `--insert-window MIN,MAX[,MEAN,SD]` sets the proper-pair window; bwa-mem's
+/// `-I mean[,sd[,max[,min]]]` then overrides it and fixes the distribution.
+fn apply_insert_args(
+    cfg: &mut PairedConfig,
+    bwa_spec: Option<&str>,
+    window_spec: &str,
+) -> Result<()> {
+    cfg.apply_insert_spec(window_spec)
+        .map_err(|e| anyhow::anyhow!("--insert-window: {e}"))?;
+    if let Some(spec) = bwa_spec {
+        cfg.apply_bwa_insert_spec(spec)
+            .map_err(|e| anyhow::anyhow!("-I/--insert-size: {e}"))?;
+    }
+    Ok(())
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -54,8 +70,10 @@ pub struct FusedAlignerParams {
     pub read_group: Option<String>,
     pub paired: bool,
     pub interleaved: bool,
-    /// `MIN,MAX[,MEAN,SD]`.
-    pub insert_size: String,
+    /// bwa-mem `-I mean[,sd[,max[,min]]]`; `None` = estimate from the data.
+    pub insert_size: Option<String>,
+    /// `MIN,MAX[,MEAN,SD]` proper-pair window (`--insert-window`).
+    pub insert_window: String,
     /// Number of read files (for paired-mode auto-detection).
     pub n_read_files: usize,
 }
@@ -130,9 +148,7 @@ pub fn build_short_pe_aligner(
     let (paired_mode, _auto) = resolve_paired_mode(p.paired, p.interleaved, p.n_read_files)?;
     let mut paired_cfg = PairedConfig::default();
     paired_cfg.mode = paired_mode;
-    paired_cfg
-        .apply_insert_spec(&p.insert_size)
-        .map_err(|e| anyhow::anyhow!("--insert-size: {e}"))?;
+    apply_insert_args(&mut paired_cfg, p.insert_size.as_deref(), &p.insert_window)?;
     seeding_cfg.mate_window = mate_seed_window(&paired_cfg);
 
     let pipeline_cfg = PipelineConfig {
@@ -395,9 +411,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     }
     let mut paired_cfg = PairedConfig::default();
     paired_cfg.mode = paired_mode;
-    paired_cfg
-        .apply_insert_spec(&args.insert_size)
-        .map_err(|e| anyhow::anyhow!("--insert-size: {e}"))?;
+    apply_insert_args(&mut paired_cfg, args.insert_size.as_deref(), &args.insert_window)?;
     seeding_cfg.mate_window = mate_seed_window(&paired_cfg);
 
     let strand_policy = match args.splice_strand.to_ascii_lowercase().as_str() {

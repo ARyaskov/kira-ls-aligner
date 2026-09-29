@@ -39,7 +39,54 @@ impl PairedConfig {
         !matches!(self.mode, IngestMode::Unpaired)
     }
 
-    /// Parse the `-I MIN,MAX[,MEAN,SD]` CLI string into the four numeric fields.
+    /// Parse bwa-mem's `-I FLOAT[,FLOAT[,INT[,INT]]]` = `mean[,sd[,max[,min]]]`
+    /// insert-size prior. Missing fields derive as bwa does: `sd = 0.1·mean`,
+    /// `max = mean + 4·sd`, `min = mean - 4·sd` (floored at 0). Setting the
+    /// prior explicitly also stops the run-time estimator from replacing it,
+    /// which is what `-I` means in bwa-mem.
+    pub fn apply_bwa_insert_spec(&mut self, spec: &str) -> Result<(), String> {
+        let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
+        if parts.is_empty() || parts.len() > 4 {
+            return Err(format!(
+                "-I takes mean[,sd[,max[,min]]] (1 to 4 values), got {}",
+                parts.len()
+            ));
+        }
+        let parse = |s: &str| -> Result<f64, String> {
+            s.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| format!("invalid insert-size component {s:?}"))
+        };
+        let mean = parse(parts[0])?;
+        let sd = match parts.get(1) {
+            Some(v) => parse(v)?,
+            None => mean * 0.1,
+        };
+        let max = match parts.get(2) {
+            Some(v) => parse(v)?,
+            None => mean + 4.0 * sd,
+        };
+        let min = match parts.get(3) {
+            Some(v) => parse(v)?,
+            None => (mean - 4.0 * sd).max(0.0),
+        };
+        if min > max {
+            return Err(format!("insert-size MIN ({min}) > MAX ({max})"));
+        }
+        self.insert_mean = mean.round() as u32;
+        self.insert_sd = sd.round().max(1.0) as u32;
+        self.insert_max = max.round() as u32;
+        self.insert_min = min.round() as u32;
+        self.estimator_locked = true;
+        Ok(())
+    }
+
+    /// Parse the `--insert-window MIN,MAX[,MEAN,SD]` string into the four
+    /// numeric fields. With only `MIN,MAX` the mean and sd are derived from
+    /// the window (`mean = (min+max)/2`, `sd = (max-min)/8`) so the MAPQ
+    /// discordance test and the rescue centre agree with the window instead
+    /// of keeping the 200/50 defaults.
     pub fn apply_insert_spec(&mut self, spec: &str) -> Result<(), String> {
         let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
         let parse = |s: &str| -> Result<u32, String> {
@@ -50,6 +97,10 @@ impl PairedConfig {
             2 => {
                 self.insert_min = parse(parts[0])?;
                 self.insert_max = parse(parts[1])?;
+                if self.insert_min <= self.insert_max {
+                    self.insert_mean = self.insert_min.midpoint(self.insert_max);
+                    self.insert_sd = ((self.insert_max - self.insert_min) / 8).max(1);
+                }
             }
             4 => {
                 self.insert_min = parse(parts[0])?;

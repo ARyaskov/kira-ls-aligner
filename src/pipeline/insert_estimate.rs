@@ -26,12 +26,19 @@ pub struct InsertEstimator {
 }
 
 impl InsertEstimator {
-    /// Build an estimator seeded with the user-supplied PE config.
+    /// Build an estimator seeded with the user-supplied PE config. A prior
+    /// that is already locked (bwa-mem `-I`) is final: nothing is sampled
+    /// and the run never replaces it.
     pub fn new(prior: PairedConfig) -> Self {
+        let locked = prior.estimator_locked.then_some(prior);
         Self {
             prior,
-            samples: Vec::with_capacity(MIN_SAMPLES * 2),
-            locked: None,
+            samples: if locked.is_some() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(MIN_SAMPLES * 2)
+            },
+            locked,
         }
     }
 

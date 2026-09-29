@@ -266,9 +266,16 @@ pub struct MemArgs {
     #[arg(short = 'c', hide = true)]
     pub compat_max_occ: Option<u32>,
 
-    /// Insert-size constraints for proper-pair classification.
-    #[arg(short = 'I', long = "insert-size", default_value = "0,1000,200,50")]
-    pub insert_size: String,
+    /// Insert-size prior, bwa-mem form: `mean[,sd[,max[,min]]]`
+    /// (bwa-mem `-I`). Fixes the distribution instead of estimating it from
+    /// the data.
+    #[arg(short = 'I', long = "insert-size", value_name = "FLOAT[,FLOAT[,INT[,INT]]]")]
+    pub insert_size: Option<String>,
+
+    /// Proper-pair window as `MIN,MAX[,MEAN,SD]` (the pre-0.5 `-I` form);
+    /// the run-time estimator still refines it. `-I` takes precedence.
+    #[arg(long = "insert-window", value_name = "MIN,MAX[,MEAN,SD]", default_value = "0,1000,200,50")]
+    pub insert_window: String,
 
     /// Maximum intron length for splice-aware alignment.
     #[arg(long = "max-intron", default_value_t = 200_000)]
@@ -437,7 +444,8 @@ impl MemArgs {
             compat_unpaired_penalty: None,
             compat_discard_exact: false,
             compat_max_occ: None,
-            insert_size: "0,1000,200,50".to_string(),
+            insert_size: None,
+            insert_window: "0,1000,200,50".to_string(),
             max_intron: 200_000,
             min_intron: 30,
             splice_strand: "auto".to_string(),

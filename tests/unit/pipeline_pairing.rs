@@ -58,6 +58,44 @@ fn insert_spec_parses_2_and_4_field_forms() {
     assert!(cfg.apply_insert_spec("500,100").is_err()); // min > max
 }
 
+/// With only `MIN,MAX` the mean/sd used by the MAPQ discordance test and
+/// the rescue centre must follow the window, not the 200/50 defaults.
+#[test]
+fn two_field_insert_window_derives_mean_and_sd() {
+    let mut cfg = PairedConfig::default();
+    cfg.apply_insert_spec("300,700").unwrap();
+    assert_eq!((cfg.insert_mean, cfg.insert_sd), (500, 50));
+    assert!(!cfg.estimator_locked);
+}
+
+/// bwa-mem `-I FLOAT[,FLOAT[,INT[,INT]]]` is mean, sd, max, min — in that
+/// order — with bwa's derivations for the missing fields.
+#[test]
+fn bwa_insert_spec_field_order_and_defaults() {
+    let mut cfg = PairedConfig::default();
+    cfg.apply_bwa_insert_spec("350").unwrap();
+    assert_eq!(cfg.insert_mean, 350);
+    assert_eq!(cfg.insert_sd, 35);
+    assert_eq!(cfg.insert_max, 490);
+    assert_eq!(cfg.insert_min, 210);
+    assert!(cfg.estimator_locked, "-I fixes the prior");
+
+    cfg.apply_bwa_insert_spec("350,50").unwrap();
+    assert_eq!((cfg.insert_mean, cfg.insert_sd, cfg.insert_max, cfg.insert_min), (350, 50, 550, 150));
+
+    cfg.apply_bwa_insert_spec("350,50,600,100").unwrap();
+    assert_eq!((cfg.insert_mean, cfg.insert_sd, cfg.insert_max, cfg.insert_min), (350, 50, 600, 100));
+
+    // sd larger than mean/4 floors min at 0 instead of failing.
+    cfg.apply_bwa_insert_spec("100,50").unwrap();
+    assert_eq!(cfg.insert_min, 0);
+
+    assert!(cfg.apply_bwa_insert_spec("").is_err());
+    assert!(cfg.apply_bwa_insert_spec("1,2,3,4,5").is_err());
+    assert!(cfg.apply_bwa_insert_spec("350,50,100,600").is_err()); // max < min
+    assert!(cfg.apply_bwa_insert_spec("abc").is_err());
+}
+
 #[test]
 fn proper_pair_fr_orientation_in_window() {
     let mut cfg = PairedConfig::default();
