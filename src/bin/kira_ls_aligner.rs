@@ -41,6 +41,7 @@ pub struct GpuServerArgs {
 }
 
 fn main() -> Result<()> {
+    restore_sigpipe();
     let cli = Cli::parse();
     match cli.command {
         Commands::Index(args) => cmd_index(args),
@@ -63,3 +64,17 @@ fn run_gpu_server(_args: GpuServerArgs) -> Result<()> {
          and install the CUDA toolkit (>= 11.0) to use --gpu-server"
     )
 }
+
+/// Rust starts with SIGPIPE ignored, so a downstream `head` or `samtools
+/// view -H` closing the pipe surfaced as `write SAM batch: Broken pipe` and
+/// exit code 1. bwa and samtools die quietly on SIGPIPE; do the same.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: setting a signal disposition before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}

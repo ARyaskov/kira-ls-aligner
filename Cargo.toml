@@ -48,6 +48,12 @@ noodles-sam = "0.85"
 # gzip/BGZF sniffing on `-` (stdin) reads; file inputs go through kira-fastq.
 flate2 = "1"
 
+# Restore the default SIGPIPE disposition in the binary so `kira mem ... |
+# head` ends quietly like bwa/samtools instead of exiting 1 with an EPIPE
+# error (Rust ignores SIGPIPE at startup).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Cross-platform thread affinity for the hybrid-aware DualPool
 # (P-core / E-core split on Intel Alder Lake+, AMD homogeneous fallback).
 core_affinity = "0.8"
