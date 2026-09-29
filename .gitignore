@@ -56,10 +56,13 @@ stdout.log
 # carelessly. The PTX itself lives under target/<profile>/build/.../out/
 # so target/ above already covers it.
 *.ptx
-!src/cuda/*.ptx   # but allow PTX checked-in deliberately under src/cuda
+# but allow PTX checked-in deliberately under src/cuda
+!src/cuda/*.ptx
 
 ### Index files we build locally ###
 *.kiraidx
+# samtools / kira-bam faidx sidecar written next to a reference
+*.fai
 
 ### OS detritus ###
 .DS_Store
