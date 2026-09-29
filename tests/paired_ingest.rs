@@ -79,8 +79,8 @@ fn two_file_pairing_yields_r1_r2_adjacent() {
     assert_eq!(batch[2].pair_role, PairRole::R1);
     assert_eq!(batch[3].pair_role, PairRole::R2);
     // ID canonicalisation must equate `read1/1` and `read1/2`.
-    assert_eq!(batch[0].id, "read1/1");
-    assert_eq!(batch[1].id, "read1/2");
+    assert_eq!(batch[0].id, "read1");
+    assert_eq!(batch[1].id, "read1");
 
     // Stream is now drained.
     assert!(stream.next_batch().unwrap().is_none());
@@ -98,11 +98,11 @@ fn interleaved_pairing_yields_r1_r2_adjacent() {
     let batch = stream.next_batch().unwrap().unwrap();
     assert_eq!(batch.len(), 4);
     assert_eq!(batch[0].pair_role, PairRole::R1);
-    assert_eq!(batch[0].id, "pair1/1");
+    assert_eq!(batch[0].id, "pair1");
     assert_eq!(batch[1].pair_role, PairRole::R2);
-    assert_eq!(batch[1].id, "pair1/2");
-    assert_eq!(batch[2].id, "pair2/1");
-    assert_eq!(batch[3].id, "pair2/2");
+    assert_eq!(batch[1].id, "pair1");
+    assert_eq!(batch[2].id, "pair2");
+    assert_eq!(batch[3].id, "pair2");
 
     let _ = std::fs::remove_file(p);
 }

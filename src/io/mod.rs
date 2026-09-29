@@ -599,6 +599,11 @@ impl<R: io::Read> io::Read for CrlfToLf<R> {
     }
 }
 
+/// Read name from a FASTQ header: the text after `@` up to the first
+/// whitespace, minus a trailing `/<digit>` mate suffix (`read1/1`,
+/// `read1/2`). bwa-mem strips that suffix (`trim_readno`) on every read so
+/// both mates share one QNAME; QNAME-keyed consumers (`samtools fixmate`,
+/// `markdup`, Picard) depend on it.
 fn extract_fastq_id(header: &[u8]) -> String {
     let header = if let Some(stripped) = header.strip_prefix(b"@") {
         stripped
@@ -609,7 +614,12 @@ fn extract_fastq_id(header: &[u8]) -> String {
         .iter()
         .position(|b| b.is_ascii_whitespace())
         .unwrap_or(header.len());
-    String::from_utf8_lossy(&header[..end]).to_string()
+    let name = &header[..end];
+    let name = match name {
+        [.., b'/', d] if d.is_ascii_digit() && name.len() > 2 => &name[..name.len() - 2],
+        _ => name,
+    };
+    String::from_utf8_lossy(name).to_string()
 }
 
 /// The FASTQ comment: header text after the first run of whitespace, with
@@ -1607,6 +1617,17 @@ mod format_tests {
         assert_eq!(extract_fastq_comment(b"@r1"), None);
         assert_eq!(extract_fastq_comment(b"@r1   "), None);
         assert_eq!(extract_fastq_id(b"@r1 BC:Z:AC"), "r1");
+    }
+
+    #[test]
+    fn fastq_id_strips_mate_suffix() {
+        assert_eq!(extract_fastq_id(b"@read1/1"), "read1");
+        assert_eq!(extract_fastq_id(b"@read1/2 1:N:0:ACGT"), "read1");
+        assert_eq!(extract_fastq_id(b"@frag/3\n"), "frag");
+        // Not a mate suffix: no digit, or nothing before the slash.
+        assert_eq!(extract_fastq_id(b"@a/b"), "a/b");
+        assert_eq!(extract_fastq_id(b"@/1"), "/1");
+        assert_eq!(extract_fastq_id(b"@x/12"), "x/12");
     }
 
     #[test]
