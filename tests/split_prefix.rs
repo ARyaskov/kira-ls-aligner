@@ -242,8 +242,8 @@ fn tiled_alignment_recovers_reads_across_tiles() {
 
     let cols0 = parse_sam_record(body_lines[0]);
     let cols1 = parse_sam_record(body_lines[1]);
-    assert_eq!(cols0[0], "pair1/1", "R1 qname");
-    assert_eq!(cols1[0], "pair1/2", "R2 qname");
+    assert_eq!(cols0[0], "pair1", "R1 qname (mate suffix stripped)");
+    assert_eq!(cols1[0], "pair1", "R2 qname (mate suffix stripped)");
 
     // R1 should be mapped to chr1
     let flag0: u32 = cols0[1].parse().unwrap();
