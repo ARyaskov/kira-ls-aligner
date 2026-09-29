@@ -1,40 +1,37 @@
 use kira_ls_aligner::pipeline::mode::{ModeFeatures, ReadMode, classify};
 
+fn features(p50: usize, p90: usize) -> ModeFeatures {
+    ModeFeatures {
+        read_len_p50: p50,
+        read_len_p90: p90,
+        n_reads: 1000,
+    }
+}
+
 #[test]
 fn mode_short_for_illumina_like() {
-    let f = ModeFeatures {
-        read_len_p50: 150,
-        read_len_p90: 150,
-        avg_minimizers: 30.0,
-        ungapped_len_p95: 150,
-        ungapped_mism_p95: 2,
-        ungapped_id_p90: 99.0,
-        chains_per_read: 2.0,
-    };
-    assert_eq!(classify(f), ReadMode::Short);
+    assert_eq!(classify(features(150, 150)), ReadMode::Short);
+    assert_eq!(classify(features(250, 300)), ReadMode::Short);
 }
 
 #[test]
 fn mode_long_for_ont_like() {
-    let f = ModeFeatures {
-        read_len_p50: 5000,
-        read_len_p90: 8000,
-        avg_minimizers: 200.0,
-        ungapped_len_p95: 5000,
-        ungapped_mism_p95: 800,
-        ungapped_id_p90: 85.0,
-        chains_per_read: 1.5,
-    };
-    assert_eq!(classify(f), ReadMode::Long);
+    assert_eq!(classify(features(5000, 8000)), ReadMode::Long);
+    assert_eq!(classify(features(800, 2500)), ReadMode::Long);
 }
 
 #[test]
 fn mode_hybrid_for_mixed_short_and_long_batch() {
-    let f = ModeFeatures {
-        read_len_p50: 150,
-        read_len_p90: 5000,
-        avg_minimizers: 50.0,
-        ..ModeFeatures::default()
-    };
-    assert_eq!(classify(f), ReadMode::Hybrid);
+    assert_eq!(classify(features(150, 5000)), ReadMode::Hybrid);
+    // Neither clearly short nor clearly long.
+    assert_eq!(classify(features(500, 800)), ReadMode::Hybrid);
+}
+
+#[test]
+fn features_come_from_length_percentiles() {
+    let mut lengths: Vec<usize> = (1..=100).collect();
+    let f = ModeFeatures::from_read_lengths(&mut lengths);
+    assert_eq!((f.read_len_p50, f.read_len_p90, f.n_reads), (50, 90, 100));
+    let f = ModeFeatures::from_read_lengths(&mut Vec::new());
+    assert_eq!(f.n_reads, 0);
 }

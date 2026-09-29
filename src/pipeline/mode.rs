@@ -1,3 +1,11 @@
+//! Auto read-mode selection (`-x auto`).
+//!
+//! The mode is decided once, on the first batch, from the read-length
+//! distribution only: that is the one signal available before any seeding
+//! or alignment has run, and it separates the three tunings cleanly
+//! (Illumina-length reads, long reads, and a mixed library). The `hybrid`
+//! profile is the fallback for anything in between.
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadMode {
     Short,
@@ -5,26 +13,37 @@ pub enum ReadMode {
     Hybrid,
 }
 
+/// Read-length summary of the batch the decision is made on.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModeFeatures {
     pub read_len_p50: usize,
     pub read_len_p90: usize,
-    pub avg_minimizers: f32,
-    pub ungapped_len_p95: usize,
-    pub ungapped_mism_p95: usize,
-    pub ungapped_id_p90: f32,
-    pub chains_per_read: f32,
+    /// Reads the percentiles were computed over.
+    pub n_reads: usize,
 }
 
+impl ModeFeatures {
+    /// Length percentiles over `lengths` (any order).
+    pub fn from_read_lengths(lengths: &mut Vec<usize>) -> Self {
+        if lengths.is_empty() {
+            return Self::default();
+        }
+        lengths.sort_unstable();
+        let percentile = |pct: usize| lengths[((lengths.len() - 1) * pct) / 100];
+        Self {
+            read_len_p50: percentile(50),
+            read_len_p90: percentile(90),
+            n_reads: lengths.len(),
+        }
+    }
+}
+
+/// Short when the bulk of the reads are Illumina-length, long when the
+/// median or the 90th percentile is kilobase-scale, hybrid for a mixed
+/// library (short median, long tail) and for everything in between.
 pub fn classify(features: ModeFeatures) -> ReadMode {
     let p50 = features.read_len_p50;
     let p90 = features.read_len_p90;
-    let err_rate = if features.ungapped_len_p95 > 0 {
-        features.ungapped_mism_p95 as f32 / features.ungapped_len_p95 as f32
-    } else {
-        0.0
-    };
-
     if p50 <= 300 && p90 <= 400 {
         return ReadMode::Short;
     }
@@ -34,14 +53,6 @@ pub fn classify(features: ModeFeatures) -> ReadMode {
     if p50 >= 1000 || p90 >= 2000 {
         return ReadMode::Long;
     }
-    if err_rate >= 0.1 || (features.avg_minimizers > 0.0 && features.avg_minimizers < 5.0) {
-        return ReadMode::Long;
-    }
-
-    if features.chains_per_read >= 5.0 && p90 <= 500 {
-        return ReadMode::Short;
-    }
-
     ReadMode::Hybrid
 }
 

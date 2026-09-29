@@ -12,7 +12,7 @@ use crate::exec::DualPool;
 use crate::exec::pool::DualPoolConfig;
 use crate::index::{Index, IndexConfig};
 use crate::io::{HeaderConfig, ReadStream, SamWriter, read_reference};
-use crate::pipeline::mode::{ModeFeatures, classify};
+use crate::pipeline::mode::{ModeFeatures, ReadMode, ReadModeProfiles, classify};
 use crate::pipeline::stage0_input;
 use crate::pipeline::stage4_alignment::AlignmentBatchStats;
 use crate::pipeline::{Pipeline, PipelineConfig, PipelineStageTimes};
@@ -150,20 +150,35 @@ pub fn config_fingerprint(cfg: &PipelineConfig, threads: usize, batch_bases: usi
 }
 
 fn mode_features_from_reads(reads: &[crate::types::ReadRecord]) -> ModeFeatures {
-    if reads.is_empty() {
-        return ModeFeatures::default();
-    }
     let mut lengths: Vec<usize> = reads.iter().map(|r| r.seq.len()).collect();
-    lengths.sort_unstable();
-    let percentile = |pct: usize| {
-        let idx = ((lengths.len() - 1) * pct) / 100;
-        lengths[idx]
-    };
-    ModeFeatures {
-        read_len_p50: percentile(50),
-        read_len_p90: percentile(90),
-        ..ModeFeatures::default()
+    ModeFeatures::from_read_lengths(&mut lengths)
+}
+
+/// `-x auto`: on the first batch, classify the library and install the
+/// matching profile. Returns the decision the first time it is made so the
+/// caller can report it; later batches keep the selected profile.
+fn decide_auto_mode(
+    profiles: &mut ReadModeProfiles,
+    reads: &[crate::types::ReadRecord],
+    pipeline: &mut Pipeline,
+    alt_mask: Option<&'static [bool]>,
+) -> Option<(ReadMode, ModeFeatures)> {
+    if profiles.decided.is_some() {
+        return None;
     }
+    let features = mode_features_from_reads(reads);
+    let mode = classify(features);
+    profiles.decided = Some(mode);
+    pipeline.config = profiles.select(mode);
+    pipeline.config.set_alt_mask(alt_mask);
+    crate::kira_info!(
+        "[KIRA_MODE] -x auto selected {:?} from the first batch (reads={} p50={} p90={})",
+        mode,
+        features.n_reads,
+        features.read_len_p50,
+        features.read_len_p90
+    );
+    Some((mode, features))
 }
 
 fn validate_index_compatibility(index: &Index, cfg: &PipelineConfig) -> Result<()> {
@@ -262,7 +277,7 @@ impl Aligner {
         let mut chain_total_used: usize = 0;
         let mut chain_total_pruned: usize = 0;
         let overall_start = Instant::now();
-        let mut mode_selected: Option<(crate::pipeline::mode::ReadMode, usize)> = None;
+        let mut mode_selected: Option<(ReadMode, usize)> = None;
 
         let output_path_buf = output_path.as_ref().map(|p| p.as_ref().to_path_buf());
         let simd_mode = if stats_enabled {
@@ -408,20 +423,11 @@ impl Aligner {
                 };
                 let fetch_time = fetch_start.elapsed();
 
-                if let Some(profiles) = auto_profiles.as_mut() {
-                    if profiles.decided.is_none() {
-                        let features = mode_features_from_reads(&reads);
-                        let mode = classify(features);
-                        profiles.decided = Some(mode);
-                        mode_selected = Some((mode, features.read_len_p50));
-                        pipeline.config = profiles.select(mode);
-                pipeline.config.set_alt_mask(alt_mask);
-                        if stats_enabled {
-                            crate::kira_info!("[KIRA_MODE] selected={:?} p50={} p90={} before first alignment batch",
-                                mode, features.read_len_p50, features.read_len_p90
-                            );
-                        }
-                    }
+                if let Some(profiles) = auto_profiles.as_mut()
+                    && let Some((mode, features)) =
+                        decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask)
+                {
+                    mode_selected = Some((mode, features.read_len_p50));
                 }
 
                 let stage0_start = Instant::now();
@@ -601,14 +607,8 @@ impl Aligner {
         let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
-            if let Some(profiles) = auto_profiles.as_mut()
-                && profiles.decided.is_none()
-            {
-                let features = mode_features_from_reads(&reads);
-                let mode = classify(features);
-                profiles.decided = Some(mode);
-                pipeline.config = profiles.select(mode);
-                pipeline.config.set_alt_mask(alt_mask);
+            if let Some(profiles) = auto_profiles.as_mut() {
+                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask);
             }
             let input = stage0_input::run(reads);
             let (scored, stats) = pipeline.process_batch_scored(input, &index)?;
@@ -726,13 +726,7 @@ impl Aligner {
 
         while let Some(reads) = stream.next_batch()? {
             if let Some(profiles) = auto_profiles.as_mut() {
-                if profiles.decided.is_none() {
-                    let features = mode_features_from_reads(&reads);
-                    let mode = classify(features);
-                    profiles.decided = Some(mode);
-                    pipeline.config = profiles.select(mode);
-                pipeline.config.set_alt_mask(alt_mask);
-                }
+                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask);
             }
             let input = stage0_input::run(reads);
             let bo = pipeline.process_batch_serialized(
