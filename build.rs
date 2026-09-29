@@ -2,27 +2,32 @@
 // enabled. The PTX file is dropped into OUT_DIR so the runtime can pick it
 // up via `include_bytes!`.
 //
-// We intentionally compile against SM_61 (Pascal — GTX 1060 / 1070 / 1080)
-// as the lowest target, then list newer architectures so a single binary
-// JIT-loads the best variant on any supported card. PTX is forward
-// compatible: an SM_61 PTX module will JIT on Volta/Turing/Ampere/Ada at
-// the cost of one-time JIT compilation per host process.
+// We intentionally compile a single PTX module against compute_61 (Pascal —
+// GTX 1060 / 1070 / 1080), the lowest supported target. PTX is forward
+// compatible: the driver JIT-compiles that module for Volta/Turing/Ampere/Ada
+// at the cost of a one-time JIT per host process, so one binary runs on any
+// supported card.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda/spectral.cu");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
+
     // Environment knobs that affect whether nvcc can locate its host
     // compiler. If the user fixes one of these between builds we want to
-    // re-run nvcc rather than reusing the stale stub PTX.
-    println!("cargo:rerun-if-env-changed=PATH");
-    println!("cargo:rerun-if-env-changed=CUDAHOSTCXX");
-    println!("cargo:rerun-if-env-changed=VCINSTALLDIR");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-
+    // re-run nvcc rather than reusing the stale stub PTX. Only watched when
+    // the kernel is actually compiled: a non-CUDA build never runs nvcc, and
+    // watching PATH there forces a full rebuild whenever the shell, IDE and
+    // CI disagree about it.
     #[cfg(feature = "cuda")]
-    cuda_build::build_kernel();
+    {
+        println!("cargo:rerun-if-env-changed=PATH");
+        println!("cargo:rerun-if-env-changed=CUDAHOSTCXX");
+        println!("cargo:rerun-if-env-changed=VCINSTALLDIR");
+        println!("cargo:rerun-if-env-changed=CUDA_PATH");
+        println!("cargo:rerun-if-env-changed=CUDA_HOME");
+        cuda_build::build_kernel();
+    }
 }
 
 #[cfg(feature = "cuda")]
