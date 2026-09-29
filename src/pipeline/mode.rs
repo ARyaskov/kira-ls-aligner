@@ -24,7 +24,7 @@ pub struct ModeFeatures {
 
 impl ModeFeatures {
     /// Length percentiles over `lengths` (any order).
-    pub fn from_read_lengths(lengths: &mut Vec<usize>) -> Self {
+    pub fn from_read_lengths(lengths: &mut [usize]) -> Self {
         if lengths.is_empty() {
             return Self::default();
         }

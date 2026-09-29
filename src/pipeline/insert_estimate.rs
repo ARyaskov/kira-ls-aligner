@@ -85,7 +85,7 @@ impl InsertEstimator {
     /// prior window, so sampling only proper pairs would censor the fit at
     /// the prior (a 1.5 kb library never escapes a 0..1000 default). Chimeric
     /// and long-fragment outliers are removed by the percentile trim in
-    /// [`Self::fit`] instead, as bwa-mem does.
+    /// `fit` instead, as bwa-mem does.
     pub fn observe_batch(&mut self, alignments: &[Vec<Alignment>]) -> Option<PairedConfig> {
         if self.locked.is_some() {
             return None;

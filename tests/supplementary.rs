@@ -80,7 +80,7 @@ fn align_cfg() -> AlignmentConfig {
     }
 }
 
-fn ref_bytes<'a>(reference: &'a Reference, ref_id: usize) -> &'a [u8] {
+fn ref_bytes(reference: &Reference, ref_id: usize) -> &[u8] {
     match &reference.sequences[ref_id].bases {
         RefBases::Owned(v) => v.as_slice(),
         _ => panic!("expected owned"),

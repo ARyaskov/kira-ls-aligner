@@ -718,6 +718,18 @@ fn apply_alt_primary_policy(
     }
 }
 
+/// Move AC-stage alignments into the cascade output. Reads resolved by AC had
+/// their minimizers suppressed in stage 1, so their cascade slot is empty —
+/// we overwrite it with the perfect-match alignment(s) produced by AC.
+fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], mut ac: AcBatchOutput) {
+    debug_assert_eq!(cascade.len(), ac.alignments.len());
+    for (dst, src) in cascade.iter_mut().zip(ac.alignments.iter_mut()) {
+        if !src.is_empty() {
+            *dst = std::mem::take(src);
+        }
+    }
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::{apply_alt_primary_policy, apply_min_output_score, apply_primary_5p};
@@ -838,17 +850,5 @@ mod policy_tests {
             alns[0][0].ref_id, 1,
             "disjoint segments are not alternatives"
         );
-    }
-}
-
-/// Move AC-stage alignments into the cascade output. Reads resolved by AC had
-/// their minimizers suppressed in stage 1, so their cascade slot is empty —
-/// we overwrite it with the perfect-match alignment(s) produced by AC.
-fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], mut ac: AcBatchOutput) {
-    debug_assert_eq!(cascade.len(), ac.alignments.len());
-    for (dst, src) in cascade.iter_mut().zip(ac.alignments.iter_mut()) {
-        if !src.is_empty() {
-            *dst = std::mem::take(src);
-        }
     }
 }

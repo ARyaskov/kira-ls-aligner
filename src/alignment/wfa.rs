@@ -868,11 +868,11 @@ fn build_cigar(
 }
 
 fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
-    if let Some(last) = cigar.last_mut() {
-        if last.op == op {
-            last.len += len;
-            return;
-        }
+    if let Some(last) = cigar.last_mut()
+        && last.op == op
+    {
+        last.len += len;
+        return;
     }
     cigar.push(CigarOp { len, op });
 }

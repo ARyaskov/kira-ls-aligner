@@ -804,12 +804,12 @@ pub fn align_in_window(
         if let Some((best, second)) = packed_scan_scratch(read_seq, ref_window) {
             let max_mism = router::spectral_max_mismatches(read_len);
             let target = &ref_window[best.shift..best.shift + read_len];
-            if spectral_hit_is_certified(read_seq, target, &best, second, max_mism) {
-                if let Some(aln) = build_spectral_alignment(
+            if spectral_hit_is_certified(read_seq, target, &best, second, max_mism)
+                && let Some(aln) = build_spectral_alignment(
                     read_seq, ref_window, win_start, ref_id, is_rev, cfg, min_score, &best,
-                ) {
-                    return Some(aln);
-                }
+                )
+            {
+                return Some(aln);
             }
 
             let band = cfg.bandwidth.max(20);
@@ -908,6 +908,7 @@ fn align_in_window_wide_sw(
 }
 
 /// Helper that builds an ungapped `Alignment` from a `PackedHit`.
+#[allow(clippy::too_many_arguments)]
 fn build_spectral_alignment(
     read_seq: &[u8],
     ref_window: &[u8],
@@ -1627,11 +1628,11 @@ fn prev_diag(
 }
 
 pub(crate) fn push_cigar(cigar: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
-    if let Some(last) = cigar.last_mut() {
-        if last.op == op {
-            last.len += len;
-            return;
-        }
+    if let Some(last) = cigar.last_mut()
+        && last.op == op
+    {
+        last.len += len;
+        return;
     }
     cigar.push(CigarOp { len, op });
 }

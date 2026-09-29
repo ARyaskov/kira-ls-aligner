@@ -69,8 +69,8 @@ pub fn simhash_window(window: &[u8]) -> Option<u64> {
         let code = base_code(b)?;
         let feature = table[i * 4 + code as usize];
         // Each bit position: +1 if the projection bit is 1, -1 otherwise.
-        for bit in 0..64 {
-            sums[bit] += if (feature >> bit) & 1 == 1 { 1 } else { -1 };
+        for (bit, sum) in sums.iter_mut().enumerate() {
+            *sum += if (feature >> bit) & 1 == 1 { 1 } else { -1 };
         }
     }
     let mut hash = 0u64;

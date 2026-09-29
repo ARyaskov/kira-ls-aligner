@@ -63,13 +63,13 @@ pub fn count_mismatches_bounded(a: &[u8], b: &[u8], max_mismatches: u32) -> u32 
     kira_simd::compare::count_mismatches_bounded(a, b, max_mismatches)
 }
 
-/// out[i] = ref_pos[i] - query_pos[i].
+/// `out[i] = ref_pos[i] - query_pos[i]`.
 #[inline]
 pub fn compute_diagonals(ref_pos: &[u32], query_pos: &[u32], out_diags: &mut [i32]) {
     kira_simd::compare::compute_diagonals_i32(ref_pos, query_pos, out_diags)
 }
 
-/// out[i] = 1 if read_pos[i] < read_len else 0.
+/// `out[i] = 1 if read_pos[i] < read_len else 0`.
 #[inline]
 pub fn mask_read_pos_in_range(read_pos: &[u32], read_len: u32, mask: &mut [u8]) {
     kira_simd::compare::mask_lt_u32(read_pos, read_len, mask)

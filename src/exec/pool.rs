@@ -62,10 +62,10 @@ impl DualPool {
     /// on detected hybrid CPUs — used to A/B benchmark the routing
     /// against the baseline rayon scheduler without a recompile.
     pub fn new(cfg: DualPoolConfig) -> Result<Self> {
-        if std::env::var_os("KIRA_HYBRID_DISABLE").is_none() {
-            if let Some(topo) = detect_topology() {
-                return Self::build_hybrid(topo, cfg);
-            }
+        if std::env::var_os("KIRA_HYBRID_DISABLE").is_none()
+            && let Some(topo) = detect_topology()
+        {
+            return Self::build_hybrid(topo, cfg);
         }
         Self::build_homogeneous(cfg)
     }

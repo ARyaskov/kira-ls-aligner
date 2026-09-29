@@ -512,14 +512,14 @@ impl Aligner {
                     break;
                 }
 
-                if let Some(profiles) = auto_profiles.as_mut() {
-                    if profiles.decided.is_some() {
-                        adjust_auto_params(
-                            &mut pipeline.config,
-                            &batch_stats.align,
-                            &batch_stats.sketch,
-                        );
-                    }
+                if let Some(profiles) = auto_profiles.as_mut()
+                    && profiles.decided.is_some()
+                {
+                    adjust_auto_params(
+                        &mut pipeline.config,
+                        &batch_stats.align,
+                        &batch_stats.sketch,
+                    );
                 }
 
                 if stats_enabled {

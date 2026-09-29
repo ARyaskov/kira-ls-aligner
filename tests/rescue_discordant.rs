@@ -4,6 +4,7 @@
 //! expected insert window and replace the discordant primary if a
 //! better-fitting placement exists there.
 
+#![allow(clippy::field_reassign_with_default)]
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::index::{Index, IndexConfig};
 use kira_ls_aligner::io::IngestMode;

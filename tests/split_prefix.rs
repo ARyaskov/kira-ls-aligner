@@ -22,6 +22,7 @@
 //!   * `MergeIter` multi-stream union
 //!   * Final stage 5/6 over the global alignment set
 
+#![allow(clippy::field_reassign_with_default)]
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -69,9 +70,7 @@ fn write_fastq(name: &str, records: &[(&str, &[u8])]) -> PathBuf {
         buf.push(b'\n');
         buf.extend_from_slice(b"+\n");
         // dummy quality
-        for _ in 0..seq.len() {
-            buf.push(b'I');
-        }
+        buf.resize(buf.len() + seq.len(), b'I');
         buf.push(b'\n');
     }
     write_tmp_file(name, &buf)
@@ -315,7 +314,7 @@ fn tiled_single_tile_is_trivial_and_still_works() {
     };
     run_tiled(
         reference,
-        &[r1_path.clone()],
+        std::slice::from_ref(&r1_path),
         Some(out_path.clone()),
         cfg,
         tile_plan,

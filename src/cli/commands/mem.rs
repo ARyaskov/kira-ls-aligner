@@ -261,10 +261,10 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         );
     }
 
-    if let Some(rg) = args.read_group.as_deref() {
-        if rg.contains("\\t") {
-            args.read_group = Some(rg.replace("\\t", "\t"));
-        }
+    if let Some(rg) = args.read_group.as_deref()
+        && rg.contains("\\t")
+    {
+        args.read_group = Some(rg.replace("\\t", "\t"));
     }
     let max_alignments = if args.output_all {
         // bwa-mem `-a`: report every alignment found. Stage 4 keeps at most

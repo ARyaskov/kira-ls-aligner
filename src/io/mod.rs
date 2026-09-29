@@ -331,6 +331,7 @@ fn open_fastx_reader<P: AsRef<Path>>(path: P) -> Result<FastxReaderWithProgress>
 /// One read input. FASTQ goes through kira-fastq (mmap / parallel BGZF);
 /// FASTA reads (no qualities) go through needletail, which the reference
 /// parser already uses.
+#[allow(clippy::large_enum_variant)] // one per input file
 enum ReadBackend {
     Fastq(KiraFastqReader),
     Fasta {

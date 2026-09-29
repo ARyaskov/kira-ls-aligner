@@ -158,10 +158,10 @@ impl MergeIter {
         // Pull from every reader whose peek matches `min_idx`.
         let mut combined: Vec<Alignment> = Vec::new();
         for r in self.readers.iter_mut() {
-            if r.peek_idx()? == Some(min_idx) {
-                if let Some((_, alns)) = r.next_record()? {
-                    combined.extend(alns);
-                }
+            if r.peek_idx()? == Some(min_idx)
+                && let Some((_, alns)) = r.next_record()?
+            {
+                combined.extend(alns);
             }
         }
         Ok(Some((min_idx, combined)))

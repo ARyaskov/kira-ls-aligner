@@ -178,11 +178,11 @@ pub fn left_normalize_indels(
     // ops (e.g. `3M 2M` after a partial shift).
     let mut compact: Vec<CigarOp> = Vec::with_capacity(ops.len());
     for op in ops {
-        if let Some(last) = compact.last_mut() {
-            if last.op == op.op {
-                last.len += op.len;
-                continue;
-            }
+        if let Some(last) = compact.last_mut()
+            && last.op == op.op
+        {
+            last.len += op.len;
+            continue;
         }
         compact.push(op);
     }

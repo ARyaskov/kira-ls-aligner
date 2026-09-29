@@ -190,7 +190,7 @@ fn run_tiled_inner(
     while let Some(reads) = stream.next_batch()? {
         let n = reads.len();
         let mut alignments: Vec<Vec<Alignment>> = vec![Vec::new(); n];
-        for i in 0..n {
+        for (i, slot) in alignments.iter_mut().enumerate() {
             let this_idx = global_read_idx + i as u64;
             while let Some((m_idx, _)) = &next_merged {
                 if *m_idx < this_idx {
@@ -199,13 +199,13 @@ fn run_tiled_inner(
                     break;
                 }
             }
-            if let Some((m_idx, _)) = &next_merged {
-                if *m_idx == this_idx {
-                    if let Some((_, alns)) = next_merged.take() {
-                        alignments[i] = alns;
-                    }
-                    next_merged = merge.next_merged()?;
+            if let Some((m_idx, _)) = &next_merged
+                && *m_idx == this_idx
+            {
+                if let Some((_, alns)) = next_merged.take() {
+                    *slot = alns;
                 }
+                next_merged = merge.next_merged()?;
             }
         }
         global_read_idx += n as u64;

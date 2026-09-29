@@ -89,6 +89,7 @@ pub fn identity_x10000(len: usize, mism: usize) -> u16 {
 }
 
 /// Run ungapped SIMD extension + Myers bounded edit distance prefilter.
+#[allow(clippy::too_many_arguments)]
 pub fn prefilter_chain(
     read_seq: &[u8],
     ref_seq: &[u8],
@@ -241,7 +242,7 @@ pub fn prefilter_chain(
         };
     }
 
-    let hard_max_mism = ((read_len * 5) + 149) / 150;
+    let hard_max_mism = (read_len * 5).div_ceil(150);
     let max_mism = accept_max_mismatches.min(hard_max_mism);
     if hamming > max_mism {
         return PrefilterOutcome {

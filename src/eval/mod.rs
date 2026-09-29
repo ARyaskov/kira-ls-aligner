@@ -50,30 +50,28 @@ pub fn parse_truth(qname: &str) -> Option<TruthLocus> {
         .unwrap_or(qname);
 
     // Colon form: <name>:<contig>:<start>-<end>
-    if let Some((head, range)) = core.rsplit_once(':') {
-        if let Some((_, contig)) = head.rsplit_once(':') {
-            if let Some((s, e)) = range.rsplit_once('-') {
-                if let (Ok(start), Ok(end)) = (s.parse::<i64>(), e.parse::<i64>()) {
-                    return Some(TruthLocus {
-                        contig: contig.to_string(),
-                        start,
-                        end,
-                    });
-                }
-            }
-        }
+    if let Some((head, range)) = core.rsplit_once(':')
+        && let Some((_, contig)) = head.rsplit_once(':')
+        && let Some((s, e)) = range.rsplit_once('-')
+        && let (Ok(start), Ok(end)) = (s.parse::<i64>(), e.parse::<i64>())
+    {
+        return Some(TruthLocus {
+            contig: contig.to_string(),
+            start,
+            end,
+        });
     }
 
     // Underscore form: <name>_<contig>_<start>_<end>
     let parts: Vec<&str> = core.rsplitn(4, '_').collect();
-    if parts.len() == 4 {
-        if let (Ok(end), Ok(start)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-            return Some(TruthLocus {
-                contig: parts[2].to_string(),
-                start,
-                end,
-            });
-        }
+    if parts.len() == 4
+        && let (Ok(end), Ok(start)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+    {
+        return Some(TruthLocus {
+            contig: parts[2].to_string(),
+            start,
+            end,
+        });
     }
     None
 }

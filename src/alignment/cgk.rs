@@ -194,7 +194,7 @@ impl FingerprintScheme {
     /// Build a scheme for inputs of fixed length `input_len` bytes.
     pub fn new(seed: u64, input_len: usize, n_banks: usize) -> Self {
         let embed_bits = 6 * input_len;
-        let advice = EmbeddingAdvice::new(seed ^ 0xA11CE_5EED_u64, embed_bits);
+        let advice = EmbeddingAdvice::new(seed ^ 0xA11CE5EED_u64, embed_bits);
         let mut banks = Vec::with_capacity(n_banks);
         for b in 0..n_banks {
             let bank_seed = seed.wrapping_mul(0x100000001b3).wrapping_add(b as u64);

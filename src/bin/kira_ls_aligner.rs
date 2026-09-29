@@ -19,6 +19,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once; MemArgs is simply large
 enum Commands {
     /// Build a minimizer index
     Index(IndexArgs),

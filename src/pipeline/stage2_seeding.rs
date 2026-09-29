@@ -252,11 +252,11 @@ fn seed_one(
         ctx.occs.clear();
         let slot_opt = ctx.ids_scratch[m_idx];
         let mut hot_hit = false;
-        if let Some(slot) = slot_opt {
-            if let Some(cached) = table.hot_lookup(slot as u32) {
-                ctx.occs.extend_from_slice(cached);
-                hot_hit = true;
-            }
+        if let Some(slot) = slot_opt
+            && let Some(cached) = table.hot_lookup(slot as u32)
+        {
+            ctx.occs.extend_from_slice(cached);
+            hot_hit = true;
         }
         if !hot_hit {
             for occ_idx in start..end {

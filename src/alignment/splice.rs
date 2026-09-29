@@ -193,7 +193,7 @@ fn refine_splice_boundary(
             confidence,
             left_shift,
         };
-        if best.as_ref().map_or(true, |(s, _)| total > *s) {
+        if best.as_ref().is_none_or(|(s, _)| total > *s) {
             best = Some((total, cand));
         }
     }
@@ -202,6 +202,7 @@ fn refine_splice_boundary(
 
 /// Replay `len` aligned columns (read `q0..`, ref `t0..`) as matches and
 /// mismatches into the running MD/NM/score accumulators.
+#[allow(clippy::too_many_arguments)]
 fn replay_diagonal(
     read_seq: &[u8],
     ref_seq: &[u8],
@@ -689,11 +690,7 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
                     }
                 }
                 CigarKind::Del | CigarKind::Skipped => {
-                    if op.op == CigarKind::Del {
-                        ref_end = ref_end.saturating_sub(op.len);
-                    } else {
-                        ref_end = ref_end.saturating_sub(op.len);
-                    }
+                    ref_end = ref_end.saturating_sub(op.len);
                 }
                 CigarKind::SoftClip => {
                     // Existing soft-clip — fold in.
@@ -720,10 +717,10 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
         let trailing_unclipped = read_len.saturating_sub(read_end);
         if trailing_unclipped > total_sc {
             // adjust the last SoftClip
-            if let Some(last) = new_cigar.last_mut() {
-                if last.op == CigarKind::SoftClip {
-                    last.len = trailing_unclipped;
-                }
+            if let Some(last) = new_cigar.last_mut()
+                && last.op == CigarKind::SoftClip
+            {
+                last.len = trailing_unclipped;
             }
         }
     } else {
@@ -851,11 +848,11 @@ fn push_cigar(out: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
     if len == 0 {
         return;
     }
-    if let Some(last) = out.last_mut() {
-        if last.op == op {
-            last.len += len;
-            return;
-        }
+    if let Some(last) = out.last_mut()
+        && last.op == op
+    {
+        last.len += len;
+        return;
     }
     out.push(CigarOp { len, op });
 }

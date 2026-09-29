@@ -3,6 +3,7 @@
 //! `rescue_unmapped_mates`, the previously-empty side should carry a
 //! banded-SW alignment landing inside the insert window.
 
+#![allow(clippy::field_reassign_with_default)]
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::index::{Index, IndexConfig};
 use kira_ls_aligner::io::IngestMode;

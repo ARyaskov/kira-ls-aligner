@@ -453,10 +453,10 @@ fn unique_mate_supported_chain(
     let mate_probe = mate_chains.len().min(max_k);
 
     let mut found: Option<usize> = None;
-    for ci in 0..probe {
+    for (ci, chain) in chain_list.iter().enumerate().take(probe) {
         let supported = mate_chains[..mate_probe]
             .iter()
-            .any(|m| chains_look_paired(&chain_list[ci], m, window));
+            .any(|m| chains_look_paired(chain, m, window));
         if supported {
             if found.is_some() {
                 return None; // more than one plausible locus ⇒ no information
@@ -482,6 +482,7 @@ fn ambig_div() -> i32 {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_read_prefilter<'read, 'index>(
     idx: usize,
     read: &'read ReadRecord,
@@ -776,44 +777,42 @@ fn process_read_prefilter<'read, 'index>(
         let cpu_fast_path_enabled = !crate::cuda::dispatcher::is_active();
         #[cfg(not(feature = "cuda"))]
         let cpu_fast_path_enabled = true;
-        if cpu_fast_path_enabled {
-            if let Some((aln, fast_kind)) =
+        if cpu_fast_path_enabled
+            && let Some((aln, fast_kind)) =
                 try_fast_dp_alignment(read_seq, ref_seq, &span, chain.score, cfg.cfg, is_rev)
-            {
-                res.accepted.push(aln);
-                res.dp_used = true;
-                match fast_kind {
-                    FastPathKind::PackedSpectral => res.packed_spectral_resolved += 1,
-                    FastPathKind::SpectralSieve => res.spectral_sieve_resolved += 1,
-                    FastPathKind::Wfa => res.wfa_resolved += 1,
-                    FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
-                    FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
-                }
-                continue;
+        {
+            res.accepted.push(aln);
+            res.dp_used = true;
+            match fast_kind {
+                FastPathKind::PackedSpectral => res.packed_spectral_resolved += 1,
+                FastPathKind::SpectralSieve => res.spectral_sieve_resolved += 1,
+                FastPathKind::Wfa => res.wfa_resolved += 1,
+                FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
+                FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
             }
+            continue;
         }
 
         let use_simd = res.bucket < 2 && lanes > 1;
-        if use_simd {
-            if let Some((win_start, ref_window)) =
+        if use_simd
+            && let Some((win_start, ref_window)) =
                 build_simd_window(ref_seq, chain, read_len, cfg.cfg)
-            {
-                res.simd_jobs.push(SimdJob {
-                    read_idx: idx,
-                    read_seq: if is_rev {
-                        Cow::Owned(read_seq.to_vec())
-                    } else {
-                        Cow::Borrowed(read_fwd)
-                    },
-                    ref_window,
-                    win_start,
-                    chain: span,
-                    is_rev,
-                    abort_score,
-                });
-                res.dp_used = true;
-                continue;
-            }
+        {
+            res.simd_jobs.push(SimdJob {
+                read_idx: idx,
+                read_seq: if is_rev {
+                    Cow::Owned(read_seq.to_vec())
+                } else {
+                    Cow::Borrowed(read_fwd)
+                },
+                ref_window,
+                win_start,
+                chain: span,
+                is_rev,
+                abort_score,
+            });
+            res.dp_used = true;
+            continue;
         }
         res.scalar_jobs.push(ScalarJob {
             read_idx: idx,

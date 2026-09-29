@@ -260,7 +260,7 @@ fn polya_tail_is_soft_clipped() {
     // Two-exon read with 50 bp polyA tail at the 3' end.
     let mut read_seq = ref_seq[2000..2200].to_vec();
     read_seq.extend_from_slice(&ref_seq[2700..2900]);
-    read_seq.extend(std::iter::repeat(b'A').take(50));
+    read_seq.extend(std::iter::repeat_n(b'A', 50));
     let original_read_len = read_seq.len();
     let read = ReadRecord {
         id: "polya_read".to_string(),
@@ -344,7 +344,7 @@ fn polya_disabled_when_min_len_zero() {
 
     let mut read_seq = ref_seq[2000..2200].to_vec();
     read_seq.extend_from_slice(&ref_seq[2700..2900]);
-    read_seq.extend(std::iter::repeat(b'A').take(50));
+    read_seq.extend(std::iter::repeat_n(b'A', 50));
     let read = ReadRecord {
         id: "x".to_string(),
         seq: read_seq,

@@ -73,7 +73,7 @@ fn forward_exact_match_yields_one_alignment() {
     let pattern = asymmetric_pattern();
     let mut reference_bytes = vec![b'A'; 30];
     reference_bytes.extend_from_slice(&pattern);
-    reference_bytes.extend_from_slice(&vec![b'A'; 30]);
+    reference_bytes.extend_from_slice(&[b'A'; 30]);
     let reference = make_ref(vec![("ref1", &reference_bytes)]);
     let index = make_index(reference);
 
@@ -101,7 +101,7 @@ fn reverse_complement_match_marks_is_rev() {
     let rc = crate::seq::reverse_complement(&pattern);
     let mut reference_bytes = vec![b'A'; 20];
     reference_bytes.extend_from_slice(&rc);
-    reference_bytes.extend_from_slice(&vec![b'A'; 20]);
+    reference_bytes.extend_from_slice(&[b'A'; 20]);
     let reference = make_ref(vec![("ref1", &reference_bytes)]);
     let index = make_index(reference);
 
@@ -123,7 +123,7 @@ fn read_with_n_falls_through() {
     let pattern_clean = asymmetric_pattern();
     let mut reference_bytes = vec![b'A'; 20];
     reference_bytes.extend_from_slice(&pattern_clean);
-    reference_bytes.extend_from_slice(&vec![b'A'; 20]);
+    reference_bytes.extend_from_slice(&[b'A'; 20]);
     let reference = make_ref(vec![("ref1", &reference_bytes)]);
     let index = make_index(reference);
 
@@ -142,7 +142,7 @@ fn short_read_below_min_pattern_len_is_skipped() {
     let pattern = b"AAAAAAGGGGGGAAAAAAGGGG".to_vec(); // 22 bp < 30
     let mut reference_bytes = vec![b'A'; 20];
     reference_bytes.extend_from_slice(&pattern);
-    reference_bytes.extend_from_slice(&vec![b'A'; 20]);
+    reference_bytes.extend_from_slice(&[b'A'; 20]);
     let reference = make_ref(vec![("ref1", &reference_bytes)]);
     let index = make_index(reference);
 
@@ -169,7 +169,7 @@ fn ambiguous_exact_match_falls_through_when_only_one_alignment_requested() {
     let pattern = asymmetric_pattern();
     let mut reference_bytes = Vec::new();
     reference_bytes.extend_from_slice(&pattern);
-    reference_bytes.extend_from_slice(&vec![b'T'; 20]);
+    reference_bytes.extend_from_slice(&[b'T'; 20]);
     reference_bytes.extend_from_slice(&pattern);
     let index = make_index(make_ref(vec![("ref1", &reference_bytes)]));
     let mut reads = vec![read("repeat", &pattern)];
@@ -185,7 +185,7 @@ fn ambiguous_exact_match_retains_competitors_when_requested() {
     let pattern = asymmetric_pattern();
     let mut reference_bytes = Vec::new();
     reference_bytes.extend_from_slice(&pattern);
-    reference_bytes.extend_from_slice(&vec![b'T'; 20]);
+    reference_bytes.extend_from_slice(&[b'T'; 20]);
     reference_bytes.extend_from_slice(&pattern);
     let index = make_index(make_ref(vec![("ref1", &reference_bytes)]));
     let mut reads = vec![read("repeat", &pattern)];

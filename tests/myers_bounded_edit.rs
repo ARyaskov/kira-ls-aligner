@@ -147,7 +147,7 @@ fn early_exit_preserves_accept_boundary_across_max_k() {
         let mut text: Vec<u8> = (0..n)
             .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
             .collect();
-        if xorshift(&mut rng) % 2 == 0 && n >= m {
+        if xorshift(&mut rng).is_multiple_of(2) && n >= m {
             let start = (xorshift(&mut rng) as usize) % (n - m + 1);
             text[start..start + m].copy_from_slice(&pattern);
         }
@@ -224,7 +224,7 @@ fn random_corpus_matches_naive() {
         let mut text: Vec<u8> = (0..n)
             .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
             .collect();
-        if xorshift(&mut rng) % 2 == 0 && n >= m {
+        if xorshift(&mut rng).is_multiple_of(2) && n >= m {
             let start = (xorshift(&mut rng) as usize) % (n - m + 1);
             text[start..start + m].copy_from_slice(&pattern);
         }

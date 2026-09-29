@@ -32,6 +32,6 @@ fn features_come_from_length_percentiles() {
     let mut lengths: Vec<usize> = (1..=100).collect();
     let f = ModeFeatures::from_read_lengths(&mut lengths);
     assert_eq!((f.read_len_p50, f.read_len_p90, f.n_reads), (50, 90, 100));
-    let f = ModeFeatures::from_read_lengths(&mut Vec::new());
+    let f = ModeFeatures::from_read_lengths(&mut []);
     assert_eq!(f.n_reads, 0);
 }

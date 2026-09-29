@@ -43,7 +43,7 @@ fn advice_bit_distribution_is_balanced() {
     let a = EmbeddingAdvice::new(0xCAFE, 900);
     let ones = (0..900).filter(|&i| a.get(i) != 0).count();
     assert!(
-        ones >= 900 * 35 / 100 && ones <= 900 * 65 / 100,
+        (900 * 35 / 100..=900 * 65 / 100).contains(&ones),
         "advice 1-bit count {} outside [35%, 65%]",
         ones
     );

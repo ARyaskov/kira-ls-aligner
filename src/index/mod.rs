@@ -32,7 +32,9 @@ pub struct Occ {
     pub strand: Strand,
 }
 
-/// Hash → bucket-id lookup.
+/// Hash → bucket-id lookup. One instance per index table, so the size
+/// difference between the variants is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum HashLookup {
     Mph(kira_kv_engine::Index),
     Sorted(Vec<u64>),
@@ -745,11 +747,11 @@ impl MinimizerIndex {
             }
             if top.len() < top_n {
                 top.push(Reverse((len, slot as u32)));
-            } else if let Some(&Reverse((min_len, _))) = top.peek() {
-                if len > min_len {
-                    top.pop();
-                    top.push(Reverse((len, slot as u32)));
-                }
+            } else if let Some(&Reverse((min_len, _))) = top.peek()
+                && len > min_len
+            {
+                top.pop();
+                top.push(Reverse((len, slot as u32)));
             }
         }
 
@@ -1098,6 +1100,7 @@ impl Index {
     /// Convenience: build the LSH index AND owned base copies, and install
     /// it as the process-global rescue. Returns the total entry count for
     /// telemetry.
+    #[allow(clippy::too_many_arguments)]
     pub fn install_lsh_rescue(
         &self,
         cfg: crate::alignment::AlignmentConfig,
@@ -1130,6 +1133,7 @@ impl Index {
     }
 
     /// Convenience: build the CGK index AND owned base copies.
+    #[allow(clippy::too_many_arguments)]
     pub fn install_cgk_rescue(
         &self,
         cfg: crate::alignment::AlignmentConfig,
