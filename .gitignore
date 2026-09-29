@@ -28,6 +28,11 @@ minimap2/
 ### Test inputs we don't ship with the repo ###
 # These come from public archives and are too large for the repo. Users
 # are expected to download them separately (see docs/ for sources).
+# The E. coli reference used by the README examples (4.6 MB; see README
+# "Test Data / Provenance" for the download URL) and two local stub files.
+ecoli.fa
+reads.fq
+ref.fa
 *.fastq
 *.fastq.gz
 *.fq

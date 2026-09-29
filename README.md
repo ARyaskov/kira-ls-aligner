@@ -461,14 +461,21 @@ Takeaways:
 
 ## Test Data / Provenance
 
-The repository contains two reference FASTA files:
+No reference FASTA is shipped in the repository. The E. coli K-12 MG1655
+reference used by the examples above (`ecoli.fa`) is NCBI RefSeq accession
+GCF_000005845.2; download and decompress it into the project root:
+
+```bash
+curl -O https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz
+gunzip -c GCF_000005845.2_ASM584v2_genomic.fna.gz > ecoli.fa
+```
+
+`ecoli.fa`, its `.fai` sidecar and the local stubs `reads.fq` / `ref.fa` are
+listed in `.gitignore`, so they stay out of commits.
 
 Regression and release benchmark comparisons should pass the versioned
 [benchmark gate](docs/benchmarking.md), which checks runtime together with SNP
 and INDEL F1 instead of accepting speed-only changes.
-
-- `ecoli.fa`: normalized E. coli K-12 MG1655 reference derived from NCBI RefSeq accession GCF_000005845.2.
-- `ref.fa`: tiny toy reference for smoke testing.
 
 Read sets, truth VCFs, and caller outputs are intentionally not versioned in
 this repository. Record their accession/checksum and exact preparation command
