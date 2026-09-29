@@ -320,13 +320,40 @@ fn unmapped_paired_record_has_full_flag_set() {
     assert_eq!(flag & 0x8, 0, "mate is mapped");
     assert!(flag & 0x20 != 0, "mate reverse");
     assert!(flag & 0x80 != 0, "R2");
-    assert_eq!(rname, "*");
-    assert_eq!(pos, 0);
+    // An unmapped read with a mapped mate is placed at the mate's position
+    // (SAM spec 2.4 recommended practice) so it sorts next to its mate.
+    assert_eq!(rname, "chr1");
+    assert_eq!(pos, 251);
     assert_eq!(mapq, 0);
     assert_eq!(cigar, "*");
-    // RNEXT is the mate's ref name when mate is mapped.
-    assert_eq!(rnext, "chr1");
+    assert_eq!(rnext, "=");
     assert_eq!(pnext, 251);
+}
+
+#[test]
+fn unmapped_read_with_unmapped_mate_stays_unplaced() {
+    let fmt = SamFormatter::new(Arc::new(make_reference()));
+    let mate = MateInfo {
+        is_paired: true,
+        is_proper_pair: false,
+        mate_is_unmapped: true,
+        mate_is_rev: false,
+        is_first_in_pair: true,
+        is_second_in_pair: false,
+        mate_ref_id: None,
+        mate_pos: 0,
+        tlen: 0,
+    };
+    let mut buf = Vec::new();
+    fmt.append_unmapped_with_mate(&mut buf, &r1_record(), Some(&mate));
+    let (flag, rname, pos, _mapq, cigar, rnext, pnext, tlen) = parse_sam(&buf);
+    assert_eq!(flag & 0xd, 0xd, "paired, unmapped, mate unmapped");
+    assert_eq!(rname, "*");
+    assert_eq!(pos, 0);
+    assert_eq!(cigar, "*");
+    assert_eq!(rnext, "*");
+    assert_eq!(pnext, 0);
+    assert_eq!(tlen, 0);
 }
 
 #[test]

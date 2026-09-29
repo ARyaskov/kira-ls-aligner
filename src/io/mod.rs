@@ -851,22 +851,24 @@ impl SamFormatter {
         buf.extend_from_slice(read.id.as_bytes());
         buf.push(b'\t');
         push_u32(buf, flag as u32);
-        // RNAME='*'  POS=0  MAPQ=0  CIGAR='*'  for unmapped
-        buf.extend_from_slice(b"\t*\t0\t0\t*\t");
 
-        // RNEXT/PNEXT/TLEN
+        // An unmapped read whose mate is mapped takes the mate's RNAME/POS
+        // (SAM spec 2.4 recommended practice, as bwa-mem does) so it sorts
+        // next to its mate and is returned by region queries; RNEXT is then
+        // `=`. Otherwise RNAME='*' POS=0. MAPQ=0, CIGAR='*', TLEN=0 always.
         match mate {
-            Some(m) if m.mate_ref_id.is_some() => {
+            Some(m) if m.mate_ref_id.is_some() && !m.mate_is_unmapped => {
                 let mate_rname = &self.reference.sequences[m.mate_ref_id.unwrap() as usize].name;
+                buf.push(b'\t');
                 buf.extend_from_slice(mate_rname.as_bytes());
                 buf.push(b'\t');
                 push_u32(buf, m.mate_pos + 1);
-                buf.push(b'\t');
-                push_i32(buf, 0); // TLEN is 0 when this record is unmapped
-                buf.push(b'\t');
+                buf.extend_from_slice(b"\t0\t*\t=\t");
+                push_u32(buf, m.mate_pos + 1);
+                buf.extend_from_slice(b"\t0\t");
             }
             _ => {
-                buf.extend_from_slice(b"*\t0\t0\t");
+                buf.extend_from_slice(b"\t*\t0\t0\t*\t*\t0\t0\t");
             }
         }
 
