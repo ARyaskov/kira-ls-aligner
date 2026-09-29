@@ -1132,9 +1132,18 @@ impl SamFormatter {
         buf.push(b'\n');
     }
 
-    pub fn append_sa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
+    /// `SA:Z:` for the record at `self_idx` of a chimeric read: every other
+    /// segment of the chimera (the primary first, then the supplementaries),
+    /// so the primary is recoverable from any supplementary line (SAM spec
+    /// 1.5; SV callers read `SA` on the 0x800 records). Secondaries are not
+    /// segments of the chimera and are skipped.
+    pub fn append_sa(&self, buf: &mut Vec<u8>, alignments: &[Alignment], self_idx: usize) -> bool {
         let mut added = false;
-        for aln in alignments.iter().filter(|a| a.is_supplementary) {
+        for (_, aln) in alignments
+            .iter()
+            .enumerate()
+            .filter(|(idx, a)| *idx != self_idx && (*idx == 0 || a.is_supplementary))
+        {
             if !added {
                 buf.extend_from_slice(b"\tSA:Z:");
                 added = true;
@@ -1325,8 +1334,8 @@ impl SamWriter {
     pub fn append_xa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
         self.formatter.append_xa(buf, alignments)
     }
-    pub fn append_sa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
-        self.formatter.append_sa(buf, alignments)
+    pub fn append_sa(&self, buf: &mut Vec<u8>, alignments: &[Alignment], self_idx: usize) -> bool {
+        self.formatter.append_sa(buf, alignments, self_idx)
     }
 
     pub fn flush(&mut self) -> Result<()> {

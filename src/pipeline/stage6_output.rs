@@ -122,31 +122,34 @@ pub fn serialize_into(
                                 output_cfg.append_comment,
                             );
                         } else {
-                            extra_tags.clear();
-                            if output_cfg.write_xa {
-                                formatter.append_xa_capped(&mut extra_tags, alns, output_cfg.xa_max);
-                            }
-                            if output_cfg.write_sa {
-                                formatter.append_sa(&mut extra_tags, alns);
-                            }
-                            if let Some(t) = mtags {
-                                extra_tags.extend_from_slice(t);
-                            }
-                            let extra = if extra_tags.is_empty() {
-                                None
-                            } else {
-                                Some(extra_tags.as_slice())
-                            };
+                            let has_supplementary = alns.iter().any(|a| a.is_supplementary);
                             for (idx, aln) in alns.iter().enumerate() {
-                                // Primary: XA/SA + mate tags. Supplementary:
-                                // mate tags only (fixmate stamps them too).
+                                // Primary: XA + SA + mate tags. Supplementary:
+                                // its own SA (the other segments) + mate tags.
                                 // Secondary: nothing beyond the core tags.
-                                let tags = if idx == 0 {
-                                    extra
-                                } else if aln.is_supplementary {
-                                    mtags
-                                } else {
+                                extra_tags.clear();
+                                if idx == 0 && output_cfg.write_xa {
+                                    formatter.append_xa_capped(
+                                        &mut extra_tags,
+                                        alns,
+                                        output_cfg.xa_max,
+                                    );
+                                }
+                                if has_supplementary
+                                    && output_cfg.write_sa
+                                    && (idx == 0 || aln.is_supplementary)
+                                {
+                                    formatter.append_sa(&mut extra_tags, alns, idx);
+                                }
+                                if (idx == 0 || aln.is_supplementary)
+                                    && let Some(t) = mtags
+                                {
+                                    extra_tags.extend_from_slice(t);
+                                }
+                                let tags = if extra_tags.is_empty() {
                                     None
+                                } else {
+                                    Some(extra_tags.as_slice())
                                 };
                                 formatter.append_alignment(
                                     &mut buf, read, aln, read_group, tags, output_cfg,

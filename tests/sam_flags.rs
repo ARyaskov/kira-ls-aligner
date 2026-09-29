@@ -398,3 +398,29 @@ fn zero_length_read_emits_star_seq_and_qual() {
     assert_eq!(cols[9], "*", "SEQ");
     assert_eq!(cols[10], "*", "QUAL");
 }
+
+/// Every segment of a chimeric read lists the *other* segments in `SA`, so
+/// the primary is recoverable from a supplementary line.
+#[test]
+fn sa_tag_on_supplementary_lists_primary_and_other_segments() {
+    let fmt = SamFormatter::new(Arc::new(make_reference()));
+    let primary = base_alignment(0, 100, 200, false);
+    let mut supp1 = base_alignment(1, 300, 350, true);
+    supp1.is_supplementary = true;
+    supp1.mapq = 40;
+    let mut supp2 = base_alignment(0, 700, 760, false);
+    supp2.is_supplementary = true;
+    supp2.mapq = 20;
+    let mut secondary = base_alignment(1, 900, 1000, false);
+    secondary.is_secondary = true;
+    let alns = vec![primary, supp1, supp2, secondary];
+
+    let sa = |idx: usize| {
+        let mut buf = Vec::new();
+        fmt.append_sa(&mut buf, &alns, idx);
+        String::from_utf8(buf).unwrap()
+    };
+    assert_eq!(sa(0), "\tSA:Z:chr2,301,-,50M,40,0;chr1,701,+,60M,20,0;");
+    assert_eq!(sa(1), "\tSA:Z:chr1,101,+,100M,60,0;chr1,701,+,60M,20,0;");
+    assert_eq!(sa(2), "\tSA:Z:chr1,101,+,100M,60,0;chr2,301,-,50M,40,0;");
+}
