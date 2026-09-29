@@ -263,9 +263,12 @@ fn transition_score(prev: &Anchor, cur: &Anchor, cfg: ChainingConfig) -> Option<
         return None;
     }
 
-    let q_gap = cur.read_start.saturating_sub(prev.read_end) as i32;
-    let r_gap = cur.ref_start.saturating_sub(prev.ref_end) as i32;
-    let diagonal_error = (q_gap - r_gap).unsigned_abs() as i32;
+    // Diagonal drift between the two anchors' starts (minimap2's
+    // `|dr - dq|`). Using the saturating end-to-start gaps here instead
+    // would hide any shift up to the overlap length whenever anchors
+    // overlap, and overlapping anchors are the norm after exact-seed runs
+    // are merged.
+    let diagonal_error = (dq as i64 - dr as i64).unsigned_abs() as i32;
     let penalty = if diagonal_error == 0 {
         0
     } else {

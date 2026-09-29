@@ -127,3 +127,40 @@ fn valid_predecessor_is_used_when_higher_score_candidate_has_bad_geometry() {
         c.anchors.len() == 2 && c.anchors[0].read_start == 0 && c.anchors[1].read_start == 120
     }));
 }
+
+/// Regression: the gap penalty was derived from saturating end-to-start
+/// gaps, so two anchors that overlap on the read (`q_gap = 0`) but sit on
+/// different diagonals were charged nothing, and an off-diagonal
+/// predecessor could out-score the true collinear one.
+#[test]
+fn overlapping_anchors_on_shifted_diagonals_are_penalised() {
+    let a = |read_start: u32, ref_start: u32| Anchor {
+        read_start,
+        read_end: read_start + 20,
+        ref_id: 0,
+        ref_start,
+        ref_end: ref_start + 20,
+        strand: Strand::Forward,
+        score: 20,
+    };
+    // prev = read[0,20)/ref[100,120); two candidates for the next anchor,
+    // both starting at read 15 and overlapping prev by 5: one collinear
+    // (diagonal 100), one shifted by a 3 bp deletion (diagonal 103).
+    let collinear = vec![a(0, 100), a(15, 115)];
+    let shifted = vec![a(0, 100), a(15, 118)];
+    let mut stats = ChainingStats::default();
+    let c1 = chain_anchors(&collinear, cfg(), &mut stats);
+    let c2 = chain_anchors(&shifted, cfg(), &mut stats);
+    assert_eq!(c1[0].anchors.len(), 2);
+    assert_eq!(c2[0].anchors.len(), 2);
+    assert!(
+        c2[0].score < c1[0].score,
+        "a 3 bp diagonal shift must cost more than a collinear extension \
+         (collinear {}, shifted {})",
+        c1[0].score,
+        c2[0].score
+    );
+    // The penalty is gap_open + gap_extend*3 + round(log2(4)*log_gap)
+    // = 6 + 3 + 2 = 11 for the cfg() parameters.
+    assert_eq!(c1[0].score - c2[0].score, 11);
+}
