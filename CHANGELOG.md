@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-30
+
+Breaking: `-I` takes bwa-mem's `mean[,sd[,max[,min]]]` (the old `MIN,MAX[,MEAN,SD]` form is `--insert-window`), `-w` is the DP band width (the minimizer window is `--window-len`), `SamWriter::new`/`from_writer` borrow the reference, `SamFormatter::append_sa` takes the record index, `FusedAlignerParams` gained `insert_window` and `insert_size` became optional, `AlignerConfig` gained `sketch_explicit`, `TiledRunConfig` gained `keep_comment`, and `ModeFeatures` holds only read-length statistics.
+
 ### Fixed
 
 - Mate rescue now searches a window centred on the mate's expected span instead of an offset one.
