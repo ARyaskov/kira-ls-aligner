@@ -1,3 +1,3 @@
-﻿# Docs
+# Docs
 
 Project docs live here.

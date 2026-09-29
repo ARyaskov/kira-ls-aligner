@@ -44,9 +44,9 @@ mod cuda_build {
         let out_dir = PathBuf::from(out_dir);
 
         // Spectral kernel powers the alignment prefilter — the only
-        // remaining CUDA kernel after GPU seeding was reverted (see
-        // src/cuda/mod.rs doc and docs/GPU_SEEDING_PLAN.md for the
-        // post-mortem on the abandoned mph_lookup / bucket_scan kernels).
+        // remaining CUDA kernel after GPU seeding was reverted (see the
+        // src/cuda/mod.rs doc for the post-mortem on the abandoned
+        // mph_lookup / bucket_scan kernels).
         compile_one(
             &nvcc,
             &PathBuf::from("src/cuda/spectral.cu"),

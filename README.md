@@ -1,4 +1,4 @@
-﻿# kira-ls-aligner
+# kira-ls-aligner
 
 `kira-ls-aligner` is a unified short- and long-read sequence aligner written in Rust 2024. It combines minimap2-style minimizers and chaining with BWA-MEM2-style exact-match anchoring and output semantics. The goal is drop-in compatibility with bwa-mem pipelines while supporting long reads efficiently.
 
@@ -143,7 +143,7 @@ set (alternating arms, minimum per stage) use this plus `KIRA_STATS=1`.
 The `mem` command line is a drop-in for `bwa mem`: the flags below carry
 bwa-mem's letters and meanings, an unmodified `bwa mem` invocation parses, and
 reads may come from stdin (`-`, plain or gzip). Flags bwa-mem has for
-heuristics this pipeline does not run (`-r -y -D -W -m -U -e -c -j`) are
+heuristics this pipeline does not run (`-r -y -D -W -m -U -e -c`) are
 accepted without effect and listed once on stderr.
 
 - `index REF` : Build a minimizer index.
@@ -170,7 +170,7 @@ accepted without effect and listed once on stderr.
 - `-k, --seed-len` : Seed length (overrides the preset for both indices).
 - `-w, --band-width` : Band width for banded DP extension (bwa-mem `-w`; overrides the preset band).
 - `--window-len` : Minimizer window size (long-only; must match the index).
-- `-x, --preset` : `short`, `long`, or `auto` (default; auto-selects mode at runtime).
+- `-x, --preset` : `short`, `long`, `splice`, `splice:hq`, or `auto` (default; auto-selects mode at runtime). bwa-mem's `pacbio`, `ont2d` and `intractg` map to `long`.
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
 - `--accept-enable` : Override the ungapped ACCEPT shortcut.
 - `--seed-occ-cap` : Maximum reference occurrences retained per read minimizer.
@@ -327,35 +327,6 @@ accumulating the run as SAM text. In-process consumers should prefer it;
 `align_to_sam_bytes` holds the entire run's text at once (5.2 GB on chr20) and
 its consumer then parses that straight back into records.
 
-Peak resident set of the fused `kira-bt solid` pipeline on chr20 30×, measured by
-sampling the process working set:
-
-| | peak |
-|---|---|
-| before | 19.7 GB |
-| releasing the sorted records before the caller runs | 14.7 GB |
-| + streaming records instead of SAM text | 14.4 GB |
-| + converting to the caller's form by consuming, not cloning | **12.0 GB** |
-
-Variant output is unchanged across all four. chr20 is ~2% of GRCh38, so this
-makes a 32 GB machine comfortable for a chromosome, but the peak still scales
-with the input.
-
-For that, `kira-bt solid --window-mb N` processes the reference in windows:
-alignments are spilled to per-window temporary BAMs as they are produced, and
-each window is then sorted, deduplicated and called on its own, so peak memory
-follows the window size instead of the run.
-
-| chr20 30×, same binary | peak | wall |
-|---|---|---|
-| resident (default) | 12.0 GB | ~230 s |
-| `--window-mb 16` | **3.4 GB** | ~295 s |
-
-The two produce **byte-identical VCFs**. Verified also at `--window-mb 100`
-(one window for the whole chromosome), which isolates the spill round-trip from
-the window boundaries — that too matches. Roughly 25–30% slower, for a peak that
-no longer grows with the input.
-
 An earlier revision of this table claimed 1.75× on the full pipeline. That was
 real but came from installing `mimalloc` as a `#[global_allocator]` *in the
 library*, which is imposed on every consumer's whole process — and it silently
@@ -426,8 +397,9 @@ Takeaways:
   orthogonal to alignment.
 
 > These are development results on a single chromosome, not a certified whole-genome benchmark.
-> See the versioned [benchmark gate](docs/benchmarking.md) (runtime + SNP/INDEL F1) for regression
-> criteria, and record accession/checksum + exact commands next to any result you reproduce.
+> Regression criteria are runtime plus SNP/INDEL F1 together (see
+> [where the time goes](docs/pipeline.md#where-the-time-goes) for the stage timers); record
+> accession/checksum + exact commands next to any result you reproduce.
 
 ## Kira LS Aligner vs bwa-mem2 vs minimap2 vs bwa-mem2/mm2-fast
 
@@ -473,9 +445,10 @@ gunzip -c GCF_000005845.2_ASM584v2_genomic.fna.gz > ecoli.fa
 `ecoli.fa`, its `.fai` sidecar and the local stubs `reads.fq` / `ref.fa` are
 listed in `.gitignore`, so they stay out of commits.
 
-Regression and release benchmark comparisons should pass the versioned
-[benchmark gate](docs/benchmarking.md), which checks runtime together with SNP
-and INDEL F1 instead of accepting speed-only changes.
+Regression and release benchmark comparisons should check runtime together
+with SNP and INDEL F1 instead of accepting speed-only changes; the per-stage
+timers in [where the time goes](docs/pipeline.md#where-the-time-goes) are how
+a runtime change is attributed.
 
 Read sets, truth VCFs, and caller outputs are intentionally not versioned in
 this repository. Record their accession/checksum and exact preparation command
