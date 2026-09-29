@@ -244,7 +244,10 @@ pub(crate) fn mate_search_window(
                 anchor_start + mean + half,
             )
         } else {
-            (anchor_end - mean - half, anchor_end - mean + half + mate_len)
+            (
+                anchor_end - mean - half,
+                anchor_end - mean + half + mate_len,
+            )
         }
     } else {
         let min = cfg.insert_min as i64;

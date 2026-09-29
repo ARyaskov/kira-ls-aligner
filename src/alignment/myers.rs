@@ -168,7 +168,11 @@ fn bounded_edit_distance_fixed(
             let new_vp = hn_shift | !(d0 | hp_shift);
             let new_vn = d0 & hp_shift;
 
-            let mask = if b == blocks - 1 { top_block_mask } else { !0u64 };
+            let mask = if b == blocks - 1 {
+                top_block_mask
+            } else {
+                !0u64
+            };
             vp[b] = new_vp & mask;
             vn[b] = new_vn & mask;
 
@@ -351,7 +355,8 @@ mod storage_equivalence_tests {
                 let fixed = bounded_edit_distance_fixed(&pattern, &text, max_k);
                 let heap = bounded_edit_distance_heap_for_test(&pattern, &text, max_k);
                 assert_eq!(
-                    fixed, heap,
+                    fixed,
+                    heap,
                     "m={m} n={n} max_k={max_k}\npattern={:?}\ntext={:?}",
                     String::from_utf8_lossy(&pattern),
                     String::from_utf8_lossy(&text)

@@ -955,7 +955,12 @@ mod underconsume_tests {
     /// Replay a WFA CIGAR against (read, text), returning (cost, query_consumed,
     /// text_consumed_end). A correct WFA result must satisfy:
     ///   cost == score, query_consumed == read.len(), text_end == aln.text_end.
-    fn replay(read: &[u8], text: &[u8], aln: &WfaAlignment, pen: WfaPenalties) -> (i32, usize, usize) {
+    fn replay(
+        read: &[u8],
+        text: &[u8],
+        aln: &WfaAlignment,
+        pen: WfaPenalties,
+    ) -> (i32, usize, usize) {
         let mut qi = 0usize;
         let mut ti = aln.text_start;
         let mut cost = 0i32;
@@ -1019,8 +1024,15 @@ mod underconsume_tests {
                     aln.cigar
                 );
                 let (cost, qi, ti) = replay(&read, &text, &aln, pen);
-                assert_eq!(qi, read.len(), "prefix={prefix} tail={tail}: query replay length");
-                assert_eq!(ti, aln.text_end, "prefix={prefix} tail={tail}: text_end mismatch");
+                assert_eq!(
+                    qi,
+                    read.len(),
+                    "prefix={prefix} tail={tail}: query replay length"
+                );
+                assert_eq!(
+                    ti, aln.text_end,
+                    "prefix={prefix} tail={tail}: text_end mismatch"
+                );
                 assert_eq!(
                     cost, aln.score,
                     "prefix={prefix} tail={tail}: replayed cost != reported score; cigar={:?}",

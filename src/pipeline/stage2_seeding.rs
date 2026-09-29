@@ -158,8 +158,14 @@ fn seed_template(
         let mut hints1 = std::mem::take(&mut ctx.hints_b);
         hints1.build_from(&a1);
         let out = if hints1.is_usable() {
-            let (a, before, occ, _) =
-                seed_one(&read_pair[0], &sketch_pair[0], index, cfg, ctx, Some(&hints1));
+            let (a, before, occ, _) = seed_one(
+                &read_pair[0],
+                &sketch_pair[0],
+                index,
+                cfg,
+                ctx,
+                Some(&hints1),
+            );
             (a, before, occ)
         } else {
             (a0, before0, occ0)
@@ -273,15 +279,13 @@ fn seed_one(
             truncated_any = true;
             match (hints, cfg.mate_window) {
                 (Some(h), Some(window)) => {
-                    ctx.occs.select_nth_unstable_by_key(
-                        take_n,
-                        |(rid, pos, strand)| {
+                    ctx.occs
+                        .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
                             (
                                 !h.supports(*rid, *pos, window),
                                 occurrence_sample_key(m.hash, *rid, *pos, *strand),
                             )
-                        },
-                    );
+                        });
                 }
                 _ => {
                     ctx.occs
@@ -551,10 +555,8 @@ fn extend_proto(
 
     // Extend left through the matching suffix of everything before the seed,
     // right through the matching prefix of everything after it.
-    let left = common_suffix_len(
-        &read_seq[..q_start as usize],
-        &ref_seq[..r_start as usize],
-    ) as i32;
+    let left =
+        common_suffix_len(&read_seq[..q_start as usize], &ref_seq[..r_start as usize]) as i32;
     q_start -= left;
     r_start -= left;
 
@@ -670,7 +672,10 @@ mod mate_hint_tests {
             .map(|i| anchor_at(0, i * HINT_BIN))
             .collect();
         h.build_from(&focused);
-        assert!(h.is_usable(), "a mate in {HINT_MAX_BINS} bins should be usable");
+        assert!(
+            h.is_usable(),
+            "a mate in {HINT_MAX_BINS} bins should be usable"
+        );
 
         // One bin more and it carries no positional information.
         let scattered: Vec<Anchor> = (0..HINT_MAX_BINS as u32 + 1)

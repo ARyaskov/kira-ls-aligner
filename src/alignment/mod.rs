@@ -1344,7 +1344,11 @@ fn banded_sw_with(
                     // base at the matrix top-left (soft-clip) — a long-standing off-by-one.
                     let qb = read[i - 1];
                     let rb = reference[(j - 1) as usize];
-                    let s = if qb == rb { cfg.match_score } else { -cfg.mismatch };
+                    let s = if qb == rb {
+                        cfg.match_score
+                    } else {
+                        -cfg.mismatch
+                    };
                     (0, s)
                 };
             let h_match = h_diag + score_diag;
@@ -2304,9 +2308,18 @@ mod adaptive_band_tests {
         read.extend_from_slice(&reference[0..50]);
         read.extend_from_slice(&reference[550..600]);
         let cigar = vec![
-            CigarOp { len: 50, op: CigarKind::Match },
-            CigarOp { len: 500, op: CigarKind::Skipped },
-            CigarOp { len: 50, op: CigarKind::Match },
+            CigarOp {
+                len: 50,
+                op: CigarKind::Match,
+            },
+            CigarOp {
+                len: 500,
+                op: CigarKind::Skipped,
+            },
+            CigarOp {
+                len: 50,
+                op: CigarKind::Match,
+            },
         ];
         let (nm, md) = compute_nm_md(&read, &reference, 0, 0, &cigar);
         assert_eq!(nm, 0);
@@ -2384,7 +2397,13 @@ mod adaptive_band_tests {
 
         // Exact read: ungapped_mism = 0 short-circuits to not-beaten.
         let exact = reference[10..70].to_vec();
-        assert!(!ungapped_beaten_by_gap(&exact, &reference, &mk_span(exact.len()), 0, c));
+        assert!(!ungapped_beaten_by_gap(
+            &exact,
+            &reference,
+            &mk_span(exact.len()),
+            0,
+            c
+        ));
     }
 
     #[test]

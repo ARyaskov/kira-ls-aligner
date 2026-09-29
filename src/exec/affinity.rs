@@ -189,8 +189,11 @@ mod windows {
         }
 
         if std::env::var_os("KIRA_AFFINITY_DEBUG").is_some() {
-            crate::kira_info!("[KIRA_AFFINITY] win32: efficiency_classes={:?} p_physical={:?} e_physical={:?}",
-                seen_eff_classes, p_physical, e_physical
+            crate::kira_info!(
+                "[KIRA_AFFINITY] win32: efficiency_classes={:?} p_physical={:?} e_physical={:?}",
+                seen_eff_classes,
+                p_physical,
+                e_physical
             );
         }
 

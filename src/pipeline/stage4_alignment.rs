@@ -287,7 +287,11 @@ impl<'read, 'index> Default for PerReadResult<'read, 'index> {
 /// `KIRA_TWOTIER=0`.
 fn two_tier_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("KIRA_TWOTIER").map(|v| v != "0").unwrap_or(true))
+    *V.get_or_init(|| {
+        std::env::var("KIRA_TWOTIER")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Feed the two-tier Myers locus cost into MAPQ. For a single-DP read with a competing chain,
@@ -301,7 +305,11 @@ fn two_tier_enabled() -> bool {
 /// error. Kept as an opt-in for data with a different paralog structure. Enable `KIRA_TWOTIER_MAPQ=1`.
 fn twotier_mapq_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("KIRA_TWOTIER_MAPQ").map(|v| v == "1").unwrap_or(false))
+    *V.get_or_init(|| {
+        std::env::var("KIRA_TWOTIER_MAPQ")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// Max candidate loci the two-tier search score-only-ranks per read (default = chaining's
@@ -406,11 +414,7 @@ fn mate_guide_enabled() -> bool {
 /// Same geometry `pair_rerank` applies to finished alignments — same contig,
 /// convergent orientation, fragment length inside the concordance window —
 /// evaluated on chain spans instead.
-fn chains_look_paired(
-    a: &Chain,
-    b: &Chain,
-    window: (u32, u32),
-) -> bool {
+fn chains_look_paired(a: &Chain, b: &Chain, window: (u32, u32)) -> bool {
     if a.ref_id != b.ref_id || a.strand == b.strand {
         return false;
     }
@@ -708,7 +712,8 @@ fn process_read_prefilter<'read, 'index>(
         {
             debug_counter.fetch_add(1, Ordering::Relaxed);
             if let Some(m) = metrics {
-                crate::kira_info!("[KIRA_DEBUG_PREFILTER] read_id={} read_len={} ungapped_len={} mism={} matches={} identity_x100={} score={} chain_rank={} q={}..{} r={}..{} decision={:?} reason={}",
+                crate::kira_info!(
+                    "[KIRA_DEBUG_PREFILTER] read_id={} read_len={} ungapped_len={} mism={} matches={} identity_x100={} score={} chain_rank={} q={}..{} r={}..{} decision={:?} reason={}",
                     read.id,
                     read_len,
                     m.len,
@@ -725,7 +730,8 @@ fn process_read_prefilter<'read, 'index>(
                     reason.as_str()
                 );
             } else {
-                crate::kira_info!("[KIRA_DEBUG_PREFILTER] read_id={} read_len={} ungapped_len=NA mism=NA matches=NA identity=NA score=NA chain_rank={} q={}..{} r={}..{} decision={:?} reason={}",
+                crate::kira_info!(
+                    "[KIRA_DEBUG_PREFILTER] read_id={} read_len={} ungapped_len=NA mism=NA matches=NA identity=NA score=NA chain_rank={} q={}..{} r={}..{} decision={:?} reason={}",
                     read.id,
                     read_len,
                     chain_rank,
@@ -1010,7 +1016,8 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
                         .push(new_idx);
                 }
             }
-            crate::kira_info!("[KIRA_GPU] dispatched {} jobs, accepted {} ({:.2} ms = {:.1} jobs/ms)",
+            crate::kira_info!(
+                "[KIRA_GPU] dispatched {} jobs, accepted {} ({:.2} ms = {:.1} jobs/ms)",
                 n_dispatched,
                 n_accepted,
                 dispatch_ms,
@@ -1047,7 +1054,8 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         && potential_accepts > 0
         && stats.prefilter_accept == 0
     {
-        crate::kira_warn!("[KIRA_DEBUG_PREFILTER] warning: potential_accepts={} but accept_count=0",
+        crate::kira_warn!(
+            "[KIRA_DEBUG_PREFILTER] warning: potential_accepts={} but accept_count=0",
             potential_accepts
         );
     }
@@ -1272,7 +1280,8 @@ fn diagnose_gpu_vs_cpu(
 
         if cpu_accepts != gpu_accepts {
             disagreements += 1;
-            crate::kira_info!("[KIRA_GPU_DIAG] job#{i}: GPU={} | CPU={} | naive: min_mism={} at shift={} (threshold={}, oracle should {})  read_len={} ref_len={}",
+            crate::kira_info!(
+                "[KIRA_GPU_DIAG] job#{i}: GPU={} | CPU={} | naive: min_mism={} at shift={} (threshold={}, oracle should {})  read_len={} ref_len={}",
                 gpu_str,
                 cpu_str,
                 min_mism,
@@ -1284,8 +1293,10 @@ fn diagnose_gpu_vs_cpu(
             );
         }
     }
-    crate::kira_info!("[KIRA_GPU_DIAG] sampled {} jobs, {} GPU≠CPU disagreements",
-        limit, disagreements
+    crate::kira_info!(
+        "[KIRA_GPU_DIAG] sampled {} jobs, {} GPU≠CPU disagreements",
+        limit,
+        disagreements
     );
 }
 

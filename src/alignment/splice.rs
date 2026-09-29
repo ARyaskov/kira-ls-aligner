@@ -860,7 +860,6 @@ fn push_cigar(out: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
     out.push(CigarOp { len, op });
 }
 
-
 #[cfg(test)]
 #[path = "../../tests/unit/alignment_splice.rs"]
 mod tests;

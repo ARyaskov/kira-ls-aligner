@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::{stdin, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write, stdin};
 
 use anyhow::{Context, Result};
 
 use crate::cli::EvalArgs;
-use crate::eval::{evaluate, render_report, EvalConfig};
+use crate::eval::{EvalConfig, evaluate, render_report};
 
 /// Run the `eval` subcommand: score a SAM file against truth-in-name read ids.
 pub fn cmd_eval(args: EvalArgs) -> Result<()> {

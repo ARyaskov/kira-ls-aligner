@@ -55,8 +55,16 @@ fn divergent_orientation_is_not_a_pair() {
 fn same_strand_or_other_contig_is_not_a_pair() {
     let window = crate::pipeline::pairing::concordance_window(&cfg());
     let a = chain(0, 1_000, Strand::Forward);
-    assert!(!chains_look_paired(&a, &chain(0, 1_200, Strand::Forward), window));
-    assert!(!chains_look_paired(&a, &chain(1, 1_200, Strand::Reverse), window));
+    assert!(!chains_look_paired(
+        &a,
+        &chain(0, 1_200, Strand::Forward),
+        window
+    ));
+    assert!(!chains_look_paired(
+        &a,
+        &chain(1, 1_200, Strand::Reverse),
+        window
+    ));
 }
 
 #[test]
@@ -64,7 +72,11 @@ fn fragment_outside_the_insert_window_is_not_a_pair() {
     let window = crate::pipeline::pairing::concordance_window(&cfg());
     let fwd = chain(0, 1_000, Strand::Forward);
     // insert_max is 600; 1_000..9_000+150 is far outside it.
-    assert!(!chains_look_paired(&fwd, &chain(0, 9_000, Strand::Reverse), window));
+    assert!(!chains_look_paired(
+        &fwd,
+        &chain(0, 9_000, Strand::Reverse),
+        window
+    ));
 }
 
 #[test]

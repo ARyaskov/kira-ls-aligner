@@ -20,7 +20,10 @@ fn aln(ref_id: u32, ref_start: u32, score: i32, secondary: bool) -> Alignment {
         ref_end: ref_start + 50,
         read_start: 0,
         read_end: 50,
-        cigar: vec![CigarOp { len: 50, op: CigarKind::Match }],
+        cigar: vec![CigarOp {
+            len: 50,
+            op: CigarKind::Match,
+        }],
         score,
         mapq: if secondary { 0 } else { 30 },
         is_rev: false,
@@ -39,8 +42,14 @@ fn aln(ref_id: u32, ref_start: u32, score: i32, secondary: bool) -> Alignment {
 fn xa_lists_secondaries_pruned_by_the_output_cap() {
     let reference = Reference {
         sequences: vec![
-            RefSeq { name: "chr1".into(), bases: RefBases::Owned(vec![b'A'; 2000]) },
-            RefSeq { name: "chr2".into(), bases: RefBases::Owned(vec![b'C'; 2000]) },
+            RefSeq {
+                name: "chr1".into(),
+                bases: RefBases::Owned(vec![b'A'; 2000]),
+            },
+            RefSeq {
+                name: "chr2".into(),
+                bases: RefBases::Owned(vec![b'C'; 2000]),
+            },
         ],
     };
     let formatter = SamFormatter::new(Arc::new(reference));
@@ -62,7 +71,8 @@ fn xa_lists_secondaries_pruned_by_the_output_cap() {
         stats: Default::default(),
     };
     // max_alignments = 1 is the CLI default: only the primary record is written.
-    let sam = String::from_utf8(serialize(batch, &formatter, None, OutputConfig::full(), 1)).unwrap();
+    let sam =
+        String::from_utf8(serialize(batch, &formatter, None, OutputConfig::full(), 1)).unwrap();
     let lines: Vec<&str> = sam.lines().collect();
     assert_eq!(lines.len(), 1, "only the primary record is emitted:\n{sam}");
     assert!(

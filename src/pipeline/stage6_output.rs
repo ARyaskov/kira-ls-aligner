@@ -74,21 +74,20 @@ pub fn serialize_into(
     // candidate list first: bwa-mem reports the alternative hits in XA even
     // though it writes only the primary record, so pruning before the tag
     // would leave XA empty at the default settings.
-    let xa_tags: Vec<Option<Vec<u8>>> = if output_cfg.write_xa
-        && matches!(output_cfg.format, EmitFormat::Sam)
-    {
-        alignments
-            .iter()
-            .map(|alns| {
-                let mut buf = Vec::new();
-                formatter
-                    .append_xa_capped(&mut buf, alns, output_cfg.xa_max)
-                    .then_some(buf)
-            })
-            .collect()
-    } else {
-        vec![None; alignments.len()]
-    };
+    let xa_tags: Vec<Option<Vec<u8>>> =
+        if output_cfg.write_xa && matches!(output_cfg.format, EmitFormat::Sam) {
+            alignments
+                .iter()
+                .map(|alns| {
+                    let mut buf = Vec::new();
+                    formatter
+                        .append_xa_capped(&mut buf, alns, output_cfg.xa_max)
+                        .then_some(buf)
+                })
+                .collect()
+        } else {
+            vec![None; alignments.len()]
+        };
     if max_alignments > 0 {
         for alns in alignments.iter_mut() {
             retain_reported_alignments(alns, max_alignments);
@@ -151,7 +150,9 @@ pub fn serialize_into(
                                 // its own SA (the other segments) + mate tags.
                                 // Secondary: nothing beyond the core tags.
                                 extra_tags.clear();
-                                if idx == 0 && let Some(xa) = xa {
+                                if idx == 0
+                                    && let Some(xa) = xa
+                                {
                                     extra_tags.extend_from_slice(xa);
                                 }
                                 if has_supplementary

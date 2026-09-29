@@ -23,12 +23,14 @@ pub fn run_gpu_server(default_threads: usize, default_batch_bases: usize) -> Res
     } // backend dropped — context handle released for the dispatcher thread
     dispatcher::start()?;
     let warmup = init_start.elapsed();
-    crate::kira_info!("[KIRA_GPU] CUDA ready ({}.{:03} s warmup).",
+    crate::kira_info!(
+        "[KIRA_GPU] CUDA ready ({}.{:03} s warmup).",
         warmup.as_secs(),
         warmup.subsec_millis()
     );
 
-    crate::kira_info!("[KIRA_GPU] Enter job parameters (one per line: `ref`, `reads`, \
+    crate::kira_info!(
+        "[KIRA_GPU] Enter job parameters (one per line: `ref`, `reads`, \
          `index`, `output`, `threads`, `batch`, `read-group`). Blank line \
          submits. `quit` to exit. If `index` is omitted, `<ref>.kiraidx` \
          is auto-detected when present."
@@ -159,12 +161,14 @@ impl Session {
             .or_else(|| auto_detect_sidecar_index(&reference));
         if self.index.is_none() {
             if let Some(idx) = resolved_index.as_ref() {
-                crate::kira_info!("[KIRA_GPU] auto-detected sidecar index {} for {}",
+                crate::kira_info!(
+                    "[KIRA_GPU] auto-detected sidecar index {} for {}",
                     idx.display(),
                     reference.display()
                 );
             } else {
-                crate::kira_info!("[KIRA_GPU] no sidecar index found for {}; building in-memory \
+                crate::kira_info!(
+                    "[KIRA_GPU] no sidecar index found for {}; building in-memory \
                      (this may take ~15 min for hg38-sized references). Run \
                      `kira_ls_aligner index <ref>` once to skip this on future jobs.",
                     reference.display()

@@ -157,14 +157,7 @@ fn bench_wfa(c: &mut Criterion) {
             text_begin_free: 0,
         };
         g.bench_function(format!("wfa_align_{mism}mism"), |b| {
-            b.iter(|| {
-                black_box(wfa_align(
-                    black_box(&read),
-                    black_box(&window),
-                    pen,
-                    opts,
-                ))
-            })
+            b.iter(|| black_box(wfa_align(black_box(&read), black_box(&window), pen, opts)))
         });
     }
     g.finish();
@@ -185,10 +178,7 @@ fn bench_byte_primitives(c: &mut Criterion) {
     let seed_at = 60usize;
     g.bench_function("seed_extend_both_ways_150", |b| {
         b.iter(|| {
-            let l = common_suffix_len(
-                black_box(&read[..seed_at]),
-                black_box(&aligned[..seed_at]),
-            );
+            let l = common_suffix_len(black_box(&read[..seed_at]), black_box(&aligned[..seed_at]));
             let r = common_prefix_len(
                 black_box(&read[seed_at + 19..]),
                 black_box(&aligned[seed_at + 19..]),

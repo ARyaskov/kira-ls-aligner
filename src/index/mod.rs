@@ -253,7 +253,8 @@ impl MinimizerIndex {
         let n_chunks = chunks.len();
 
         let t_total = Instant::now();
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) building from {n_seqs} seq(s), {:.1} Mbp; \
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) building from {n_seqs} seq(s), {:.1} Mbp; \
              RAM budget {:.1} GB → chunk≈{:.1} Mbp ({} chunk(s))",
             total_bp as f64 / 1e6,
             ram_budget_bytes as f64 / (1u64 << 30) as f64,
@@ -282,7 +283,8 @@ impl MinimizerIndex {
                 }
             }
 
-            crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) chunk {}/{}: {:.1} Mbp, +{:.1}M mins → \
+            crate::kira_info!(
+                "[KIRA_INDEX] (k={k} w={w}) chunk {}/{}: {:.1} Mbp, +{:.1}M mins → \
                  {:.1}M flat total ({:.2} GB, elapsed={:.1}s)",
                 chunk_idx + 1,
                 n_chunks,
@@ -295,7 +297,8 @@ impl MinimizerIndex {
         }
 
         let t_sort = Instant::now();
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) sorting {:.1}M minimizers by hash...",
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) sorting {:.1}M minimizers by hash...",
             flat.len() as f64 / 1e6
         );
         // Sort by the full record, not just the hash: buckets over `max_occ`
@@ -304,7 +307,8 @@ impl MinimizerIndex {
         // builder, which sorts its runs the same way).
         flat.par_sort_unstable_by_key(|t| (t.hash, t.ref_strand, t.pos));
         let t_sort_dur = t_sort.elapsed();
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) sort done in {:.1}s ({:.0}M items/s)",
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) sort done in {:.1}s ({:.0}M items/s)",
             t_sort_dur.as_secs_f64(),
             flat.len() as f64 / t_sort_dur.as_secs_f64().max(0.001) / 1e6
         );
@@ -319,7 +323,8 @@ impl MinimizerIndex {
                 }
             }
         }
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase C: scanning for unique hashes ({:.0}M expected)...",
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) phase C: scanning for unique hashes ({:.0}M expected)...",
             n_unique as f64 / 1e6,
         );
         let mut unique_hashes: Vec<u64> = Vec::with_capacity(n_unique);
@@ -339,7 +344,8 @@ impl MinimizerIndex {
             i = j;
         }
         let t_group_dur = t_group.elapsed();
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase C done in {:.1}s: {} unique bucket(s)",
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) phase C done in {:.1}s: {} unique bucket(s)",
             t_group_dur.as_secs_f64(),
             unique_hashes.len(),
         );
@@ -350,7 +356,8 @@ impl MinimizerIndex {
             .unwrap_or(true);
         let t_lookup = Instant::now();
         let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph {
-            crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase D: building PtrHash25 over {:.1}M keys \
+            crate::kira_info!(
+                "[KIRA_INDEX] (k={k} w={w}) phase D: building PtrHash25 over {:.1}M keys \
                  (no progress output; expect ~30s/100M keys on modern CPUs). \
                  Set KIRA_INDEX_USE_MPH=0 to use a sorted-array fallback (instant build, \
                  ~5× slower per lookup).",
@@ -362,7 +369,8 @@ impl MinimizerIndex {
                 .with_build_fast_profile(true)
                 .build_index(keys_bytes)
                 .expect("PtrHash25 build");
-            crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase D done in {:.1}s (mph), looking up ids...",
+            crate::kira_info!(
+                "[KIRA_INDEX] (k={k} w={w}) phase D done in {:.1}s (mph), looking up ids...",
                 t_lookup.elapsed().as_secs_f64(),
             );
 
@@ -379,7 +387,8 @@ impl MinimizerIndex {
             }
             (HashLookup::Mph(mph), max_id_u as usize + 1, Some(assigned))
         } else {
-            crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase D: sorted-array lookup over {:.1}M keys \
+            crate::kira_info!(
+                "[KIRA_INDEX] (k={k} w={w}) phase D: sorted-array lookup over {:.1}M keys \
                  (KIRA_INDEX_USE_MPH=0; binary-search lookups ~100 ns each at this scale)",
                 unique_hashes.len() as f64 / 1e6,
             );
@@ -393,7 +402,8 @@ impl MinimizerIndex {
         let t_lookup_dur = t_lookup.elapsed();
 
         let t_perm = Instant::now();
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) phase E: allocating final layout \
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) phase E: allocating final layout \
              (offsets={:.2} MB, occs={:.2} GB)...",
             ((n_slots + 1) * 4) as f64 / (1u64 << 20) as f64,
             (bucket_lens.iter().map(|&n| n as usize).sum::<usize>() * OCC_DISK_SIZE) as f64
@@ -453,7 +463,8 @@ impl MinimizerIndex {
         drop(unique_hashes); // already taken above if sorted path
         drop(assigned_ids);
 
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) done: {:.0}M minimizers → {:.0}M unique buckets \
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) done: {:.0}M minimizers → {:.0}M unique buckets \
              [extract={:.1}s, sort={:.1}s, group={:.1}s, lookup({})={:.1}s, perm={:.1}s, \
               total={:.1}s]",
             total_mins as f64 / 1e6,
@@ -502,7 +513,8 @@ impl MinimizerIndex {
                     temp_parent.display()
                 )
             });
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) estimated occurrence stream exceeds RAM budget; \
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) estimated occurrence stream exceeds RAM budget; \
              spilling sorted {:.1} Mbp segments to {}",
             segment_bp as f64 / 1e6,
             temp.path().display()
@@ -679,7 +691,8 @@ impl MinimizerIndex {
                 .to_occ();
             }
         }
-        crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) external build complete: {:.1}M minimizers, \
+        crate::kira_info!(
+            "[KIRA_INDEX] (k={k} w={w}) external build complete: {:.1}M minimizers, \
              {:.1}M buckets, {:.1}M retained occurrences",
             total_mins as f64 / 1e6,
             bucket_lens.len() as f64 / 1e6,
@@ -715,7 +728,8 @@ impl MinimizerIndex {
         let n_slots = n_offsets - 1;
 
         let t = std::time::Instant::now();
-        crate::kira_info!("[KIRA_HOT_CACHE] scanning {} slots for top {} largest buckets (cap {} M occs)...",
+        crate::kira_info!(
+            "[KIRA_HOT_CACHE] scanning {} slots for top {} largest buckets (cap {} M occs)...",
             n_slots,
             top_n,
             max_total_occs / 1_000_000,
@@ -759,7 +773,8 @@ impl MinimizerIndex {
             cache.insert(slot, HotBucketEntry { occs });
         }
 
-        crate::kira_info!("[KIRA_HOT_CACHE] cached {} buckets, {} occs ({:.1} MB) in {:.2}s",
+        crate::kira_info!(
+            "[KIRA_HOT_CACHE] cached {} buckets, {} occs ({:.1} MB) in {:.2}s",
             cache.len(),
             total_occs,
             total_occs as f64 * 12.0 / 1e6,
@@ -1005,8 +1020,10 @@ impl Index {
     pub fn build(reference: Reference, cfg: IndexConfig) -> Self {
         let t0 = Instant::now();
         let short = if cfg.build_short {
-            crate::kira_info!("[KIRA_INDEX] building short index (k={} w={})",
-                cfg.short_k, cfg.short_w
+            crate::kira_info!(
+                "[KIRA_INDEX] building short index (k={} w={})",
+                cfg.short_k,
+                cfg.short_w
             );
             let s = MinimizerIndex::build(&reference, cfg.short_k, cfg.short_w, cfg.max_occ);
             log_memory_state("after short build");
@@ -1017,8 +1034,10 @@ impl Index {
         };
 
         let long = if cfg.build_long {
-            crate::kira_info!("[KIRA_INDEX] building long index (k={} w={})",
-                cfg.long_k, cfg.long_w
+            crate::kira_info!(
+                "[KIRA_INDEX] building long index (k={} w={})",
+                cfg.long_k,
+                cfg.long_w
             );
             let l = MinimizerIndex::build(&reference, cfg.long_k, cfg.long_w, cfg.max_occ);
             log_memory_state("after long build");
@@ -1028,7 +1047,8 @@ impl Index {
             empty_minimizer_index(cfg.long_k, cfg.long_w, cfg.max_occ)
         };
 
-        crate::kira_info!("[KIRA_INDEX] index assembly done in {:.2}s",
+        crate::kira_info!(
+            "[KIRA_INDEX] index assembly done in {:.2}s",
             t0.elapsed().as_secs_f64()
         );
         Self {
@@ -1198,7 +1218,8 @@ impl Index {
             );
         }
         if is_v2 {
-            crate::kira_info!("[KIRA_INDEX] loading legacy KIRAIDX2 index (sorted-array variant unavailable; \
+            crate::kira_info!(
+                "[KIRA_INDEX] loading legacy KIRAIDX2 index (sorted-array variant unavailable; \
                  layout is otherwise compatible)"
             );
         }
@@ -1521,7 +1542,8 @@ fn log_memory_state(label: &str) {
     } else {
         (raw_used / (1024 * 1024), raw_total / (1024 * 1024))
     };
-    crate::kira_info!("[KIRA_INDEX] mem [{label}]: used={}MB / total={}MB ({}%)",
+    crate::kira_info!(
+        "[KIRA_INDEX] mem [{label}]: used={}MB / total={}MB ({}%)",
         used_mb,
         total_mb,
         used_mb
@@ -1676,10 +1698,16 @@ mod tests {
                 assert_eq!(a.len(), max_occ + 1, "sentinel length for hash {hash}");
                 all.sort_unstable();
                 all.truncate(max_occ + 1);
-                assert_eq!(a, all, "retained subset must be the lowest (strand, pos) records");
+                assert_eq!(
+                    a, all,
+                    "retained subset must be the lowest (strand, pos) records"
+                );
             }
         }
-        assert!(saw_truncated, "test reference must contain an over-cap bucket");
+        assert!(
+            saw_truncated,
+            "test reference must contain an over-cap bucket"
+        );
     }
 
     #[test]

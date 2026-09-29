@@ -158,10 +158,8 @@ pub fn extend_seeds_into(
 
         // Extend left through the matching suffix of what precedes the seed,
         // right through the matching prefix of what follows it.
-        let left = common_suffix_len(
-            &read_seq[..q_start as usize],
-            &ref_seq[..r_start as usize],
-        ) as i32;
+        let left =
+            common_suffix_len(&read_seq[..q_start as usize], &ref_seq[..r_start as usize]) as i32;
         q_start -= left;
         r_start -= left;
 

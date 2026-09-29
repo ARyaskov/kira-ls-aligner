@@ -79,7 +79,10 @@ impl Aligner {
             );
             return None;
         }
-        crate::kira_info!("[KIRA] ALT-aware: {n_alt} of {} contigs are ALT", mask.len());
+        crate::kira_info!(
+            "[KIRA] ALT-aware: {n_alt} of {} contigs are ALT",
+            mask.len()
+        );
         Some(Box::leak(mask.into_boxed_slice()))
     }
 }
@@ -385,7 +388,8 @@ impl Aligner {
         // users notice when the auto-detected split disagrees with what
         // they expected (e.g. a misreported hybrid CPU falling back to a
         // single pool).
-        crate::kira_info!("[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={}",
+        crate::kira_info!(
+            "[KIRA_POOL] hybrid={} p_threads={} e_threads={} total={}",
             pool.is_hybrid(),
             pool.p_threads(),
             pool.e_threads(),
@@ -403,7 +407,8 @@ impl Aligner {
         let alt_mask = self.alt_mask_for(&index);
         pipeline.config.set_alt_mask(alt_mask);
         if stats_enabled {
-            crate::kira_info!("[KIRA_CONFIG] {}",
+            crate::kira_info!(
+                "[KIRA_CONFIG] {}",
                 config_fingerprint(&pipeline.config, self.cfg.threads, self.cfg.batch_bases)
             );
         }
@@ -539,7 +544,8 @@ impl Aligner {
                         progress.as_ref(),
                     );
                     print_algo_counters(&format!("batch {}", batch_idx), &batch_stats.align);
-                    crate::kira_info!("[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
+                    crate::kira_info!(
+                        "[KIRA_SEED_STATS] batch {}: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
                         batch_idx,
                         batch_stats.seed.anchors_before_prune,
                         batch_stats.seed.anchors_after_prune,
@@ -552,7 +558,8 @@ impl Aligner {
                         batch_stats.align.dp_early_abort as f32 * 100.0
                             / batch_stats.align.dp_attempts as f32
                     };
-                    crate::kira_info!("[KIRA_ALIGN_STATS] batch {}: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
+                    crate::kira_info!(
+                        "[KIRA_ALIGN_STATS] batch {}: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
                         batch_idx,
                         (batch_stats.align.prefilter_accept as f32 * 100.0
                             / batch_stats.align.reads.max(1) as f32),
@@ -605,15 +612,20 @@ impl Aligner {
             );
             print_algo_counters("summary", &align_total);
             print_cascade_summary(&align_total);
-            crate::kira_info!("[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
-                seed_total_before, seed_total_after, chain_total_used, chain_total_pruned,
+            crate::kira_info!(
+                "[KIRA_SEED_STATS] summary: anchors_before_prune={} anchors_after_prune={} chaining_used={} chaining_pruned={}",
+                seed_total_before,
+                seed_total_after,
+                chain_total_used,
+                chain_total_pruned,
             );
             let dp_rate = if align_total.dp_attempts == 0 {
                 0.0
             } else {
                 align_total.dp_early_abort as f32 * 100.0 / align_total.dp_attempts as f32
             };
-            crate::kira_info!("[KIRA_ALIGN_STATS] summary: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
+            crate::kira_info!(
+                "[KIRA_ALIGN_STATS] summary: accept_rate={:.2}% fallback_rate={:.2}% dp_early_abort_rate={:.2}%",
                 (align_total.prefilter_accept as f32 * 100.0 / align_total.reads.max(1) as f32),
                 (align_total.prefilter_fallback as f32 * 100.0 / align_total.reads.max(1) as f32),
                 dp_rate
@@ -703,10 +715,8 @@ impl Aligner {
     /// file path writes.
     pub fn sam_header_bytes(&self, index: &Index) -> Result<Vec<u8>> {
         let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let mut writer = SamWriter::from_writer(
-            Box::new(crate::io::VecSink(sink.clone())),
-            &index.reference,
-        );
+        let mut writer =
+            SamWriter::from_writer(Box::new(crate::io::VecSink(sink.clone())), &index.reference);
         match &self.cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,
             None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
@@ -797,10 +807,8 @@ impl Aligner {
         );
 
         let out = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let mut writer = SamWriter::from_writer(
-            Box::new(crate::io::VecSink(out.clone())),
-            &index.reference,
-        );
+        let mut writer =
+            SamWriter::from_writer(Box::new(crate::io::VecSink(out.clone())), &index.reference);
         match &self.cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,
             None => writer.write_header_with_rg(self.cfg.read_group.as_deref())?,
@@ -992,7 +1000,8 @@ fn print_algo_counters(label: &str, stats: &AlignmentBatchStats) {
         + stats.gpu_spectral_resolved
         + stats.prefilter_accept;
     let sw_total = stats.dp_simd + stats.dp_scalar;
-    crate::kira_info!("[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
+    crate::kira_info!(
+        "[KIRA_ALGO] {}: reads={} | exact={} ({:.2}%) prefilter={} ({:.2}%) packed_spectral={} ({:.2}%) spectral_sieve={} ({:.2}%) gpu_spectral={} ({:.2}%) wfa={} ({:.2}%) lsh_rescue={} ({:.2}%) cgk_rescue={} ({:.2}%) sw_simd={} ({:.2}%) sw_scalar={} ({:.2}%) unmapped={} ({:.2}%) | spectral_total={} ({:.2}%) sw_total={} ({:.2}%) wfa_total={} ({:.2}%)",
         label,
         stats.reads,
         stats.exact_matches,
@@ -1147,8 +1156,10 @@ fn print_summary_stats(
         align_total.avg_read_len(),
     );
     if let Some((mode, p50)) = mode_selected {
-        crate::kira_info!("[KIRA_MODE] summary: selected={:?} median_read_len={}",
-            mode, p50
+        crate::kira_info!(
+            "[KIRA_MODE] summary: selected={:?} median_read_len={}",
+            mode,
+            p50
         );
     }
     let _ = pb;

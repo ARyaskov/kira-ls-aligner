@@ -178,8 +178,6 @@ fn base_code(b: u8) -> u8 {
     }
 }
 
-
-
 fn hash64(mut x: u64) -> u64 {
     // SplitMix64
     x = x.wrapping_add(0x9e3779b97f4a7c15);
@@ -231,8 +229,11 @@ mod ring_equivalence_tests {
             }
             assert_eq!(ring.len(), deque.len(), "trial {trial}: k={k} w={w}");
             for (a, b) in ring.iter().zip(deque.iter()) {
-                assert_eq!((a.hash, a.pos, a.strand), (b.hash, b.pos, b.strand),
-                    "trial {trial}: k={k} w={w}");
+                assert_eq!(
+                    (a.hash, a.pos, a.strand),
+                    (b.hash, b.pos, b.strand),
+                    "trial {trial}: k={k} w={w}"
+                );
             }
         }
     }

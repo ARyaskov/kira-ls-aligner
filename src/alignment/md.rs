@@ -207,24 +207,40 @@ mod tests {
     #[test]
     fn deletion_and_insertion() {
         // read ACGTACGT vs ref ACG[TT]TACGT: 3M2D5M
-        let cigar = ops(&[(3, CigarKind::Match), (2, CigarKind::Del), (5, CigarKind::Match)]);
+        let cigar = ops(&[
+            (3, CigarKind::Match),
+            (2, CigarKind::Del),
+            (5, CigarKind::Match),
+        ]);
         let (nm, md) = nm_md_from_cigar(b"ACGTACGT", b"ACGTTTACGT", 0, 0, &cigar);
         assert_eq!((nm, md.as_str()), (2, "3^TT5"));
-        let cigar = ops(&[(3, CigarKind::Match), (2, CigarKind::Ins), (3, CigarKind::Match)]);
+        let cigar = ops(&[
+            (3, CigarKind::Match),
+            (2, CigarKind::Ins),
+            (3, CigarKind::Match),
+        ]);
         let (nm, md) = nm_md_from_cigar(b"ACGAAGTA", b"ACGGTA", 0, 0, &cigar);
         assert_eq!((nm, md.as_str()), (2, "6"));
     }
 
     #[test]
     fn soft_clips_and_offsets_are_skipped() {
-        let cigar = ops(&[(2, CigarKind::SoftClip), (3, CigarKind::Match), (1, CigarKind::SoftClip)]);
+        let cigar = ops(&[
+            (2, CigarKind::SoftClip),
+            (3, CigarKind::Match),
+            (1, CigarKind::SoftClip),
+        ]);
         let (nm, md) = nm_md_from_cigar(b"NNACGN", b"XXXXACG", 0, 4, &cigar);
         assert_eq!((nm, md.as_str()), (0, "3"));
     }
 
     #[test]
     fn reference_skip_does_not_split_the_run() {
-        let cigar = ops(&[(2, CigarKind::Match), (100, CigarKind::Skipped), (2, CigarKind::Match)]);
+        let cigar = ops(&[
+            (2, CigarKind::Match),
+            (100, CigarKind::Skipped),
+            (2, CigarKind::Match),
+        ]);
         let mut reference = vec![b'T'; 104];
         reference[0] = b'A';
         reference[1] = b'C';

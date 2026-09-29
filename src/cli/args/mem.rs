@@ -244,7 +244,12 @@ pub struct MemArgs {
 
     /// Smart pairing (bwa-mem `-p`): the single input FASTQ is interleaved,
     /// consecutive records being R1/R2 of one template.
-    #[arg(short = 'p', long = "interleaved", alias = "smart-pairing", default_value_t = false)]
+    #[arg(
+        short = 'p',
+        long = "interleaved",
+        alias = "smart-pairing",
+        default_value_t = false
+    )]
     pub interleaved: bool,
 
     // ── bwa-mem flags accepted for wrapper compatibility, without effect ──
@@ -287,12 +292,20 @@ pub struct MemArgs {
     /// Insert-size prior, bwa-mem form: `mean[,sd[,max[,min]]]`
     /// (bwa-mem `-I`). Fixes the distribution instead of estimating it from
     /// the data.
-    #[arg(short = 'I', long = "insert-size", value_name = "FLOAT[,FLOAT[,INT[,INT]]]")]
+    #[arg(
+        short = 'I',
+        long = "insert-size",
+        value_name = "FLOAT[,FLOAT[,INT[,INT]]]"
+    )]
     pub insert_size: Option<String>,
 
     /// Proper-pair window as `MIN,MAX[,MEAN,SD]` (the pre-0.5 `-I` form);
     /// the run-time estimator still refines it. `-I` takes precedence.
-    #[arg(long = "insert-window", value_name = "MIN,MAX[,MEAN,SD]", default_value = "0,1000,200,50")]
+    #[arg(
+        long = "insert-window",
+        value_name = "MIN,MAX[,MEAN,SD]",
+        default_value = "0,1000,200,50"
+    )]
     pub insert_window: String,
 
     /// Maximum intron length for splice-aware alignment.

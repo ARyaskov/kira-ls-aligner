@@ -92,9 +92,7 @@ impl ReadStream {
             return Err(anyhow::anyhow!("no reads input provided"));
         }
         if paths.iter().filter(|p| is_stdin_path(p)).count() > 1 {
-            return Err(anyhow::anyhow!(
-                "only one reads input may be `-` (stdin)"
-            ));
+            return Err(anyhow::anyhow!("only one reads input may be `-` (stdin)"));
         }
         match mode {
             IngestMode::TwoFile if paths.len() != 2 => {
@@ -136,7 +134,6 @@ impl ReadStream {
     pub fn mode(&self) -> IngestMode {
         self.mode
     }
-
 
     pub fn next_batch(&mut self) -> Result<Option<Vec<ReadRecord>>> {
         match self.mode {
@@ -447,7 +444,10 @@ fn detect_compression(path: &Path) -> Result<InputCompression> {
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut filled = 0usize;
     while filled < head.len() {
-        match f.read(&mut head[filled..]).context("read FASTQ header bytes")? {
+        match f
+            .read(&mut head[filled..])
+            .context("read FASTQ header bytes")?
+        {
             0 => break,
             n => filled += n,
         }
@@ -877,7 +877,11 @@ impl ContigCatalog {
                 None => s.name.clone(),
             })
             .collect();
-        let lens = reference.sequences.iter().map(|s| s.len(None) as u64).collect();
+        let lens = reference
+            .sequences
+            .iter()
+            .map(|s| s.len(None) as u64)
+            .collect();
         Self { names, lens }
     }
 
@@ -894,7 +898,9 @@ impl ContigCatalog {
 
 impl SamFormatter {
     pub fn new(reference: std::sync::Arc<Reference>) -> Self {
-        Self::from_catalog(std::sync::Arc::new(ContigCatalog::from_reference(&reference)))
+        Self::from_catalog(std::sync::Arc::new(ContigCatalog::from_reference(
+            &reference,
+        )))
     }
 
     pub fn from_catalog(contigs: std::sync::Arc<ContigCatalog>) -> Self {
@@ -1082,7 +1088,9 @@ impl SamFormatter {
             buf.extend_from_slice(b"\tAS:i:");
             push_i32(buf, aln.as_score);
         }
-        if cfg.write_xs && let Some(xs) = aln.xs_score {
+        if cfg.write_xs
+            && let Some(xs) = aln.xs_score
+        {
             buf.extend_from_slice(b"\tXS:i:");
             push_i32(buf, xs);
         }
@@ -1093,7 +1101,9 @@ impl SamFormatter {
                 crate::types::Strand::Reverse => b'-',
             });
         }
-        if cfg.write_rg && let Some(rg) = read_group {
+        if cfg.write_rg
+            && let Some(rg) = read_group
+        {
             buf.extend_from_slice(b"\tRG:Z:");
             buf.extend_from_slice(extract_rg_id(rg).as_bytes());
         }
@@ -1113,7 +1123,12 @@ impl SamFormatter {
     /// `XA` for the secondary hits, or nothing when there are more than
     /// `xa_max` of them (bwa-mem `-h`): past that point the list stops
     /// naming a locus and only restates what MAPQ already says.
-    pub fn append_xa_capped(&self, buf: &mut Vec<u8>, alignments: &[Alignment], xa_max: u32) -> bool {
+    pub fn append_xa_capped(
+        &self,
+        buf: &mut Vec<u8>,
+        alignments: &[Alignment],
+        xa_max: u32,
+    ) -> bool {
         if alignments.len() <= 1 {
             return false;
         }
@@ -1309,7 +1324,12 @@ fn terminal_softclips(ops: &[CigarOp]) -> (u32, u32) {
 
 /// Reverse complement of `seq`, keeping only oriented positions
 /// `[keep_start, keep_end)` of the reverse-complemented string.
-fn append_reverse_complement_range(buf: &mut Vec<u8>, seq: &[u8], keep_start: usize, keep_end: usize) {
+fn append_reverse_complement_range(
+    buf: &mut Vec<u8>,
+    seq: &[u8],
+    keep_start: usize,
+    keep_end: usize,
+) {
     let n = seq.len();
     // Oriented index i ↔ original index n-1-i.
     append_reverse_complement(buf, &seq[n - keep_end..n - keep_start]);
@@ -1650,8 +1670,14 @@ mod format_tests {
             read_start: 80,
             read_end: 150,
             cigar: vec![
-                CigarOp { len: 80, op: CigarKind::SoftClip },
-                CigarOp { len: 70, op: CigarKind::Match },
+                CigarOp {
+                    len: 80,
+                    op: CigarKind::SoftClip,
+                },
+                CigarOp {
+                    len: 70,
+                    op: CigarKind::Match,
+                },
             ],
             score: 70,
             mapq: 44,
@@ -1706,7 +1732,11 @@ mod format_tests {
         cfg.split_as_secondary = true;
         buf.clear();
         fmt.append_alignment(&mut buf, &read, &aln, None, None, cfg);
-        assert_eq!(fields(&buf)[1], "256", "-M reports the split segment as secondary");
+        assert_eq!(
+            fields(&buf)[1],
+            "256",
+            "-M reports the split segment as secondary"
+        );
     }
 
     #[test]
@@ -1744,7 +1774,10 @@ mod format_tests {
 
     #[test]
     fn fastq_comment_extraction() {
-        assert_eq!(extract_fastq_comment(b"@r1 BC:Z:AC\tRX:Z:T\n"), Some("BC:Z:AC\tRX:Z:T".into()));
+        assert_eq!(
+            extract_fastq_comment(b"@r1 BC:Z:AC\tRX:Z:T\n"),
+            Some("BC:Z:AC\tRX:Z:T".into())
+        );
         assert_eq!(extract_fastq_comment(b"@r1"), None);
         assert_eq!(extract_fastq_comment(b"@r1   "), None);
         assert_eq!(extract_fastq_id(b"@r1 BC:Z:AC"), "r1");
@@ -1794,14 +1827,22 @@ mod format_tests {
 
         // gzip magic, deflate, no FEXTRA.
         let gz = dir.join("b.fastq.gz");
-        std::fs::write(&gz, [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff, 1, 2, 3, 4, 5, 6]).unwrap();
+        std::fs::write(
+            &gz,
+            [
+                0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff, 1, 2, 3, 4, 5, 6,
+            ],
+        )
+        .unwrap();
         assert_eq!(detect_compression(&gz).unwrap(), InputCompression::Gzip);
 
         // BGZF: FEXTRA set (flag 0x04) with the `BC` subfield at bytes 12..14.
         let bgzf = dir.join("c.fastq.gz");
         std::fs::write(
             &bgzf,
-            [0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00],
+            [
+                0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00,
+            ],
         )
         .unwrap();
         assert_eq!(detect_compression(&bgzf).unwrap(), InputCompression::Bgzf);
@@ -1818,7 +1859,10 @@ mod format_tests {
         // low 16 bits; reading it raw saturates the bar instantly.
         let voff = kira_fastq::offset::VirtualOffset::new(4096, 300);
         assert_eq!(voff.compressed(), 4096);
-        assert!(voff.get() > 1 << 20, "raw virtual offset dwarfs the file position");
+        assert!(
+            voff.get() > 1 << 20,
+            "raw virtual offset dwarfs the file position"
+        );
 
         // Decoded bytes are scaled back down by the assumed FASTQ ratio.
         assert_eq!(3_000u64 / FASTQ_GZIP_RATIO, 1_000);
@@ -1840,7 +1884,12 @@ mod format_tests {
         }
         let pieces: &[&[u8]] = &[b"@r\r", b"\nACGT\r\n+", b"\r\nIIII\r", b"\n", b"x\r"];
         let mut out = Vec::new();
-        CrlfToLf::new(Chunked(pieces, 0)).read_to_end(&mut out).unwrap();
-        assert_eq!(out, b"@r\nACGT\n+\nIIII\nx\r", "a trailing lone CR is preserved");
+        CrlfToLf::new(Chunked(pieces, 0))
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(
+            out, b"@r\nACGT\n+\nIIII\nx\r",
+            "a trailing lone CR is preserved"
+        );
     }
 }

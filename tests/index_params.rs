@@ -67,7 +67,10 @@ fn minimizer_params_are_taken_from_the_index_unless_pinned() {
         .args(&args)
         .output()
         .expect("spawn aligner");
-    assert!(!res.status.success(), "a pinned -k must not be overridden by the index");
+    assert!(
+        !res.status.success(),
+        "a pinned -k must not be overridden by the index"
+    );
     let err = String::from_utf8_lossy(&res.stderr);
     assert!(err.contains("mismatch"), "unexpected error text:\n{err}");
 }

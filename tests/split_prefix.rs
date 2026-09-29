@@ -350,8 +350,14 @@ fn tiled_paired_primary_is_the_best_scoring_hit_across_tiles() {
     c0[300..390].copy_from_slice(&c1[700..790]);
     let reference = Reference {
         sequences: vec![
-            RefSeq { name: "chr1".to_string(), bases: RefBases::Owned(c0.clone()) },
-            RefSeq { name: "chr2".to_string(), bases: RefBases::Owned(c1.clone()) },
+            RefSeq {
+                name: "chr1".to_string(),
+                bases: RefBases::Owned(c0.clone()),
+            },
+            RefSeq {
+                name: "chr2".to_string(),
+                bases: RefBases::Owned(c1.clone()),
+            },
         ],
     };
 
@@ -414,11 +420,17 @@ fn tiled_paired_primary_is_the_best_scoring_hit_across_tiles() {
             flag & 0x40 != 0 && flag & 0x900 == 0
         })
         .expect("R1 primary record");
-    assert_eq!(r1_primary[2], "chr2", "primary must be the full-length chr2 hit:\n{sam}");
+    assert_eq!(
+        r1_primary[2], "chr2",
+        "primary must be the full-length chr2 hit:\n{sam}"
+    );
     assert_eq!(r1_primary[3], "701");
     assert_eq!(r1_primary[5], "150M");
     let mapq: u32 = r1_primary[4].parse().unwrap();
-    assert!(mapq > 0, "a full-length unique hit must not be MAPQ 0:\n{sam}");
+    assert!(
+        mapq > 0,
+        "a full-length unique hit must not be MAPQ 0:\n{sam}"
+    );
 
     let _ = std::fs::remove_file(r1_path);
     let _ = std::fs::remove_file(r2_path);

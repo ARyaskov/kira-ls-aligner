@@ -14,15 +14,50 @@ fn parse(args: &[&str]) -> Result<MemArgs, clap::Error> {
 #[test]
 fn unmodified_bwa_mem_command_line_parses() {
     let a = parse(&[
-        "-t", "16", "-K", "100000000", "-Y", "-M", "-5", "-R", "@RG\\tID:x\\tSM:y",
-        "-v", "1", "-w", "100", "-I", "350,50", "-A", "1", "-B", "4", "-O", "6,6",
-        "-E", "1,1", "-L", "5,5", "-T", "30", "-h", "5,200", "-q", "-V", "-r", "1.5",
-        "ref.fa", "r1.fq", "r2.fq",
+        "-t",
+        "16",
+        "-K",
+        "100000000",
+        "-Y",
+        "-M",
+        "-5",
+        "-R",
+        "@RG\\tID:x\\tSM:y",
+        "-v",
+        "1",
+        "-w",
+        "100",
+        "-I",
+        "350,50",
+        "-A",
+        "1",
+        "-B",
+        "4",
+        "-O",
+        "6,6",
+        "-E",
+        "1,1",
+        "-L",
+        "5,5",
+        "-T",
+        "30",
+        "-h",
+        "5,200",
+        "-q",
+        "-V",
+        "-r",
+        "1.5",
+        "ref.fa",
+        "r1.fq",
+        "r2.fq",
     ])
     .expect("bwa mem command line must parse");
     assert_eq!(a.threads, 16);
     assert_eq!(a.band_width, Some(100));
-    assert_eq!(a.window_len, None, "-w is the band width, not the minimizer window");
+    assert_eq!(
+        a.window_len, None,
+        "-w is the band width, not the minimizer window"
+    );
     assert_eq!(a.insert_size.as_deref(), Some("350,50"));
     assert_eq!(a.gap_open, 6);
     assert_eq!(a.gap_extend, 1);
@@ -67,6 +102,11 @@ fn unknown_preset_is_rejected_and_bwa_long_read_presets_map_to_long() {
         let a = parse(&["-x", p, "ref.fa", "r.fq"]).unwrap();
         assert_eq!(a.preset, "long", "{p}");
     }
-    assert_eq!(parse(&["-x", "splice:hq", "ref.fa", "r.fq"]).unwrap().preset, "splice:hq");
+    assert_eq!(
+        parse(&["-x", "splice:hq", "ref.fa", "r.fq"])
+            .unwrap()
+            .preset,
+        "splice:hq"
+    );
     assert_eq!(parse(&["ref.fa", "r.fq"]).unwrap().preset, "auto");
 }

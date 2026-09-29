@@ -81,10 +81,26 @@ fn bwa_insert_spec_field_order_and_defaults() {
     assert!(cfg.estimator_locked, "-I fixes the prior");
 
     cfg.apply_bwa_insert_spec("350,50").unwrap();
-    assert_eq!((cfg.insert_mean, cfg.insert_sd, cfg.insert_max, cfg.insert_min), (350, 50, 550, 150));
+    assert_eq!(
+        (
+            cfg.insert_mean,
+            cfg.insert_sd,
+            cfg.insert_max,
+            cfg.insert_min
+        ),
+        (350, 50, 550, 150)
+    );
 
     cfg.apply_bwa_insert_spec("350,50,600,100").unwrap();
-    assert_eq!((cfg.insert_mean, cfg.insert_sd, cfg.insert_max, cfg.insert_min), (350, 50, 600, 100));
+    assert_eq!(
+        (
+            cfg.insert_mean,
+            cfg.insert_sd,
+            cfg.insert_max,
+            cfg.insert_min
+        ),
+        (350, 50, 600, 100)
+    );
 
     // sd larger than mean/4 floors min at 0 instead of failing.
     cfg.apply_bwa_insert_spec("100,50").unwrap();

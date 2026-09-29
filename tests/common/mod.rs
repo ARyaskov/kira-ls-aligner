@@ -380,7 +380,10 @@ impl SamRecord {
             })
         };
         let flag = num(1, "FLAG");
-        assert!((0..=0xFFFF).contains(&flag), "FLAG out of range in {line:?}");
+        assert!(
+            (0..=0xFFFF).contains(&flag),
+            "FLAG out of range in {line:?}"
+        );
         let mapq = num(4, "MAPQ");
         assert!((0..=255).contains(&mapq), "MAPQ out of range in {line:?}");
         SamRecord {
@@ -436,7 +439,11 @@ impl SamRecord {
 
     /// RNEXT with `=` resolved to RNAME.
     pub fn mate_rname(&self) -> &str {
-        if self.rnext == "=" { &self.rname } else { &self.rnext }
+        if self.rnext == "=" {
+            &self.rname
+        } else {
+            &self.rnext
+        }
     }
 }
 

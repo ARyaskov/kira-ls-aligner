@@ -17,8 +17,8 @@
 //! (5+ GB on a 30× chr20) that kira-bam then re-parsed.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -94,7 +94,12 @@ const RECORD_BYTES_PER_SAM_BYTE: usize = 2;
 /// `--sort-memory auto`: a quarter of RAM, never below this.
 const AUTO_SORT_MIN_BYTES: usize = 512 << 20;
 
-pub fn run_fused(aligner: &Aligner, index: Index, reads: &[PathBuf], opts: EmitOptions) -> Result<()> {
+pub fn run_fused(
+    aligner: &Aligner,
+    index: Index,
+    reads: &[PathBuf],
+    opts: EmitOptions,
+) -> Result<()> {
     let cfg = aligner.config();
     if opts.kind.is_cram() {
         ensure_fai(&opts.reference)?;
@@ -113,7 +118,8 @@ pub fn run_fused(aligner: &Aligner, index: Index, reads: &[PathBuf], opts: EmitO
         let mut h = parse_header(&set_sort_order(&header_text, "coordinate"))?;
         append_pg(&mut h, &PgInfo::new("sort", !opts.no_pg)).context("append @PG sort")?;
         if opts.markdup {
-            append_pg(&mut h, &PgInfo::new("markdup", !opts.no_pg)).context("append @PG markdup")?;
+            append_pg(&mut h, &PgInfo::new("markdup", !opts.no_pg))
+                .context("append @PG markdup")?;
         }
         h
     } else {
@@ -175,7 +181,11 @@ pub fn run_fused(aligner: &Aligner, index: Index, reads: &[PathBuf], opts: EmitO
         })
         .context("build BAI")?;
     }
-    crate::kira_info!("[KIRA] {} pipeline complete → {}", final_path.kind_name, final_path.path.display());
+    crate::kira_info!(
+        "[KIRA] {} pipeline complete → {}",
+        final_path.kind_name,
+        final_path.path.display()
+    );
     Ok(())
 }
 
@@ -222,7 +232,11 @@ impl Converter {
     }
 
     fn open_final(&self, header: sam::Header) -> Result<BamWriter> {
-        let reference = self.opts.kind.is_cram().then_some(self.opts.reference.as_path());
+        let reference = self
+            .opts
+            .kind
+            .is_cram()
+            .then_some(self.opts.reference.as_path());
         BamWriter::create_with_options(
             Some(&self.opts.output),
             header,
@@ -274,7 +288,11 @@ impl Converter {
                             "[KIRA] --emit {}: records exceed --sort-memory ({} MB); spilling to an unsorted BAM and finishing with kira-bam's external sort{}",
                             emit_name(kind),
                             *budget >> 20,
-                            if self.opts.markdup { " + two-pass markdup" } else { "" }
+                            if self.opts.markdup {
+                                " + two-pass markdup"
+                            } else {
+                                ""
+                            }
                         );
                         let dir = self
                             .opts
@@ -334,7 +352,9 @@ impl Converter {
                             .prefix("kira-ls-aligner-")
                             .suffix(".sorted.bam")
                             .tempfile_in(&dir)
-                            .with_context(|| format!("create sorted temp BAM in {}", dir.display()))?
+                            .with_context(|| {
+                                format!("create sorted temp BAM in {}", dir.display())
+                            })?
                             .into_temp_path(),
                     )
                 } else {

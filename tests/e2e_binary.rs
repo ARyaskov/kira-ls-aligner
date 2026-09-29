@@ -48,7 +48,10 @@ fn check_header(header: &[String], ds: &Dataset, what: &str) {
             (sn.expect("@SQ has SN"), ln.expect("@SQ has LN"))
         })
         .collect();
-    assert_eq!(sq, ds.contigs, "{what}: @SQ lines differ from the reference");
+    assert_eq!(
+        sq, ds.contigs,
+        "{what}: @SQ lines differ from the reference"
+    );
 }
 
 /// Every SAM line must also parse with a spec-conformant reader.
@@ -86,7 +89,11 @@ fn check_record(rec: &SamRecord, ds: &Dataset, paired: bool, stats: &mut Stats) 
             "paired record must have exactly one of 0x40/0x80: {line}"
         );
     } else {
-        assert_eq!(rec.flag & (0x1 | 0x40 | 0x80), 0, "single-end record with pair bits: {line}");
+        assert_eq!(
+            rec.flag & (0x1 | 0x40 | 0x80),
+            0,
+            "single-end record with pair bits: {line}"
+        );
     }
 
     let truth = ds
@@ -114,8 +121,16 @@ fn check_record(rec: &SamRecord, ds: &Dataset, paired: bool, stats: &mut Stats) 
         let qlen = cigar_query_len(&rec.cigar)
             .unwrap_or_else(|| panic!("malformed CIGAR {:?}: {line}", rec.cigar));
         if rec.seq != "*" {
-            assert_eq!(qlen, rec.seq.len(), "CIGAR query length != SEQ length: {line}");
-            assert_eq!(rec.qual.len(), rec.seq.len(), "QUAL length != SEQ length: {line}");
+            assert_eq!(
+                qlen,
+                rec.seq.len(),
+                "CIGAR query length != SEQ length: {line}"
+            );
+            assert_eq!(
+                rec.qual.len(),
+                rec.seq.len(),
+                "QUAL length != SEQ length: {line}"
+            );
         }
         assert!(rec.tag("NM").is_some(), "mapped record without NM: {line}");
         assert!(
@@ -127,7 +142,11 @@ fn check_record(rec: &SamRecord, ds: &Dataset, paired: bool, stats: &mut Stats) 
     // 0x10 must agree with the orientation of SEQ relative to the read as
     // sequenced (only checkable when SEQ is the full, unclipped read).
     if rec.seq != "*" && !rec.cigar.contains('H') {
-        let expected = if rec.has(0x10) { revcomp(&truth.seq) } else { truth.seq.clone() };
+        let expected = if rec.has(0x10) {
+            revcomp(&truth.seq)
+        } else {
+            truth.seq.clone()
+        };
         assert_eq!(
             rec.seq.as_bytes(),
             expected.as_slice(),
@@ -202,23 +221,75 @@ fn check_pairs(sam: &Sam, ds: &Dataset) {
 
         let both_mapped = !r1.is_unmapped() && !r2.is_unmapped();
         if both_mapped {
-            assert_eq!(r1.tlen, -r2.tlen, "TLEN of the mates must be negatives:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r1.mate_rname(), r2.rname, "R1 RNEXT != R2 RNAME:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r1.pnext, r2.pos, "R1 PNEXT != R2 POS:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r2.mate_rname(), r1.rname, "R2 RNEXT != R1 RNAME:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r2.pnext, r1.pos, "R2 PNEXT != R1 POS:\n{}\n{}", r1.line, r2.line);
-            assert!(!r1.has(0x8) && !r2.has(0x8), "0x8 set although both mates mapped:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r1.has(0x20), r2.has(0x10), "R1 0x20 != R2 0x10:\n{}\n{}", r1.line, r2.line);
-            assert_eq!(r2.has(0x20), r1.has(0x10), "R2 0x20 != R1 0x10:\n{}\n{}", r1.line, r2.line);
+            assert_eq!(
+                r1.tlen, -r2.tlen,
+                "TLEN of the mates must be negatives:\n{}\n{}",
+                r1.line, r2.line
+            );
+            assert_eq!(
+                r1.mate_rname(),
+                r2.rname,
+                "R1 RNEXT != R2 RNAME:\n{}\n{}",
+                r1.line,
+                r2.line
+            );
+            assert_eq!(
+                r1.pnext, r2.pos,
+                "R1 PNEXT != R2 POS:\n{}\n{}",
+                r1.line, r2.line
+            );
+            assert_eq!(
+                r2.mate_rname(),
+                r1.rname,
+                "R2 RNEXT != R1 RNAME:\n{}\n{}",
+                r1.line,
+                r2.line
+            );
+            assert_eq!(
+                r2.pnext, r1.pos,
+                "R2 PNEXT != R1 POS:\n{}\n{}",
+                r1.line, r2.line
+            );
+            assert!(
+                !r1.has(0x8) && !r2.has(0x8),
+                "0x8 set although both mates mapped:\n{}\n{}",
+                r1.line,
+                r2.line
+            );
+            assert_eq!(
+                r1.has(0x20),
+                r2.has(0x10),
+                "R1 0x20 != R2 0x10:\n{}\n{}",
+                r1.line,
+                r2.line
+            );
+            assert_eq!(
+                r2.has(0x20),
+                r1.has(0x10),
+                "R2 0x20 != R1 0x10:\n{}\n{}",
+                r1.line,
+                r2.line
+            );
             if r1.rname == r2.rname {
-                assert_ne!(r1.tlen, 0, "TLEN 0 for mates on one contig:\n{}\n{}", r1.line, r2.line);
+                assert_ne!(
+                    r1.tlen, 0,
+                    "TLEN 0 for mates on one contig:\n{}\n{}",
+                    r1.line, r2.line
+                );
                 // Concordant, full-length pair: |TLEN| is the fragment length.
                 let t1 = &ds.truth[&(r1.qname.clone(), Role::R1)];
                 let t2 = &ds.truth[&(r2.qname.clone(), Role::R2)];
                 let frag = (t2.end - t1.start) as i64;
-                let r1_ok = r1.rname == t1.contig && (r1.pos as i64 - 1 - t1.start as i64).abs() <= POS_TOLERANCE;
-                let r2_ok = r2.rname == t2.contig && (r2.pos as i64 - 1 - t2.start as i64).abs() <= POS_TOLERANCE;
-                if r1_ok && r2_ok && r1.cigar.ends_with('M') && !r1.cigar.contains('S') && !r2.cigar.contains('S') {
+                let r1_ok = r1.rname == t1.contig
+                    && (r1.pos as i64 - 1 - t1.start as i64).abs() <= POS_TOLERANCE;
+                let r2_ok = r2.rname == t2.contig
+                    && (r2.pos as i64 - 1 - t2.start as i64).abs() <= POS_TOLERANCE;
+                if r1_ok
+                    && r2_ok
+                    && r1.cigar.ends_with('M')
+                    && !r1.cigar.contains('S')
+                    && !r2.cigar.contains('S')
+                {
                     assert!(
                         (r1.tlen.abs() - frag).abs() <= 2 * POS_TOLERANCE,
                         "|TLEN| {} far from fragment length {frag}:\n{}\n{}",
@@ -226,19 +297,42 @@ fn check_pairs(sam: &Sam, ds: &Dataset) {
                         r1.line,
                         r2.line
                     );
-                    assert!(r1.has(0x2) && r2.has(0x2), "concordant pair without 0x2:\n{}\n{}", r1.line, r2.line);
+                    assert!(
+                        r1.has(0x2) && r2.has(0x2),
+                        "concordant pair without 0x2:\n{}\n{}",
+                        r1.line,
+                        r2.line
+                    );
                 }
             }
         } else {
             for (me, mate) in [(r1, r2), (r2, r1)] {
                 if me.is_unmapped() {
-                    assert!(mate.has(0x8) || mate.is_unmapped(), "mate of an unmapped read lacks 0x8:\n{}\n{}", me.line, mate.line);
+                    assert!(
+                        mate.has(0x8) || mate.is_unmapped(),
+                        "mate of an unmapped read lacks 0x8:\n{}\n{}",
+                        me.line,
+                        mate.line
+                    );
                     assert_eq!(me.tlen, 0, "unmapped read with a TLEN:\n{}", me.line);
                     if me.rname != "*" {
                         // Placed at the mate: must copy the mate's coordinates.
-                        assert!(!mate.is_unmapped(), "unmapped read placed at an unmapped mate:\n{}\n{}", me.line, mate.line);
-                        assert_eq!(me.rname, mate.rname, "unmapped read placed away from its mate:\n{}\n{}", me.line, mate.line);
-                        assert_eq!(me.pos, mate.pos, "unmapped read placed away from its mate:\n{}\n{}", me.line, mate.line);
+                        assert!(
+                            !mate.is_unmapped(),
+                            "unmapped read placed at an unmapped mate:\n{}\n{}",
+                            me.line,
+                            mate.line
+                        );
+                        assert_eq!(
+                            me.rname, mate.rname,
+                            "unmapped read placed away from its mate:\n{}\n{}",
+                            me.line, mate.line
+                        );
+                        assert_eq!(
+                            me.pos, mate.pos,
+                            "unmapped read placed away from its mate:\n{}\n{}",
+                            me.line, mate.line
+                        );
                     }
                 }
             }
@@ -268,7 +362,12 @@ fn index_and_mem_through_the_binary() {
         &["--index", index.to_str().unwrap(), "-t", "2"],
     );
     // Single-end: no --index, indexing on the fly.
-    let single_text = run_mem(&ds.reference, &[&ds.single], &ds.dir.join("single.sam"), &[]);
+    let single_text = run_mem(
+        &ds.reference,
+        &[&ds.single],
+        &ds.dir.join("single.sam"),
+        &[],
+    );
 
     let paired = parse_sam(&paired_text);
     let single = parse_sam(&single_text);
@@ -320,7 +419,9 @@ fn index_and_mem_through_the_binary() {
         .expect("spawn kira_ls_aligner");
     let mut stdout = child.stdout.take().unwrap();
     let mut head = [0u8; 100];
-    stdout.read_exact(&mut head).expect("read the first 100 bytes of SAM");
+    stdout
+        .read_exact(&mut head)
+        .expect("read the first 100 bytes of SAM");
     drop(stdout);
     let out = child.wait_with_output().expect("wait for kira_ls_aligner");
     let stderr = String::from_utf8_lossy(&out.stderr);

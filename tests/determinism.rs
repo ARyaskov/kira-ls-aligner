@@ -27,13 +27,14 @@ fn params() -> SimParams {
 fn assert_bodies_identical(a: &str, b: &str, what: &str) {
     let a = sam_body(a);
     let b = sam_body(b);
-    let differing = a
+    let differing =
+        a.iter().zip(b.iter()).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
+    if let Some((i, (x, y))) = a
         .iter()
         .zip(b.iter())
-        .filter(|(x, y)| x != y)
-        .count()
-        + a.len().abs_diff(b.len());
-    if let Some((i, (x, y))) = a.iter().zip(b.iter()).enumerate().find(|(_, (x, y))| x != y) {
+        .enumerate()
+        .find(|(_, (x, y))| x != y)
+    {
         panic!(
             "{what}: {differing} differing body line(s); first at record {}:\n  {x}\n  {y}",
             i + 1
@@ -46,14 +47,40 @@ fn assert_bodies_identical(a: &str, b: &str, what: &str) {
 fn across_thread_counts() {
     let ds = build_dataset("det_threads", &params());
 
-    let t1 = run_mem(&ds.reference, &[&ds.r1, &ds.r2], &ds.dir.join("p_t1.sam"), &["-t", "1"]);
-    let t4 = run_mem(&ds.reference, &[&ds.r1, &ds.r2], &ds.dir.join("p_t4.sam"), &["-t", "4"]);
-    assert!(sam_body(&t1).len() >= 2 * ds.n_pairs, "paired output is missing records");
+    let t1 = run_mem(
+        &ds.reference,
+        &[&ds.r1, &ds.r2],
+        &ds.dir.join("p_t1.sam"),
+        &["-t", "1"],
+    );
+    let t4 = run_mem(
+        &ds.reference,
+        &[&ds.r1, &ds.r2],
+        &ds.dir.join("p_t4.sam"),
+        &["-t", "4"],
+    );
+    assert!(
+        sam_body(&t1).len() >= 2 * ds.n_pairs,
+        "paired output is missing records"
+    );
     assert_bodies_identical(&t1, &t4, "paired, -t 1 vs -t 4");
 
-    let s1 = run_mem(&ds.reference, &[&ds.single], &ds.dir.join("s_t1.sam"), &["-t", "1"]);
-    let s4 = run_mem(&ds.reference, &[&ds.single], &ds.dir.join("s_t4.sam"), &["-t", "4"]);
-    assert!(sam_body(&s1).len() >= ds.n_single, "single-end output is missing records");
+    let s1 = run_mem(
+        &ds.reference,
+        &[&ds.single],
+        &ds.dir.join("s_t1.sam"),
+        &["-t", "1"],
+    );
+    let s4 = run_mem(
+        &ds.reference,
+        &[&ds.single],
+        &ds.dir.join("s_t4.sam"),
+        &["-t", "4"],
+    );
+    assert!(
+        sam_body(&s1).len() >= ds.n_single,
+        "single-end output is missing records"
+    );
     assert_bodies_identical(&s1, &s4, "single-end, -t 1 vs -t 4");
 }
 
@@ -63,7 +90,15 @@ fn placements(text: &str) -> BTreeSet<(String, Role, bool, String, u64)> {
         .records
         .iter()
         .filter(|r| r.is_primary())
-        .map(|r| (r.qname.clone(), r.role(), r.is_unmapped(), r.rname.clone(), r.pos))
+        .map(|r| {
+            (
+                r.qname.clone(),
+                r.role(),
+                r.is_unmapped(),
+                r.rname.clone(),
+                r.pos,
+            )
+        })
         .collect()
 }
 
@@ -77,12 +112,25 @@ fn across_batch_sizes() {
         &ds.dir.join("k100k.sam"),
         &["-t", "2", "-K", "100000"],
     );
-    let default = run_mem(&ds.reference, &[&ds.r1, &ds.r2], &ds.dir.join("kdef.sam"), &["-t", "2"]);
+    let default = run_mem(
+        &ds.reference,
+        &[&ds.r1, &ds.r2],
+        &ds.dir.join("kdef.sam"),
+        &["-t", "2"],
+    );
 
     let p_small = placements(&small);
     let p_default = placements(&default);
-    assert_eq!(p_small.len(), 2 * ds.n_pairs, "one primary record per read (-K 100000)");
-    assert_eq!(p_default.len(), 2 * ds.n_pairs, "one primary record per read (default -K)");
+    assert_eq!(
+        p_small.len(),
+        2 * ds.n_pairs,
+        "one primary record per read (-K 100000)"
+    );
+    assert_eq!(
+        p_default.len(),
+        2 * ds.n_pairs,
+        "one primary record per read (default -K)"
+    );
 
     let only_small: Vec<_> = p_small.difference(&p_default).collect();
     let only_default: Vec<_> = p_default.difference(&p_small).collect();

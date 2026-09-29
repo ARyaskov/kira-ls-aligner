@@ -42,13 +42,7 @@ fn scan_raw_matches_packed_dna_entry_point() {
     let tp = PackedDna::pack(reference);
     let shifted = tp.pre_shifted_window();
     let via_struct = scan_best_with_second(&rp, &shifted, reference.len());
-    let via_raw = scan_best_with_second_raw(
-        &rp.bits,
-        rp.len,
-        rp.valid,
-        &shifted,
-        reference.len(),
-    );
+    let via_raw = scan_best_with_second_raw(&rp.bits, rp.len, rp.valid, &shifted, reference.len());
     assert_eq!(
         via_struct.map(|(h, s)| (h.shift, h.mismatches, s)),
         via_raw.map(|(h, s)| (h.shift, h.mismatches, s)),

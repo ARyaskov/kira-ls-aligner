@@ -32,7 +32,6 @@ use crate::pipeline::pairing::{
     PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs_with_ref,
     rescue_unmapped_mates_with_ref,
 };
-use crate::types::{Alignment, MateInfo, ReadRecord, Reference};
 use crate::pipeline::stage1_sketch::{
     SketchBatchStats, SketchConfig, run_with_mask as sketch_run_with_mask,
 };
@@ -43,6 +42,7 @@ use crate::pipeline::stage4_alignment::{
 };
 use crate::pipeline::stage6_output::serialize_into as output_serialize_into;
 use crate::seeding::SeedingConfig;
+use crate::types::{Alignment, MateInfo, ReadRecord, Reference};
 
 /// Pipeline configuration aggregated across stages.
 #[derive(Clone, Copy, Debug)]
@@ -257,8 +257,7 @@ impl Pipeline {
         read_group: Option<&str>,
     ) -> Result<PipelineBatchOutput> {
         let mut sam_buf = Vec::new();
-        let stats =
-            self.process_batch_into(input, index, formatter, read_group, &mut sam_buf)?;
+        let stats = self.process_batch_into(input, index, formatter, read_group, &mut sam_buf)?;
         Ok(PipelineBatchOutput { stats, sam_buf })
     }
 
@@ -361,7 +360,8 @@ impl Pipeline {
         let t_stage4 = ts4.elapsed();
 
         if std::env::var_os("KIRA_STATS").is_some() {
-            crate::kira_info!("[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
+            crate::kira_info!(
+                "[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
                 ac_stats.n_reads,
                 ac_stats.reads_eligible,
                 ac_stats.reads_resolved,
@@ -394,7 +394,8 @@ impl Pipeline {
 
         stages[3] = t3.elapsed();
         if std::env::var_os("KIRA_STATS").is_some() {
-            crate::kira_info!("[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",
+            crate::kira_info!(
+                "[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",
                 t_stage4.as_secs_f64() * 1000.0,
                 t_rescue_unmapped.as_secs_f64() * 1000.0,
                 t_pair_rerank.as_secs_f64() * 1000.0,
@@ -583,10 +584,9 @@ impl PostAlignPolicy<'_> {
         let apply_pairing_t = tap.elapsed();
 
         let refined = match estimator {
-            Some(e) if paired_cfg.is_paired() => e
-                .write()
-                .ok()
-                .and_then(|mut e| e.observe_batch(alignments)),
+            Some(e) if paired_cfg.is_paired() => {
+                e.write().ok().and_then(|mut e| e.observe_batch(alignments))
+            }
             _ => None,
         };
 
@@ -688,7 +688,10 @@ fn apply_alt_primary_policy(
         let read_len = read.seq.len() as u32;
         let interval = |a: &crate::types::Alignment| -> (u32, u32) {
             if a.is_rev {
-                (read_len.saturating_sub(a.read_end), read_len.saturating_sub(a.read_start))
+                (
+                    read_len.saturating_sub(a.read_end),
+                    read_len.saturating_sub(a.read_start),
+                )
             } else {
                 (a.read_start, a.read_end)
             }
@@ -754,7 +757,10 @@ mod policy_tests {
     fn min_output_score_unmaps_read_when_primary_is_below_floor() {
         let mut alns = vec![vec![aln(0, 25, 0, 150, false), aln(1, 40, 0, 150, false)]];
         apply_min_output_score(&mut alns, 30);
-        assert!(alns[0].is_empty(), "a rejected primary never promotes a runner-up");
+        assert!(
+            alns[0].is_empty(),
+            "a rejected primary never promotes a runner-up"
+        );
     }
 
     #[test]
@@ -809,7 +815,10 @@ mod policy_tests {
         let mask = &[false, true][..];
         let mut alns = vec![vec![aln(1, 150, 0, 150, false), aln(0, 130, 0, 150, false)]];
         apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
-        assert_eq!(alns[0][0].ref_id, 1, "a 5-mismatch gap is real divergence, not an ALT tie");
+        assert_eq!(
+            alns[0][0].ref_id, 1,
+            "a 5-mismatch gap is real divergence, not an ALT tie"
+        );
     }
 
     #[test]
@@ -817,12 +826,18 @@ mod policy_tests {
         let mask = &[false, true][..];
         let mut alns = vec![vec![aln(0, 150, 0, 150, false), aln(1, 150, 0, 150, false)]];
         apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
-        assert_eq!(alns[0][0].ref_id, 0, "a primary-assembly primary is left alone");
+        assert_eq!(
+            alns[0][0].ref_id, 0,
+            "a primary-assembly primary is left alone"
+        );
 
         // ALT primary whose only primary-assembly hit covers a different read region.
         let mut alns = vec![vec![aln(1, 70, 0, 70, false), aln(0, 70, 80, 150, false)]];
         apply_alt_primary_policy(&[read(150)], &mut alns, mask, 4);
-        assert_eq!(alns[0][0].ref_id, 1, "disjoint segments are not alternatives");
+        assert_eq!(
+            alns[0][0].ref_id, 1,
+            "disjoint segments are not alternatives"
+        );
     }
 }
 

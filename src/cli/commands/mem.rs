@@ -144,7 +144,7 @@ pub fn build_short_pe_aligner(
         gap_extend: env_i32("KIRA_CHAIN_GAP_EXTEND", 1),
         log_gap: 0.2,
         rmq_window: 256,
-            keep_anchors: false,
+        keep_anchors: false,
     };
     let alignment_cfg = AlignmentConfig {
         match_score: 1,
@@ -376,7 +376,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_extend: 1,
                 log_gap: 0.2,
                 rmq_window: 256,
-            keep_anchors: false,
+                keep_anchors: false,
             },
             AlignmentConfig {
                 match_score: args.match_score,
@@ -402,7 +402,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 gap_extend: 1,
                 log_gap: 0.2,
                 rmq_window: 1024,
-            keep_anchors: false,
+                keep_anchors: false,
             },
             AlignmentConfig {
                 match_score: args.match_score,
@@ -439,14 +439,19 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     let (paired_mode, auto_detected_pe) =
         resolve_paired_mode(args.paired, args.interleaved, args.reads.len())?;
     if auto_detected_pe {
-        crate::kira_info!("[KIRA] auto-detected 2 FASTQ inputs as paired R1+R2 (bwa-mem convention). \
+        crate::kira_info!(
+            "[KIRA] auto-detected 2 FASTQ inputs as paired R1+R2 (bwa-mem convention). \
              Pass --paired to silence this notice, or provide >2 files / 1 file for \
              single-end concatenation."
         );
     }
     let mut paired_cfg = PairedConfig::default();
     paired_cfg.mode = paired_mode;
-    apply_insert_args(&mut paired_cfg, args.insert_size.as_deref(), &args.insert_window)?;
+    apply_insert_args(
+        &mut paired_cfg,
+        args.insert_size.as_deref(),
+        &args.insert_window,
+    )?;
     seeding_cfg.mate_window = mate_seed_window(&paired_cfg);
 
     let strand_policy = match args.splice_strand.to_ascii_lowercase().as_str() {
@@ -489,7 +494,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
             let idx = JunctionIndex::from_bed_path(path, &reference)
                 .with_context(|| format!("parse --junc-bed {}", path.display()))?;
             if idx.is_empty() {
-                crate::kira_warn!("[KIRA_JUNCBED] warning: 0 usable junctions loaded from {}; \
+                crate::kira_warn!(
+                    "[KIRA_JUNCBED] warning: 0 usable junctions loaded from {}; \
                      splice path will rely on signal detection only",
                     path.display()
                 );
@@ -595,7 +601,9 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
             v.into_iter().map(|(k, val)| format!("{k}={val}")).collect()
         };
         if !knobs.is_empty() {
-            header.co_lines.push(format!("kira-env:{}", knobs.join(" ")));
+            header
+                .co_lines
+                .push(format!("kira-env:{}", knobs.join(" ")));
         }
         header.co_lines.push(format!(
             "kira-config:{}",
@@ -648,7 +656,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     let resolved_index: Option<std::path::PathBuf> = if splice_preset {
         if args.index.is_some() {
-            crate::kira_warn!("[KIRA] warning: --index is being ignored in splice mode \
+            crate::kira_warn!(
+                "[KIRA] warning: --index is being ignored in splice mode \
                  (k/w mismatch would produce zero alignments). Building \
                  a fresh splice-tuned index in memory."
             );
@@ -658,7 +667,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         args.index.clone().or_else(|| {
             let candidate = args.reference.with_extension("kiraidx");
             if candidate.is_file() {
-                crate::kira_info!("[KIRA] auto-detected sidecar index {} for {}",
+                crate::kira_info!(
+                    "[KIRA] auto-detected sidecar index {} for {}",
                     candidate.display(),
                     args.reference.display()
                 );
@@ -702,7 +712,9 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         ));
     }
     if args.markdup && !kind.is_sorted() {
-        crate::kira_warn!("[KIRA] warning: --markdup requires --emit sorted-bam/sorted-cram; skipping");
+        crate::kira_warn!(
+            "[KIRA] warning: --markdup requires --emit sorted-bam/sorted-cram; skipping"
+        );
     }
 
     // The fused path drives the pipeline itself, so it needs the index in hand.
@@ -816,8 +828,8 @@ fn header_insert_lines(item: &str) -> Result<Vec<String>> {
     if let Some(rest) = item.strip_prefix('@') {
         return Ok(vec![format!("@{}", rest.replace("\\t", "\t"))]);
     }
-    let text = std::fs::read_to_string(item)
-        .with_context(|| format!("read -H header file {item}"))?;
+    let text =
+        std::fs::read_to_string(item).with_context(|| format!("read -H header file {item}"))?;
     let lines: Vec<String> = text
         .lines()
         .map(str::trim_end)
@@ -850,9 +862,11 @@ fn run_split_prefix(
         ));
     }
     if tile_plan.is_trivial() {
-        crate::kira_info!("[KIRA_TILE] note: reference fits in a single tile ({} bytes ≤ tile-bytes {}). \
+        crate::kira_info!(
+            "[KIRA_TILE] note: reference fits in a single tile ({} bytes ≤ tile-bytes {}). \
              Tiled pipeline still runs but it's equivalent to the single-pass path.",
-            tile_plan.tiles[0].total_bytes, args.tile_bytes
+            tile_plan.tiles[0].total_bytes,
+            args.tile_bytes
         );
     }
     let tiled_cfg = TiledRunConfig {
@@ -893,7 +907,12 @@ pub(crate) fn mate_seed_window(paired: &PairedConfig) -> Option<u32> {
     if !enabled || !paired.is_paired() {
         return None;
     }
-    Some(paired.insert_max.max(paired.insert_mean.saturating_add(4 * paired.insert_sd)).max(500))
+    Some(
+        paired
+            .insert_max
+            .max(paired.insert_mean.saturating_add(4 * paired.insert_sd))
+            .max(500),
+    )
 }
 
 /// Resolve the FASTQ ingestion mode from the `--paired` / `--interleaved` flags and the input file.

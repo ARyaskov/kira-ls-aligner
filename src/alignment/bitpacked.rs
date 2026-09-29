@@ -175,8 +175,7 @@ pub fn scan_best_with_second_raw(
         if byte_off + read_bytes > ref_buf.len() {
             continue;
         }
-        let mismatches =
-            mismatch_count(read_bits, &ref_buf[byte_off..byte_off + read_bytes], r);
+        let mismatches = mismatch_count(read_bits, &ref_buf[byte_off..byte_off + read_bytes], r);
         if mismatches < best_mism {
             second_mism = best_mism;
             best_mism = mismatches;

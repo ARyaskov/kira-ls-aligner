@@ -187,7 +187,10 @@ fn observe_batch_samples_fr_pairs_beyond_the_prior_window() {
             ref_end: 150,
             read_start: 0,
             read_end: 150,
-            cigar: vec![CigarOp { len: 150, op: CigarKind::Match }],
+            cigar: vec![CigarOp {
+                len: 150,
+                op: CigarKind::Match,
+            }],
             score: 150,
             mapq: 60,
             is_rev,
