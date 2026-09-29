@@ -298,7 +298,11 @@ impl MinimizerIndex {
         crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) sorting {:.1}M minimizers by hash...",
             flat.len() as f64 / 1e6
         );
-        flat.par_sort_unstable_by_key(|t| t.hash);
+        // Sort by the full record, not just the hash: buckets over `max_occ`
+        // are truncated to the first `max_occ + 1` records, and the retained
+        // subset must be the same for every build (and match the external
+        // builder, which sorts its runs the same way).
+        flat.par_sort_unstable_by_key(|t| (t.hash, t.ref_strand, t.pos));
         let t_sort_dur = t_sort.elapsed();
         crate::kira_info!("[KIRA_INDEX] (k={k} w={w}) sort done in {:.1}s ({:.0}M items/s)",
             t_sort_dur.as_secs_f64(),
@@ -1624,6 +1628,58 @@ mod tests {
         assert_eq!(occ.ref_id, 123);
         assert_eq!(occ.pos, u32::MAX);
         assert!(matches!(occ.strand, Strand::Reverse));
+    }
+
+    /// Over-cap buckets keep a deterministic `max_occ + 1` subset in both
+    /// builders: the sentinel length marks the bucket as too repetitive and
+    /// the retained records are the lowest `(strand, pos)` ones.
+    #[test]
+    fn over_cap_buckets_are_truncated_identically_by_both_builders() {
+        // "ACGTA" repeated 12 times: every k=5 window recurs 12 times.
+        let unit = b"ACGTA";
+        let mut bases = Vec::new();
+        for _ in 0..12 {
+            bases.extend_from_slice(unit);
+        }
+        bases.extend_from_slice(b"TTGCAGGCTTAC");
+        let reference = reference(&bases);
+        let cfg = MinimizerConfig { k: 5, w: 3 };
+        let max_occ = 3;
+        let in_memory =
+            MinimizerIndex::build_with_budget(&reference, cfg.k, cfg.w, max_occ, usize::MAX);
+        let external = MinimizerIndex::build_external(&reference, cfg, cfg.k, cfg.w, max_occ, 1);
+        let mut hashes: Vec<u64> = minimizers(reference.sequences[0].bases(None), &cfg)
+            .into_iter()
+            .map(|m| m.hash)
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        let uncapped =
+            MinimizerIndex::build_with_budget(&reference, cfg.k, cfg.w, 1_000, usize::MAX);
+        // Raw (unsorted) bucket contents as (strand, pos) in stored order.
+        let raw = |index: &MinimizerIndex, hash: u64| -> Vec<(u8, u32)> {
+            let mut out = Vec::new();
+            index.for_each_occ(None, hash, &mut |occ| {
+                out.push((u8::from(matches!(occ.strand, Strand::Reverse)), occ.pos));
+            });
+            out
+        };
+        let mut saw_truncated = false;
+        for hash in hashes {
+            let a = raw(&in_memory, hash);
+            let b = raw(&external, hash);
+            assert_eq!(a, b, "hash {hash}");
+            assert!(a.len() <= max_occ + 1, "bucket exceeds the sentinel length");
+            let mut all = raw(&uncapped, hash);
+            if all.len() > max_occ {
+                saw_truncated = true;
+                assert_eq!(a.len(), max_occ + 1, "sentinel length for hash {hash}");
+                all.sort_unstable();
+                all.truncate(max_occ + 1);
+                assert_eq!(a, all, "retained subset must be the lowest (strand, pos) records");
+            }
+        }
+        assert!(saw_truncated, "test reference must contain an over-cap bucket");
     }
 
     #[test]

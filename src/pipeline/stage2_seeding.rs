@@ -174,6 +174,15 @@ fn seed_template(
     vec![(a0, before0, occ0), (a1, before1, occ1)]
 }
 
+/// Occurrence cap the seeder applies to a table: the smaller of the run-time
+/// cap and the cap the index was built with. Buckets over the build cap are
+/// stored truncated to `index_max_occ + 1` records as a "too repetitive"
+/// sentinel, so a larger run-time cap must never treat them as complete.
+#[inline]
+pub fn effective_max_occ(seeding_max_occ: usize, index_max_occ: usize) -> usize {
+    seeding_max_occ.min(index_max_occ)
+}
+
 /// Seed one read. Returns its anchors, the pre-prune anchor count, the minimum
 /// seed occurrence count, and whether any bucket had to be truncated.
 fn seed_one(
@@ -219,6 +228,7 @@ fn seed_one(
         &mut ctx.buckets_scratch,
     );
 
+    let max_occ = effective_max_occ(cfg.max_occ, table.max_occ);
     let mut min_occ: u32 = u32::MAX;
     for (m_idx, m) in mins.iter().enumerate() {
         let (start, end) = match ctx.buckets_scratch[m_idx] {
@@ -229,7 +239,7 @@ fn seed_one(
         if bucket_len >= 1 {
             min_occ = min_occ.min(bucket_len as u32);
         }
-        if bucket_len == 0 || bucket_len > cfg.max_occ {
+        if bucket_len == 0 || bucket_len > max_occ {
             continue;
         }
 
@@ -693,6 +703,18 @@ mod mate_hint_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-time cap never exceeds the build cap: an index built with
+    /// --max-occ 100 stores over-cap buckets truncated to 101 records, which
+    /// a seeder capped at 500 must not read as complete buckets.
+    #[test]
+    fn effective_cap_is_bounded_by_the_index_cap() {
+        assert_eq!(effective_max_occ(500, 100), 100);
+        assert_eq!(effective_max_occ(32, 500), 32);
+        assert_eq!(effective_max_occ(500, 500), 500);
+        // The sentinel length (index cap + 1) is always over the cap.
+        assert!(101 > effective_max_occ(500, 100));
+    }
 
     #[test]
     fn seed_strand_is_relative_not_reference_canonical_strand() {
