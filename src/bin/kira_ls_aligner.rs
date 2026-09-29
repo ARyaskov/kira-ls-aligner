@@ -28,6 +28,8 @@ enum Commands {
     Eval(EvalArgs),
     /// Run a long-lived GPU server with a warm CUDA context.
     GpuServer(GpuServerArgs),
+    /// List the KIRA_* tuning knobs with their defaults
+    Knobs,
 }
 
 #[derive(Parser, Debug)]
@@ -48,6 +50,10 @@ fn main() -> Result<()> {
         Commands::Mem(args) => cmd_mem(args),
         Commands::Eval(args) => cmd_eval(args),
         Commands::GpuServer(args) => run_gpu_server(args),
+        Commands::Knobs => {
+            print!("{}", kira_ls_aligner::knobs::render_table());
+            Ok(())
+        }
     }
 }
 

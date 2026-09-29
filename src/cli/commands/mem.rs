@@ -242,6 +242,13 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     // knob: every `KIRA_*` is a lazily initialised `OnceLock`, and nothing has
     // touched one yet at this point.
     apply_knob_overrides(args.config.as_deref(), &args.set)?;
+    let unknown = crate::knobs::unknown_in_env();
+    if !unknown.is_empty() {
+        crate::kira_warn!(
+            "[KIRA] warning: unknown KIRA_* variables in the environment (no effect): {}",
+            unknown.join(" ")
+        );
+    }
     if args.gpu {
         start_gpu_dispatcher()?;
     }
@@ -754,9 +761,13 @@ fn apply_knob_overrides(config: Option<&std::path::Path>, sets: &[String]) -> Re
         pairs.push((k.trim().to_string(), v.trim().to_string()));
     }
     for (k, v) in pairs {
-        if !k.starts_with("KIRA_") || k.len() <= 5 {
+        if !crate::knobs::is_known(&k) {
+            let hint = match crate::knobs::suggest(&k) {
+                Some(s) => format!("; did you mean {s}?"),
+                None => String::new(),
+            };
             return Err(anyhow::anyhow!(
-                "tuning knob {k:?} must be a KIRA_* name (see README, \"Tuning knobs\")"
+                "unknown tuning knob {k:?}{hint} (`kira_ls_aligner knobs` lists them)"
             ));
         }
         // SAFETY: called from `cmd_mem` before any worker thread exists —

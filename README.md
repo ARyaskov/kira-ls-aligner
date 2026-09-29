@@ -219,7 +219,11 @@ knob in force (`@CO kira-env:…`) and the effective pipeline parameters
 
 Defaults are what the numbers below were measured with; each knob exists so the
 default can be A/B'd without a rebuild. Set them in the environment, with
-`--set`, or in a `--config` file of `KIRA_KNOB=value` lines.
+`--set`, or in a `--config` file of `KIRA_KNOB=value` lines. `--set` and
+`--config` reject a name that is not a knob (with a "did you mean"), and an
+unknown `KIRA_*` variable found in the environment is reported at startup.
+`kira_ls_aligner knobs` prints the full registry with defaults; the table
+below covers the ones worth knowing about.
 
 | Variable | Default | Effect |
 |---|---|---|
