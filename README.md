@@ -161,7 +161,7 @@ accepted without effect and listed once on stderr.
 - `-v INT` : Verbosity, 1 errors … 3 messages (default) … 4 debug.
 - `-T INT` : Minimum alignment score to output (30).
 - `-a` : Output all found alignments (secondaries included).
-- `-h INT[,INT]` : Emit `XA` only when the read has at most INT close secondary hits (5). `XA` needs secondaries to exist, i.e. `--dp-topk 2` or `-a`.
+- `-h INT[,INT]` : Emit `XA` only when the read has at most INT close secondary hits (5). `XA` lists every alternative placement stage 4 aligned, whether or not the secondary records themselves are emitted (`-a`); `--dp-topk 2` makes more reads carry one.
 - `-M` : Flag supplementary segments as secondary (0x100) for Picard-era tools.
 - `-Y` : Soft-clip supplementary segments; the default hard-clips them, as bwa-mem does.
 - `-5` : For a split read, the segment with the smallest read coordinate is primary.

@@ -8,10 +8,12 @@ use super::stage5_scoring::ScoredBatch;
 
 /// One read ready for emission: the read, its alignments, the mate context
 /// for an unmapped record, and the pre-built mate tags (`MC`/`MQ`/`ms`).
+/// `(read, alignments, unmapped-mate info, mate tags, XA tag)`.
 type EmitRecord = (
     ReadRecord,
     Vec<crate::types::Alignment>,
     Option<crate::types::MateInfo>,
+    Option<Vec<u8>>,
     Option<Vec<u8>>,
 );
 
@@ -67,6 +69,26 @@ pub fn serialize_into(
     let mut alignments = input.alignments;
     let unmapped_mate_info = input.unmapped_mate_info;
 
+    // `max_alignments` caps the primary/secondary *records* emitted per read
+    // (supplementaries always go out). The XA tag is built from the full
+    // candidate list first: bwa-mem reports the alternative hits in XA even
+    // though it writes only the primary record, so pruning before the tag
+    // would leave XA empty at the default settings.
+    let xa_tags: Vec<Option<Vec<u8>>> = if output_cfg.write_xa
+        && matches!(output_cfg.format, EmitFormat::Sam)
+    {
+        alignments
+            .iter()
+            .map(|alns| {
+                let mut buf = Vec::new();
+                formatter
+                    .append_xa_capped(&mut buf, alns, output_cfg.xa_max)
+                    .then_some(buf)
+            })
+            .collect()
+    } else {
+        vec![None; alignments.len()]
+    };
     if max_alignments > 0 {
         for alns in alignments.iter_mut() {
             retain_reported_alignments(alns, max_alignments);
@@ -92,7 +114,8 @@ pub fn serialize_into(
         .zip(alignments)
         .zip(unmapped_mate_info)
         .zip(mate_tags)
-        .map(|(((r, a), m), t)| (r, a, m, t))
+        .zip(xa_tags)
+        .map(|((((r, a), m), t), xa)| (r, a, m, t, xa))
         .collect();
 
     let chunk_size: usize = 64;
@@ -101,7 +124,7 @@ pub fn serialize_into(
         .par_chunks(chunk_size)
         .map(|chunk| {
             let mut estimate = 0usize;
-            for (read, alns, _mate, _tags) in chunk.iter() {
+            for (read, alns, _mate, _tags, _xa) in chunk.iter() {
                 let qual_len = read.qual.as_ref().map_or(1, |q| q.len());
                 let per = read.id.len() + read.seq.len() + qual_len + 96;
                 let count = if alns.is_empty() { 1 } else { alns.len() };
@@ -109,7 +132,7 @@ pub fn serialize_into(
             }
             let mut buf = Vec::with_capacity(estimate);
             let mut extra_tags: Vec<u8> = Vec::new();
-            for (read, alns, mate, mtags) in chunk.iter() {
+            for (read, alns, mate, mtags, xa) in chunk.iter() {
                 let mtags = mtags.as_deref();
                 match output_cfg.format {
                     EmitFormat::Sam => {
@@ -128,12 +151,8 @@ pub fn serialize_into(
                                 // its own SA (the other segments) + mate tags.
                                 // Secondary: nothing beyond the core tags.
                                 extra_tags.clear();
-                                if idx == 0 && output_cfg.write_xa {
-                                    formatter.append_xa_capped(
-                                        &mut extra_tags,
-                                        alns,
-                                        output_cfg.xa_max,
-                                    );
+                                if idx == 0 && let Some(xa) = xa {
+                                    extra_tags.extend_from_slice(xa);
                                 }
                                 if has_supplementary
                                     && output_cfg.write_sa
