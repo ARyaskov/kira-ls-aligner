@@ -299,6 +299,9 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     } else {
         (5_000, 4000, 150, 512)
     };
+    // bwa-mem `-w`: one band width for every profile when given.
+    let band = |preset_band: i32| args.band_width.unwrap_or(preset_band);
+    let bandwidth = band(bandwidth);
 
     let chaining_cfg = ChainingConfig {
         max_dist,
@@ -348,7 +351,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 mismatch: args.mismatch_penalty,
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
-                bandwidth: 50,
+                bandwidth: band(50),
                 xdrop: args.xdrop,
                 clip_penalty: args.clip_penalty,
             },
@@ -374,7 +377,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 mismatch: args.mismatch_penalty,
                 gap_open: args.gap_open,
                 gap_extend: args.gap_extend,
-                bandwidth: 200,
+                bandwidth: band(200),
                 xdrop: args.xdrop,
                 clip_penalty: args.clip_penalty,
             },

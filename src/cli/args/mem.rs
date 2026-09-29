@@ -26,8 +26,9 @@ pub struct MemArgs {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
-    /// Verbosity: 1 = errors, 2 = warnings, 3 = messages (default), 4 = debug.
-    #[arg(short = 'v', long = "verbosity", default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))]
+    /// Verbosity: 0/1 = errors, 2 = warnings, 3 = messages (default), 4 = debug
+    /// (bwa-mem `-v`; 0 is accepted and behaves as 1).
+    #[arg(short = 'v', long = "verbosity", default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=4))]
     pub verbosity: u8,
 
     /// Config file of `KIRA_KNOB=value` lines (`#` comments allowed). Applied
@@ -134,8 +135,14 @@ pub struct MemArgs {
     pub seed_len: Option<usize>,
 
     /// Minimizer window size (overrides preset for both short and long indices).
-    #[arg(short = 'w', long = "window-len")]
+    /// Long-only: `-w` is bwa-mem's DP band width.
+    #[arg(long = "window-len")]
     pub window_len: Option<usize>,
+
+    /// Band width for banded DP extension (bwa-mem `-w`, default 100).
+    /// Overrides the per-preset band.
+    #[arg(short = 'w', long = "band-width", value_name = "INT", value_parser = clap::value_parser!(i32).range(1..))]
+    pub band_width: Option<i32>,
 
     /// Maximum reference occurrences retained per read minimizer.
     #[arg(long = "seed-occ-cap", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
@@ -265,6 +272,13 @@ pub struct MemArgs {
     /// `--seed-occ-cap` semantics would change results; accepted, no effect.
     #[arg(short = 'c', hide = true)]
     pub compat_max_occ: Option<u32>,
+    /// bwa-mem `-q`: don't modify mapQ of supplementary alignments. No effect
+    /// (supplementary MAPQ is never reduced here).
+    #[arg(short = 'q', hide = true)]
+    pub compat_keep_supp_mapq: bool,
+    /// bwa-mem `-V`: output the reference FASTA header in the XR tag. No effect.
+    #[arg(short = 'V', hide = true)]
+    pub compat_xr_header: bool,
 
     /// Insert-size prior, bwa-mem form: `mean[,sd[,max[,min]]]`
     /// (bwa-mem `-I`). Fixes the distribution instead of estimating it from
@@ -413,6 +427,7 @@ impl MemArgs {
             preset: "auto".to_string(),
             seed_len: None,
             window_len: None,
+            band_width: None,
             seed_occ_cap: 16,
             long_read_threshold: 500,
             match_score: 1,
@@ -444,6 +459,8 @@ impl MemArgs {
             compat_unpaired_penalty: None,
             compat_discard_exact: false,
             compat_max_occ: None,
+            compat_keep_supp_mapq: false,
+            compat_xr_header: false,
             insert_size: None,
             insert_window: "0,1000,200,50".to_string(),
             max_intron: 200_000,
@@ -493,6 +510,12 @@ impl MemArgs {
         }
         if self.compat_max_occ.is_some() {
             v.push("-c");
+        }
+        if self.compat_keep_supp_mapq {
+            v.push("-q");
+        }
+        if self.compat_xr_header {
+            v.push("-V");
         }
         v
     }

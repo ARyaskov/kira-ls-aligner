@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 static VERBOSITY: AtomicU8 = AtomicU8::new(3);
 
-/// Set the verbosity level (clamped to `1..=4`).
+/// Set the verbosity level (clamped to `1..=4`; bwa-mem's `-v 0` maps to 1).
 pub fn set_verbosity(level: u8) {
     VERBOSITY.store(level.clamp(1, 4), Ordering::Relaxed);
 }

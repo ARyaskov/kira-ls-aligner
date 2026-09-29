@@ -167,7 +167,9 @@ accepted without effect and listed once on stderr.
 - `-5` : For a split read, the segment with the smallest read coordinate is primary.
 - `-S` / `-P` : Skip mate rescue / skip pairing.
 - `-A -B -O -E -L -d` : Match, mismatch, gap open, gap extend, clip penalty, z-dropoff. `-O`/`-E`/`-L` accept bwa's `INT,INT` form (first value applies).
-- `-k, --seed-len` / `-w, --window-len` : Seed length and minimizer window (note: bwa-mem's `-w` is a band width).
+- `-k, --seed-len` : Seed length (overrides the preset for both indices).
+- `-w, --band-width` : Band width for banded DP extension (bwa-mem `-w`; overrides the preset band).
+- `--window-len` : Minimizer window size (long-only; must match the index).
 - `-x, --preset` : `short`, `long`, or `auto` (default; auto-selects mode at runtime).
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
 - `--accept-enable` : Override the ungapped ACCEPT shortcut.
