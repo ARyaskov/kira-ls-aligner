@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FASTA reads are accepted, as the CLI help and README already claimed.
 - `XA` is built from the full candidate list before the record cap is applied.
 - The binary exits quietly on `SIGPIPE`, like bwa and samtools.
+- The tiled (`--split-prefix`) driver runs the same post-alignment policy chain as the in-memory driver (candidate ordering, `-T`/`-5`/ALT policies, insert-size refinement, `-C` comments); each read's best-scoring candidate is primary in both drivers.
+- The insert-size estimator samples every same-contig FR pair rather than only pairs already inside the prior window, fits like bwa-mem's `mem_pestat` (IQR trim, mean +/- 4 sigma, sigma floor), and needs 4096 samples before locking.
+- With `--index`, the minimizer parameters are taken from the index unless `-k`/`--window-len` are given, in which case a disagreement is an error.
+- `--set` / `--config` reject unknown `KIRA_*` knob names with a suggestion; unknown `KIRA_*` variables in the environment are reported at startup.
+
+### Added
+
+- `kira_ls_aligner knobs` lists every `KIRA_*` tuning knob with its default.
+- End-to-end tests through the real binary (`tests/e2e_binary.rs`), determinism tests across `-t` and `-K` (`tests/determinism.rs`), and a GitHub Actions workflow.
+
+### Changed
+
+- `-x auto` classifies the library from the read-length distribution only (the other classifier inputs were never computed) and logs its decision.
+- The SAM writer keeps only contig names and lengths instead of a clone of the whole reference.
+- One `MdBuilder` produces `MD`/`NM` for every alignment path.
+- The NEON Smith-Waterman kernel compiles without `unsafe_op_in_unsafe_fn` warnings.
 
 ## [0.4.6] - 2026-09-03
 
