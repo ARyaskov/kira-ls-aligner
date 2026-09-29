@@ -1128,6 +1128,9 @@ fn build_alignment(
 }
 
 /// Scalar banded Smith-Waterman — also the fallback for INT8 lanes that saturate.
+/// Only the x86-64 INT8/VNNI kernel falls back through it; other targets never
+/// saturate a lane and have no caller.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn banded_sw_internal(
     read: &[u8],
     reference: &[u8],
@@ -2136,7 +2139,9 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
                     -cfg.mismatch
                 };
             }
-            let score_vec = vld1q_s32(score_arr.as_ptr());
+            // SAFETY: `score_arr` is a 4-element i32 array; the load reads
+            // exactly four lanes.
+            let score_vec = unsafe { vld1q_s32(score_arr.as_ptr()) };
 
             let h_diag = prev_h[j - 1];
             let h_match = vaddq_s32(h_diag, score_vec);
@@ -2157,14 +2162,18 @@ unsafe fn sw_batch_neon(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
             cur_e[j] = e;
             cur_f = f;
 
-            vst1q_s32(h_buf.as_mut_ptr(), h);
-            vst1q_s32(hm_buf.as_mut_ptr(), h_match);
-            vst1q_s32(e_buf.as_mut_ptr(), e);
-            vst1q_s32(f_buf.as_mut_ptr(), f);
-            vst1q_s32(e_from_h_buf.as_mut_ptr(), e_from_h);
-            vst1q_s32(e_from_e_buf.as_mut_ptr(), e_from_e);
-            vst1q_s32(f_from_h_buf.as_mut_ptr(), f_from_h);
-            vst1q_s32(f_from_f_buf.as_mut_ptr(), f_from_f);
+            // SAFETY: every destination is a 4-element i32 array and each
+            // store writes exactly four lanes.
+            unsafe {
+                vst1q_s32(h_buf.as_mut_ptr(), h);
+                vst1q_s32(hm_buf.as_mut_ptr(), h_match);
+                vst1q_s32(e_buf.as_mut_ptr(), e);
+                vst1q_s32(f_buf.as_mut_ptr(), f);
+                vst1q_s32(e_from_h_buf.as_mut_ptr(), e_from_h);
+                vst1q_s32(e_from_e_buf.as_mut_ptr(), e_from_e);
+                vst1q_s32(f_from_h_buf.as_mut_ptr(), f_from_h);
+                vst1q_s32(f_from_f_buf.as_mut_ptr(), f_from_f);
+            }
 
             for lane in 0..lanes {
                 let idx = i * (r_len + 1) + j;
