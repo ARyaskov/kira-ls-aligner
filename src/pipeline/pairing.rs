@@ -164,6 +164,54 @@ impl Default for RescueConfig {
     }
 }
 
+/// Reference window in which the mate of an anchor alignment is expected.
+///
+/// `insert_mean` / `insert_min` / `insert_max` describe the *outer fragment
+/// length* (what `|TLEN|` measures and what `InsertEstimator` samples), so
+/// for a forward anchor starting at `anchor_start` the mate occupies
+/// `[anchor_start + F - mate_len, anchor_start + F]`, and for a reverse
+/// anchor ending at `anchor_end` it occupies `[anchor_end - F, anchor_end -
+/// F + mate_len]`. Once the estimator is locked the window is `F = mean ±
+/// 3σ` widened by the mate length on the near side; during bootstrap it is
+/// the full `[insert_min, insert_max]` prior, again widened so a mate that
+/// overlaps the anchor is reachable. The window is clamped to the contig and
+/// always at least `mate_len` wide when the contig allows it.
+pub(crate) fn mate_search_window(
+    anchor_start: i64,
+    anchor_end: i64,
+    anchor_is_rev: bool,
+    mate_len: i64,
+    cfg: &PairedConfig,
+    ref_len: i64,
+) -> Option<(u64, u64)> {
+    let (lo, hi) = if cfg.estimator_locked && cfg.insert_sd > 0 {
+        let mean = cfg.insert_mean as i64;
+        let half = 3 * cfg.insert_sd as i64;
+        if !anchor_is_rev {
+            (
+                anchor_start + mean - half - mate_len,
+                anchor_start + mean + half,
+            )
+        } else {
+            (anchor_end - mean - half, anchor_end - mean + half + mate_len)
+        }
+    } else {
+        let min = cfg.insert_min as i64;
+        let max = cfg.insert_max.max(cfg.insert_min) as i64;
+        if !anchor_is_rev {
+            (anchor_start + min - mate_len, anchor_start + max)
+        } else {
+            (anchor_end - max, anchor_end - min + mate_len)
+        }
+    };
+    let lo = lo.clamp(0, ref_len);
+    let hi = hi.clamp(0, ref_len);
+    if hi <= lo {
+        return None;
+    }
+    Some((lo as u64, hi as u64))
+}
+
 /// Mate rescue: for paired reads where exactly one mate failed chaining but the other has a.
 pub fn rescue_unmapped_mates(
     reads: &[ReadRecord],
@@ -233,39 +281,16 @@ pub fn rescue_unmapped_mates_with_ref(
 
             let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
             let ref_len = ref_seq.len() as i64;
-            let (win_start_u64, win_end_u64) = if cfg.estimator_locked && cfg.insert_sd > 0 {
-                let mean = cfg.insert_mean as i64;
-                let half = 3 * cfg.insert_sd as i64;
-                if !anchor_is_rev {
-                    let centre = anchor_ref_end as i64 + mean;
-                    (
-                        (centre - half).max(0).min(ref_len) as u64,
-                        (centre + half).max(0).min(ref_len) as u64,
-                    )
-                } else {
-                    let centre = anchor_ref_start as i64 - mean;
-                    (
-                        (centre - half).max(0).min(ref_len) as u64,
-                        (centre + half).max(0).min(ref_len) as u64,
-                    )
-                }
-            } else {
-                let insert_max = cfg.insert_max as u64;
-                if !anchor_is_rev {
-                    (
-                        anchor_ref_end as u64,
-                        (anchor_ref_end as u64 + insert_max).min(ref_len as u64),
-                    )
-                } else {
-                    (
-                        (anchor_ref_start as u64).saturating_sub(insert_max),
-                        anchor_ref_start as u64,
-                    )
-                }
-            };
-            if win_end_u64 <= win_start_u64 {
+            let Some((win_start_u64, win_end_u64)) = mate_search_window(
+                anchor_ref_start as i64,
+                anchor_ref_end as i64,
+                anchor_is_rev,
+                read_pair[target_local].seq.len() as i64,
+                cfg,
+                ref_len,
+            ) else {
                 return;
-            }
+            };
             let win_start = win_start_u64 as u32;
             let ref_window = &ref_seq[win_start as usize..win_end_u64 as usize];
 
@@ -659,13 +684,6 @@ pub fn rescue_discordant_pairs_with_ref(
     }
     debug_assert_eq!(reads.len(), alignments.len());
 
-    let half_window: u64 = if cfg.estimator_locked && cfg.insert_sd > 0 {
-        (3 * cfg.insert_sd) as u64
-    } else {
-        cfg.insert_max as u64
-    };
-    let center_offset: i64 = cfg.insert_mean.max(1) as i64;
-
     // Pairs are independent — parallelize over R1/R2 chunks (per-pair logic unchanged).
     alignments
         .par_chunks_mut(2)
@@ -715,16 +733,17 @@ pub fn rescue_discordant_pairs_with_ref(
             let ref_seq = reference.sequences[anchor_ref_id as usize].bases(mmap);
             let ref_len = ref_seq.len() as i64;
 
-            let (center, target_is_rev) = if !anchor_is_rev {
-                (anchor_ref_end + center_offset, true)
-            } else {
-                (anchor_ref_start - center_offset, false)
-            };
-            let win_start = (center - half_window as i64).max(0).min(ref_len) as u64;
-            let win_end = (center + half_window as i64).max(0).min(ref_len) as u64;
-            if win_end <= win_start {
+            let target_is_rev = !anchor_is_rev;
+            let Some((win_start, win_end)) = mate_search_window(
+                anchor_ref_start,
+                anchor_ref_end,
+                anchor_is_rev,
+                read_pair[target_local].seq.len() as i64,
+                cfg,
+                ref_len,
+            ) else {
                 return;
-            }
+            };
             let win_start = win_start as u32;
             let ref_window = &ref_seq[win_start as usize..win_end as usize];
 

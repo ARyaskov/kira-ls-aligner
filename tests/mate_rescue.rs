@@ -299,8 +299,9 @@ fn locked_estimator_narrows_rescue_window_to_3sigma() {
     ];
 
     // Configure a *locked* PairedConfig with a tight mean / σ
-    // characteristic of a real Illumina library. The 3 σ rescue
-    // window is then [650 + 200 - 150, 650 + 200 + 150] = [700, 1000]
+    // characteristic of a real Illumina library. The mate of a forward
+    // anchor starting at 500 with fragment 200 ± 3σ spans
+    // [500 + 200 - 150 - 150, 500 + 200 + 150] = [400, 850]
     // — well below the true R2 at 2500..2650.
     let mut locked_cfg = PairedConfig::default();
     locked_cfg.mode = IngestMode::TwoFile;
@@ -333,9 +334,9 @@ fn locked_estimator_narrows_rescue_window_to_3sigma() {
             a.ref_end
         );
         // And whatever it found must lie inside the narrow window
-        // [700, 1000] (allowing the off-by-one of partial alignment).
+        // [400, 850] (allowing the off-by-one of partial alignment).
         assert!(
-            a.ref_start >= 700 && a.ref_end <= 1000,
+            a.ref_start >= 400 && a.ref_end <= 850,
             "locked-rescue strayed outside the 3σ window: [{}, {})",
             a.ref_start,
             a.ref_end
@@ -367,4 +368,74 @@ fn locked_estimator_narrows_rescue_window_to_3sigma() {
         r2_aln.ref_start as usize <= r2_true_end && r2_aln.ref_end as usize >= r2_true_start,
         "unlocked rescue missed the true mate site"
     );
+}
+
+#[test]
+fn locked_estimator_rescues_mate_at_mean_fragment_distance() {
+    // Regression: the locked window used to be centred on
+    // `anchor_ref_end + insert_mean`, i.e. one anchor length to the right
+    // of where the mate actually sits (`insert_mean` is the outer fragment
+    // length measured from the anchor *start*). With 2×150 reads and a
+    // 350 ± 30 library the true mate was entirely outside the window and
+    // rescue silently failed for every pair once the estimator locked.
+    let reference = synth_reference();
+    let ref_bytes = match &reference.sequences[0].bases {
+        RefBases::Owned(v) => v.clone(),
+        _ => panic!("expected owned"),
+    };
+    let index = build_index(&reference);
+
+    let fragment = 350usize;
+    let r1_start = 500usize;
+    let r1_end = r1_start + 150;
+    let r2_true_end = r1_start + fragment;
+    let r2_true_start = r2_true_end - 150;
+
+    let r1_seq = ref_bytes[r1_start..r1_end].to_vec();
+    let mut r2_seq_in_read = ref_bytes[r2_true_start..r2_true_end].to_vec();
+    r2_seq_in_read.reverse();
+    for b in r2_seq_in_read.iter_mut() {
+        *b = match *b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            x => x,
+        };
+    }
+    let reads = vec![
+        mk_paired_read("p", r1_seq, PairRole::R1),
+        mk_paired_read("p", r2_seq_in_read, PairRole::R2),
+    ];
+
+    let mut locked_cfg = PairedConfig::default();
+    locked_cfg.mode = IngestMode::TwoFile;
+    locked_cfg.insert_mean = fragment as u32;
+    locked_cfg.insert_sd = 30;
+    locked_cfg.insert_min = 0;
+    locked_cfg.insert_max = 1000;
+    locked_cfg.estimator_locked = true;
+
+    let mut alignments: Vec<Vec<Alignment>> = vec![
+        vec![mk_aln(0, r1_start as u32, r1_end as u32, false, 150)],
+        vec![],
+    ];
+    rescue_unmapped_mates(
+        &reads,
+        &mut alignments,
+        &index,
+        &locked_cfg,
+        align_cfg(),
+        RescueConfig::default(),
+    );
+    assert_eq!(
+        alignments[1].len(),
+        1,
+        "mate at the mean fragment distance must be rescued under a locked estimator"
+    );
+    let a = &alignments[1][0];
+    assert!(a.is_rev);
+    assert_eq!(a.ref_start as usize, r2_true_start);
+    assert_eq!(a.ref_end as usize, r2_true_end);
+    assert_eq!(a.kind, AlignmentKind::Rescued);
 }
