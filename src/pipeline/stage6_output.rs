@@ -170,7 +170,7 @@ pub fn serialize_into(
 
     let total: usize = chunks.iter().map(|c| c.len()).sum();
     out.clear();
-    out.reserve(total.saturating_sub(out.capacity()));
+    out.reserve(total);
     for c in chunks {
         out.extend_from_slice(&c);
     }
