@@ -169,7 +169,7 @@ accepted without effect and listed once on stderr.
 - `-A -B -O -E -L -d` : Match, mismatch, gap open, gap extend, clip penalty, z-dropoff. `-O`/`-E`/`-L` accept bwa's `INT,INT` form (first value applies).
 - `-k, --seed-len` : Seed length (overrides the preset for both indices).
 - `-w, --band-width` : Band width for banded DP extension (bwa-mem `-w`; overrides the preset band).
-- `--window-len` : Minimizer window size (long-only; must match the index).
+- `--window-len` : Minimizer window size (long-only). With `--index`, `-k`/`--window-len` are taken from the index unless given, in which case a disagreement is an error.
 - `-x, --preset` : `short`, `long`, `splice`, `splice:hq`, or `auto` (default; auto-selects mode at runtime). bwa-mem's `pacbio`, `ont2d` and `intractg` map to `long`.
 - `--fast-output` : Omit MD/XS/XA/SA tags for speed.
 - `--accept-enable` : Override the ungapped ACCEPT shortcut.

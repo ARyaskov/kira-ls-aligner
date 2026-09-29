@@ -30,6 +30,11 @@ pub struct AlignerConfig {
     pub index: IndexConfig,
     pub pipeline: PipelineConfig,
     pub auto_profiles: Option<crate::pipeline::mode::ReadModeProfiles>,
+    /// The user pinned the minimizer parameters (`-k` / `--window-len`).
+    /// When false and a prebuilt index disagrees with the preset, the
+    /// index's parameters are adopted, as bwa-mem takes everything from the
+    /// index; when true a disagreement is an error.
+    pub sketch_explicit: bool,
     pub read_group: Option<String>,
     /// SAM header customisation: @PG / @CO injections, @RG.
     pub header: Option<HeaderConfig>,
@@ -238,7 +243,61 @@ impl Aligner {
         R: AsRef<Path>,
     {
         let index = Index::load(index_path).context("load index")?;
-        self.run_with_index(index, reads_paths, output_path)
+        let adopted;
+        let this = match self.reconcile_sketch(&index)? {
+            Some(a) => {
+                adopted = a;
+                &adopted
+            }
+            None => self,
+        };
+        this.run_with_index(index, reads_paths, output_path)
+    }
+
+    /// Take the minimizer parameters from `index` when they differ from the
+    /// configured ones and the user did not pin them (`sketch_explicit`).
+    /// Returns the adjusted aligner, `None` when nothing had to change, or
+    /// the parameter-mismatch error when the user did pin them.
+    fn reconcile_sketch(&self, index: &Index) -> Result<Option<Aligner>> {
+        let actual = (index.short.k, index.short.w, index.long.k, index.long.w);
+        let sk = &self.cfg.pipeline.sketch;
+        if (sk.short_k, sk.short_w, sk.long_k, sk.long_w) == actual {
+            return Ok(None);
+        }
+        if self.cfg.sketch_explicit {
+            validate_index_compatibility(index, &self.cfg.pipeline)?;
+            return Ok(None);
+        }
+        crate::kira_info!(
+            "[KIRA] using the index's minimizer parameters: short k/w={}/{}, long k/w={}/{} \
+             (preset asked for {}/{} and {}/{}; pass -k/--window-len to pin them)",
+            actual.0,
+            actual.1,
+            actual.2,
+            actual.3,
+            sk.short_k,
+            sk.short_w,
+            sk.long_k,
+            sk.long_w
+        );
+        let mut cfg = self.cfg.clone();
+        let adopt = |sketch: &mut crate::pipeline::stage1_sketch::SketchConfig| {
+            sketch.short_k = actual.0;
+            sketch.short_w = actual.1;
+            sketch.long_k = actual.2;
+            sketch.long_w = actual.3;
+        };
+        adopt(&mut cfg.pipeline.sketch);
+        if let Some(profiles) = cfg.auto_profiles.as_mut() {
+            adopt(&mut profiles.short.sketch);
+            adopt(&mut profiles.long.sketch);
+            adopt(&mut profiles.hybrid.sketch);
+        }
+        cfg.index.short_k = actual.0;
+        cfg.index.short_w = actual.1;
+        cfg.index.long_k = actual.2;
+        cfg.index.long_w = actual.3;
+        Ok(Some(Aligner { cfg }))
     }
 
     fn run_with_index<R>(
@@ -576,6 +635,26 @@ impl Aligner {
         &self,
         index: Index,
         reads_paths: &[std::path::PathBuf],
+        sink: F,
+    ) -> Result<()>
+    where
+        F: FnMut(crate::pipeline::stage5_scoring::ScoredBatch) -> Result<()>,
+    {
+        let adopted;
+        let this = match self.reconcile_sketch(&index)? {
+            Some(a) => {
+                adopted = a;
+                &adopted
+            }
+            None => self,
+        };
+        this.align_streaming_inner(index, reads_paths, sink)
+    }
+
+    fn align_streaming_inner<F>(
+        &self,
+        index: Index,
+        reads_paths: &[std::path::PathBuf],
         mut sink: F,
     ) -> Result<()>
     where
@@ -671,6 +750,22 @@ impl Aligner {
         note = "holds the whole run's SAM text in RAM; use `align_streaming` and consume batches as they are scored"
     )]
     pub fn align_to_sam_bytes(
+        &self,
+        index: Index,
+        reads_paths: &[std::path::PathBuf],
+    ) -> Result<Vec<u8>> {
+        let adopted;
+        let this = match self.reconcile_sketch(&index)? {
+            Some(a) => {
+                adopted = a;
+                &adopted
+            }
+            None => self,
+        };
+        this.align_to_sam_bytes_inner(index, reads_paths)
+    }
+
+    fn align_to_sam_bytes_inner(
         &self,
         mut index: Index,
         reads_paths: &[std::path::PathBuf],
