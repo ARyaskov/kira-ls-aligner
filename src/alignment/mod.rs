@@ -3,6 +3,7 @@ pub mod bitpacked;
 pub mod cgk;
 pub mod junc_bed;
 pub mod lsh_rescue;
+pub mod md;
 pub mod myers;
 pub mod normalize;
 pub mod prefilter;
@@ -12,6 +13,9 @@ pub mod splice;
 #[cfg(target_arch = "x86_64")]
 pub mod sw_int8_vnni;
 pub mod wfa;
+
+pub use md::MdBuilder;
+pub(crate) use md::push_u32_decimal;
 
 use crate::seq::reverse_complement_into;
 use crate::simd::{self, SimdMode};
@@ -362,26 +366,18 @@ pub fn wfa_result_to_alignment(
         return None;
     }
     let mut sw_score: i32 = 0;
-    let mut nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
+    let mut md = MdBuilder::new();
     let mut qi = 0usize;
     let mut ti = wfa_aln.text_start;
     for op in &cigar {
+        let len = op.len as usize;
         match op.op {
             CigarKind::Match => {
-                for _ in 0..op.len {
-                    let qb = read_seq[qi];
-                    let rb = text[ti];
-                    if qb == rb {
+                for _ in 0..len {
+                    if md.column(read_seq[qi], text[ti]) {
                         sw_score += cfg.match_score;
-                        match_run += 1;
                     } else {
                         sw_score -= cfg.mismatch;
-                        nm += 1;
-                        push_u32_decimal(&mut md_bytes, match_run);
-                        md_bytes.push(rb);
-                        match_run = 0;
                     }
                     qi += 1;
                     ti += 1;
@@ -389,33 +385,22 @@ pub fn wfa_result_to_alignment(
             }
             CigarKind::Ins => {
                 sw_score -= cfg.gap_open + cfg.gap_extend * op.len as i32;
-                nm += op.len;
-                qi += op.len as usize;
+                md.insertion(op.len);
+                qi += len;
             }
             CigarKind::Del => {
                 sw_score -= cfg.gap_open + cfg.gap_extend * op.len as i32;
-                nm += op.len;
-                push_u32_decimal(&mut md_bytes, match_run);
-                md_bytes.push(b'^');
-                for _ in 0..op.len {
-                    md_bytes.push(text[ti]);
-                    ti += 1;
-                }
-                match_run = 0;
+                md.deletion(&text[ti..ti + len]);
+                ti += len;
             }
-            CigarKind::SoftClip => {
-                qi += op.len as usize;
-            }
+            CigarKind::SoftClip => qi += len,
             CigarKind::Skipped => {
-                // MD does not represent reference skips: the match run continues
-                // across the intron (SAM spec; samtools calmd).
-                ti += op.len as usize;
+                md.skip();
+                ti += len;
             }
         }
     }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: only ASCII digits, ACGTN and '^' were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+    let (nm, md) = md.finish();
 
     // `text_start` is 0 unless ends-free leading text was enabled; honoring it
     // keeps ref_start correct when the read aligns past the window start.
@@ -1654,25 +1639,7 @@ fn clamp_window(ref_len: usize, ref_start: u32, ref_end: u32, bandwidth: i32) ->
     (start, end.max(start + 1))
 }
 
-/// Append decimal digits of `v` to a byte buffer without allocating.
-#[inline]
-pub(crate) fn push_u32_decimal(out: &mut Vec<u8>, mut v: u32) {
-    if v == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = 0usize;
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    for idx in (0..i).rev() {
-        out.push(tmp[idx]);
-    }
-}
-
+/// `(NM, MD)` for `cigar` over `read[read_start..]` / `reference[ref_start..]`.
 pub(crate) fn compute_nm_md(
     read: &[u8],
     reference: &[u8],
@@ -1680,59 +1647,7 @@ pub(crate) fn compute_nm_md(
     ref_start: usize,
     cigar: &[CigarOp],
 ) -> (u32, String) {
-    let mut nm = 0u32;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_count = 0u32;
-    let mut qpos = read_start;
-    let mut rpos = ref_start;
-
-    for op in cigar {
-        match op.op {
-            CigarKind::Match => {
-                for _ in 0..op.len {
-                    let qb = read.get(qpos).copied().unwrap_or(b'N');
-                    let rb = reference.get(rpos).copied().unwrap_or(b'N');
-                    if qb == rb {
-                        match_count += 1;
-                    } else {
-                        nm += 1;
-                        push_u32_decimal(&mut md_bytes, match_count);
-                        md_bytes.push(rb);
-                        match_count = 0;
-                    }
-                    qpos += 1;
-                    rpos += 1;
-                }
-            }
-            CigarKind::Ins => {
-                nm += op.len;
-                qpos += op.len as usize;
-            }
-            CigarKind::Del => {
-                nm += op.len;
-                push_u32_decimal(&mut md_bytes, match_count);
-                md_bytes.push(b'^');
-                for _ in 0..op.len {
-                    let rb = reference.get(rpos).copied().unwrap_or(b'N');
-                    md_bytes.push(rb);
-                    rpos += 1;
-                }
-                match_count = 0;
-            }
-            CigarKind::SoftClip => {
-                qpos += op.len as usize;
-            }
-            CigarKind::Skipped => {
-                // MD does not represent reference skips: the match run continues
-                // across the intron (SAM spec; samtools calmd).
-                rpos += op.len as usize;
-            }
-        }
-    }
-    push_u32_decimal(&mut md_bytes, match_count);
-    // SAFETY: only ASCII digits, ACGTN and '^' were pushed — all valid UTF-8.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
-    (nm, md)
+    md::nm_md_from_cigar(read, reference, read_start, ref_start, cigar)
 }
 
 #[cfg(target_arch = "x86_64")]

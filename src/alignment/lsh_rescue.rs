@@ -20,7 +20,7 @@ use crate::index::lsh::LshIndex;
 use crate::sketch::simhash::simhash_window;
 use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, Strand};
 
-use super::{AlignmentConfig, push_u32_decimal};
+use super::AlignmentConfig;
 
 /// Holder for the LSH side-index + the bases we need to verify candidates.
 pub struct LshRescue {
@@ -186,20 +186,10 @@ fn build_ungapped_alignment(
         len: read_len as u32,
         op: CigarKind::Match,
     }];
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
-    for (qb, rb) in read.iter().zip(ref_slice.iter()) {
-        if qb == rb {
-            match_run += 1;
-        } else {
-            push_u32_decimal(&mut md_bytes, match_run);
-            md_bytes.push(*rb);
-            match_run = 0;
-        }
-    }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: pushed bytes are ASCII digits and ACGTN bases.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+    let mut md = crate::alignment::MdBuilder::new();
+    let counted = md.columns(read, &ref_slice[..read_len]);
+    debug_assert_eq!(counted, nm, "caller's mismatch count must match the replay");
+    let (_, md) = md.finish();
     let matches = (read_len as u32 - nm) as i32;
     let mism = nm as i32;
     let score = matches * cfg.match_score - mism * cfg.mismatch;

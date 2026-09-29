@@ -1,5 +1,6 @@
 //! Splice-aware alignment for RNA-seq reads.
 
+use crate::alignment::MdBuilder;
 use rayon::prelude::*;
 
 use crate::alignment::junc_bed::JunctionIndex;
@@ -201,7 +202,6 @@ fn refine_splice_boundary(
 
 /// Replay `len` aligned columns (read `q0..`, ref `t0..`) as matches and
 /// mismatches into the running MD/NM/score accumulators.
-#[allow(clippy::too_many_arguments)]
 fn replay_diagonal(
     read_seq: &[u8],
     ref_seq: &[u8],
@@ -209,22 +209,13 @@ fn replay_diagonal(
     t0: usize,
     len: usize,
     cfg: AlignmentConfig,
-    md_bytes: &mut Vec<u8>,
-    md_run: &mut u32,
-    total_nm: &mut u32,
+    md: &mut MdBuilder,
     total_score: &mut i32,
 ) {
     for k in 0..len {
-        let qb = read_seq[q0 + k];
-        let tb = ref_seq[t0 + k];
-        if qb == tb {
-            *md_run += 1;
+        if md.column(read_seq[q0 + k], ref_seq[t0 + k]) {
             *total_score += cfg.match_score;
         } else {
-            push_decimal(md_bytes, *md_run);
-            md_bytes.push(tb);
-            *md_run = 0;
-            *total_nm += 1;
             *total_score -= cfg.mismatch;
         }
     }
@@ -262,9 +253,7 @@ pub fn align_spliced_chain(
 
     let mut cigar: Vec<CigarOp> = Vec::new();
     let mut total_score: i32 = 0;
-    let mut total_nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(32);
-    let mut md_run: u32 = 0;
+    let mut md = MdBuilder::with_capacity(32);
     // Per-junction strand votes for the final xs_strand aggregation.
     let mut fwd_votes: u32 = 0;
     let mut rev_votes: u32 = 0;
@@ -324,37 +313,25 @@ pub fn align_spliced_chain(
                     for _ in 0..op.len {
                         let qb = read_seq[r_lo + qpos];
                         let rb = ref_seq[t_lo + rpos];
-                        if qb == rb {
-                            md_run += 1;
-                        } else {
-                            push_decimal(&mut md_bytes, md_run);
-                            md_bytes.push(rb);
-                            md_run = 0;
-                            total_nm += 1;
-                        }
+                        md.column(qb, rb);
                         qpos += 1;
                         rpos += 1;
                     }
                 }
                 CigarKind::Ins => {
-                    total_nm += op.len;
+                    md.insertion(op.len);
                     qpos += op.len as usize;
                 }
                 CigarKind::Del => {
-                    total_nm += op.len;
-                    push_decimal(&mut md_bytes, md_run);
-                    md_bytes.push(b'^');
-                    for _ in 0..op.len {
-                        md_bytes.push(ref_seq[t_lo + rpos]);
-                        rpos += 1;
-                    }
-                    md_run = 0;
+                    let start = t_lo + rpos;
+                    md.deletion(&ref_seq[start..start + op.len as usize]);
+                    rpos += op.len as usize;
                 }
                 CigarKind::SoftClip => {
                     qpos += op.len as usize;
                 }
                 CigarKind::Skipped => {
-                    // MD does not represent reference skips; the run continues.
+                    md.skip();
                     rpos += op.len as usize;
                 }
             }
@@ -423,14 +400,9 @@ pub fn align_spliced_chain(
                         for k in 0..left_shift {
                             let qb = read_seq[(a.read_end + k) as usize];
                             let tb = ref_seq[(a.ref_end + k) as usize];
-                            if qb == tb {
-                                md_run += 1;
+                            if md.column(qb, tb) {
                                 total_score += cfg.match_score;
                             } else {
-                                push_decimal(&mut md_bytes, md_run);
-                                md_bytes.push(tb);
-                                md_run = 0;
-                                total_nm += 1;
                                 total_score -= cfg.mismatch;
                             }
                         }
@@ -446,14 +418,9 @@ pub fn align_spliced_chain(
                         for k in 0..right_shift {
                             let qb = read_seq[(a.read_end + left_shift + k) as usize];
                             let tb = ref_seq[(acceptor_pos + k) as usize];
-                            if qb == tb {
-                                md_run += 1;
+                            if md.column(qb, tb) {
                                 total_score += cfg.match_score;
                             } else {
-                                push_decimal(&mut md_bytes, md_run);
-                                md_bytes.push(tb);
-                                md_run = 0;
-                                total_nm += 1;
                                 total_score -= cfg.mismatch;
                             }
                         }
@@ -508,9 +475,7 @@ pub fn align_spliced_chain(
                             t0,
                             best_left,
                             cfg,
-                            &mut md_bytes,
-                            &mut md_run,
-                            &mut total_nm,
+                            &mut md,
                             &mut total_score,
                         );
                         push_cigar(&mut cigar, CigarKind::Match, best_left as u32);
@@ -522,9 +487,7 @@ pub fn align_spliced_chain(
                             next.ref_start as usize - right,
                             right,
                             cfg,
-                            &mut md_bytes,
-                            &mut md_run,
-                            &mut total_nm,
+                            &mut md,
                             &mut total_score,
                         );
                         push_cigar(&mut cigar, CigarKind::Match, right as u32);
@@ -546,9 +509,7 @@ pub fn align_spliced_chain(
                     t0,
                     diag,
                     cfg,
-                    &mut md_bytes,
-                    &mut md_run,
-                    &mut total_nm,
+                    &mut md,
                     &mut total_score,
                 );
                 push_cigar(&mut cigar, CigarKind::Match, diag as u32);
@@ -557,19 +518,15 @@ pub fn align_spliced_chain(
             let del = ref_gap - diag as u32;
             if ins > 0 {
                 push_cigar(&mut cigar, CigarKind::Ins, ins);
-                total_nm += ins;
+                md.insertion(ins);
                 total_score -= cfg.gap_open + cfg.gap_extend * ins as i32;
             }
             if del > 0 {
                 push_cigar(&mut cigar, CigarKind::Del, del);
-                total_nm += del;
                 total_score -= cfg.gap_open + cfg.gap_extend * del as i32;
-                push_decimal(&mut md_bytes, md_run);
-                md_bytes.push(b'^');
                 let rstart = t0 + diag;
                 let rend = (rstart + del as usize).min(ref_seq.len());
-                md_bytes.extend_from_slice(&ref_seq[rstart..rend]);
-                md_run = 0;
+                md.deletion(&ref_seq[rstart..rend]);
             }
         }
     }
@@ -581,7 +538,7 @@ pub fn align_spliced_chain(
             op: CigarKind::SoftClip,
         });
     }
-    push_decimal(&mut md_bytes, md_run);
+    let (total_nm, md) = md.finish();
 
     let xs_strand = match splice_cfg.strand_policy {
         SpliceStrandPolicy::None => None,
@@ -609,9 +566,6 @@ pub fn align_spliced_chain(
             }
         }
     };
-
-    // SAFETY: only ASCII digits, ACGTN and '^' were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
 
     let splice_score_boost = splice_confidence_sum;
     let total_score = total_score + splice_score_boost;
@@ -906,23 +860,6 @@ fn push_cigar(out: &mut Vec<CigarOp>, op: CigarKind, len: u32) {
     out.push(CigarOp { len, op });
 }
 
-/// Append a decimal number to a byte buffer (used for MD construction).
-fn push_decimal(out: &mut Vec<u8>, mut v: u32) {
-    if v == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = 0usize;
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    for k in (0..i).rev() {
-        out.push(tmp[k]);
-    }
-}
 
 #[cfg(test)]
 #[path = "../../tests/unit/alignment_splice.rs"]
