@@ -10,19 +10,18 @@ use crate::exec::pool::DualPoolConfig;
 use crate::index::tiling::TilePlan;
 use crate::index::{Index, IndexConfig};
 use crate::io::{HeaderConfig, ReadStream, SamWriter};
-use crate::mapq::{assign_mapq_preserving_primary, assign_mapq_with_qual};
 use crate::pipeline::chunk_io::{ChunkReader, ChunkWriter, MergeIter};
 use std::sync::Arc;
 
 use crate::alignment::junc_bed::JunctionIndex;
 use crate::mapq::PairMapqContext;
-use crate::pipeline::pairing::{
-    RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs_with_ref,
-    rescue_unmapped_mates_with_ref,
-};
+use crate::pipeline::insert_estimate::InsertEstimator;
+use crate::pipeline::stage4_alignment::AlignBatch;
+use crate::pipeline::stage5_scoring;
+use crate::pipeline::PostAlignPolicy;
+use std::sync::RwLock;
 use crate::pipeline::stage0_input;
 use crate::pipeline::stage4_alignment::AlignmentBatchStats;
-use crate::pipeline::stage5_scoring::ScoredBatch;
 use crate::pipeline::stage6_output::serialize as output_serialize;
 use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::types::{Alignment, MateInfo, Reference};
@@ -42,6 +41,8 @@ pub struct TiledRunConfig {
     /// Optional junction annotation (`--junc-bed`).
     pub junctions: Option<Arc<JunctionIndex>>,
     pub junc_bed_tolerance: u32,
+    /// Keep the FASTQ comment on every read (`-C`).
+    pub keep_comment: bool,
 }
 
 /// Run the full tiled pipeline.
@@ -105,10 +106,11 @@ fn run_tiled_inner(
         let mut writer = ChunkWriter::create(&chunk_path)
             .with_context(|| format!("create chunk file {}", chunk_path.display()))?;
 
-        let mut stream = ReadStream::new_multi_with_mode(
+        let mut stream = ReadStream::new_multi_with_opts(
             reads_paths,
             cfg.batch_bases,
             cfg.pipeline_cfg.paired.mode,
+            cfg.keep_comment,
         )?;
         let pipeline = Pipeline::with_pool(cfg.pipeline_cfg, Arc::clone(&pool))
             .with_junctions(cfg.junctions.clone(), cfg.junc_bed_tolerance);
@@ -159,11 +161,23 @@ fn run_tiled_inner(
     }
     let formatter = writer.formatter_handle();
 
-    let mut stream = ReadStream::new_multi_with_mode(
+    let mut stream = ReadStream::new_multi_with_opts(
         reads_paths,
         cfg.batch_bases,
         cfg.pipeline_cfg.paired.mode,
+        cfg.keep_comment,
     )?;
+
+    // The same post-stage-4 policy chain as the in-memory driver, with one
+    // insert-size estimator refined across the merged batches.
+    let estimator = RwLock::new(InsertEstimator::new(cfg.pipeline_cfg.paired));
+    let policy = PostAlignPolicy {
+        reference: &reference,
+        mmap: None,
+        config: &cfg.pipeline_cfg,
+        pool: &pool,
+    };
+    let preserve_primary = cfg.pipeline_cfg.primary_5p || cfg.pipeline_cfg.alt_mask.is_some();
 
     let mut global_read_idx: u64 = 0;
     let mut next_merged: Option<(u64, Vec<Alignment>)> = merge.next_merged()?;
@@ -191,84 +205,39 @@ fn run_tiled_inner(
         }
         global_read_idx += n as u64;
 
-        rescue_unmapped_mates_with_ref(
-            &reads,
-            &mut alignments,
-            &reference,
-            None,
-            &cfg.pipeline_cfg.paired,
-            cfg.pipeline_cfg.alignment,
-            RescueConfig::default(),
-        );
-
-        pair_rerank(
-            &reads,
-            &mut alignments,
-            &cfg.pipeline_cfg.paired,
-            cfg.pipeline_cfg.dp_topk.max(2),
-        );
-
-        rescue_discordant_pairs_with_ref(
-            &reads,
-            &mut alignments,
-            &reference,
-            None,
-            &cfg.pipeline_cfg.paired,
-            cfg.pipeline_cfg.alignment,
-            RescueConfig::default(),
-        );
-
-        // Indel left-normalization (see pipeline/mod.rs) — same placement as
-        // the in-memory pipeline: after rescue, before pairing/MAPQ.
-        crate::alignment::normalize::normalize_alignments(&reads, &mut alignments, |ref_id| {
-            reference.sequences[ref_id as usize].bases(None)
-        });
-
+        let paired_cfg = estimator
+            .read()
+            .map(|e| e.current())
+            .unwrap_or(cfg.pipeline_cfg.paired);
         let mut unmapped_mate_info: Vec<Option<MateInfo>> = vec![None; n];
-        apply_pairing(
+        let post = policy.apply(
             &reads,
             &mut alignments,
             &mut unmapped_mate_info,
-            &cfg.pipeline_cfg.paired,
+            &paired_cfg,
+            Some(&estimator),
         );
 
-        let pair_ctx = if cfg.pipeline_cfg.paired.is_paired() {
+        let pair_ctx = if post.paired_cfg.is_paired() {
             Some(PairMapqContext {
-                insert_mean: cfg.pipeline_cfg.paired.insert_mean,
-                insert_sd: cfg.pipeline_cfg.paired.insert_sd,
+                insert_mean: post.paired_cfg.insert_mean,
+                insert_sd: post.paired_cfg.insert_sd,
                 discordant_cap: 10,
             })
         } else {
             None
         };
-        for (i, alns) in alignments.iter_mut().enumerate() {
-            if reads[i].pair_role == crate::types::PairRole::Unpaired {
-                assign_mapq_with_qual(
-                    alns,
-                    reads[i].seq.len(),
-                    reads[i].qual.as_deref(),
-                    cfg.pipeline_cfg.mapq,
-                    pair_ctx,
-                    reads[i].repeat_min_occ,
-                );
-            } else {
-                assign_mapq_preserving_primary(
-                    alns,
-                    reads[i].seq.len(),
-                    reads[i].qual.as_deref(),
-                    cfg.pipeline_cfg.mapq,
-                    pair_ctx,
-                    reads[i].repeat_min_occ,
-                );
-            }
-        }
-
-        let scored = ScoredBatch {
-            reads,
-            alignments,
-            unmapped_mate_info,
-            stats: AlignmentBatchStats::default(),
-        };
+        let scored = stage5_scoring::run_with_primary_policy(
+            AlignBatch {
+                reads,
+                alignments,
+                unmapped_mate_info,
+                stats: AlignmentBatchStats::default(),
+            },
+            cfg.pipeline_cfg.mapq,
+            pair_ctx,
+            preserve_primary,
+        );
         let sam_buf = output_serialize(
             scored,
             &formatter,

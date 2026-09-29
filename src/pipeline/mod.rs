@@ -29,9 +29,10 @@ use crate::io::{OutputConfig, SamFormatter};
 use crate::mapq::MapqConfig;
 use crate::pipeline::insert_estimate::InsertEstimator;
 use crate::pipeline::pairing::{
-    PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs,
-    rescue_unmapped_mates,
+    PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs_with_ref,
+    rescue_unmapped_mates_with_ref,
 };
+use crate::types::{Alignment, MateInfo, ReadRecord, Reference};
 use crate::pipeline::stage1_sketch::{
     SketchBatchStats, SketchConfig, run_with_mask as sketch_run_with_mask,
 };
@@ -372,93 +373,24 @@ impl Pipeline {
             );
         }
 
-        let tru = Instant::now();
-        if !self.config.skip_mate_rescue {
-            let reads = &align.reads;
-            let alns = &mut align.alignments;
-            let pcfg = paired_cfg;
-            let acfg = self.config.alignment;
-            self.pool.install_compute(move || {
-                rescue_unmapped_mates(reads, alns, index, &pcfg, acfg, RescueConfig::default())
-            });
-        }
-        let t_rescue_unmapped = tru.elapsed();
-
-        let tpr = Instant::now();
-        if !self.config.skip_pairing {
-            pair_rerank(
-                &align.reads,
-                &mut align.alignments,
-                &paired_cfg,
-                self.config.dp_topk.max(2),
-            );
-        }
-        let t_pair_rerank = tpr.elapsed();
-
-        let trd = Instant::now();
-        if !self.config.skip_mate_rescue && !self.config.skip_pairing {
-            let reads = &align.reads;
-            let alns = &mut align.alignments;
-            let pcfg = paired_cfg;
-            let acfg = self.config.alignment;
-            self.pool.install_compute(move || {
-                rescue_discordant_pairs(reads, alns, index, &pcfg, acfg, RescueConfig::default())
-            });
-        }
-        let t_rescue_discordant = trd.elapsed();
-
-        // bwa-mem `-T`: the score floor applies to everything the stages above
-        // produced, rescued placements included, and runs before pairing so
-        // the mate's RNEXT/PNEXT never point at a record that is not emitted.
-        if self.config.min_output_score > i32::MIN {
-            apply_min_output_score(&mut align.alignments, self.config.min_output_score);
-        }
-        // bwa-mem `-5`: choose the primary segment of a split read by read
-        // coordinate, also before pairing for the same reason.
-        if self.config.primary_5p {
-            apply_primary_5p(&align.reads, &mut align.alignments);
-        }
-        // ALT contigs: prefer an equivalent primary-assembly placement over an
-        // ALT one (bwa-postalt), before pairing sees the coordinates.
-        if let Some(mask) = self.config.alt_mask {
-            apply_alt_primary_policy(&align.reads, &mut align.alignments, mask, self.config.alignment.mismatch);
-        }
-
-        // Indel left-normalization: canonicalise gap placement so equivalent
-        // alignments of the same variant emit identical CIGARs (GATK
-        // LeftAlignIndels / bcftools norm convention). Runs before pairing so
-        // TLEN/proper-pair geometry sees final coordinates — which in fact
-        // never move: normalization only slides indels within the aligned
-        // span. NM/MD are recomputed for the records that moved.
-        {
-            let reads = &align.reads;
-            let alns = &mut align.alignments;
-            let index = &index;
-            self.pool.install_compute(move || {
-                crate::alignment::normalize::normalize_alignments(reads, alns, |ref_id| {
-                    index.ref_bases(ref_id as usize)
-                })
-            });
-        }
-
-        let tap = Instant::now();
-        apply_pairing(
+        let policy = PostAlignPolicy {
+            reference: &index.reference,
+            mmap: index.mmap.as_deref().map(|m| &m[..]),
+            config: &self.config,
+            pool: &self.pool,
+        };
+        let post = policy.apply(
             &align.reads,
             &mut align.alignments,
             &mut align.unmapped_mate_info,
             &paired_cfg,
+            Some(&self.insert_estimator),
         );
-        let t_apply_pairing = tap.elapsed();
-
-        let refined_after = if paired_cfg.is_paired() {
-            self.insert_estimator
-                .write()
-                .ok()
-                .and_then(|mut e| e.observe_batch(&align.alignments))
-        } else {
-            None
-        };
-        let paired_cfg_final = refined_after.unwrap_or(paired_cfg);
+        let t_rescue_unmapped = post.rescue_unmapped;
+        let t_pair_rerank = post.pair_rerank;
+        let t_rescue_discordant = post.rescue_discordant;
+        let t_apply_pairing = post.apply_pairing;
+        let paired_cfg_final = post.paired_cfg;
 
         stages[3] = t3.elapsed();
         if std::env::var_os("KIRA_STATS").is_some() {
@@ -532,6 +464,160 @@ impl Pipeline {
         );
         stats.times.stages[5] = t5.elapsed();
         Ok(stats)
+    }
+}
+
+/// Everything that runs between stage 4 and stage 5, shared by the in-memory
+/// driver and the tiled (`--split-prefix`) driver so both apply the same
+/// record-level policies in the same order:
+///
+/// 1. order each read's candidates by score (stage 4 emits them in DP-job
+///    order, and the tiled merge concatenates per-tile lists);
+/// 2. mate rescue of unmapped mates, pair re-ranking, discordant rescue;
+/// 3. the `-T` score floor, the `-5` primary rule and the ALT policy;
+/// 4. indel left-normalization;
+/// 5. pair stamping (flags, RNEXT/PNEXT/TLEN) and the insert-size update.
+pub struct PostAlignPolicy<'a> {
+    pub reference: &'a Reference,
+    pub mmap: Option<&'a [u8]>,
+    pub config: &'a PipelineConfig,
+    pub pool: &'a DualPool,
+}
+
+/// Timings and the paired-end configuration in force after the policies ran.
+pub struct PostAlignOutcome {
+    pub rescue_unmapped: Duration,
+    pub pair_rerank: Duration,
+    pub rescue_discordant: Duration,
+    pub apply_pairing: Duration,
+    /// `paired_cfg` refined by this batch's proper pairs, if the estimator
+    /// locked on them.
+    pub paired_cfg: PairedConfig,
+}
+
+impl PostAlignPolicy<'_> {
+    pub fn apply(
+        &self,
+        reads: &[ReadRecord],
+        alignments: &mut [Vec<Alignment>],
+        unmapped_mate_info: &mut [Option<MateInfo>],
+        paired_cfg: &PairedConfig,
+        estimator: Option<&RwLock<InsertEstimator>>,
+    ) -> PostAlignOutcome {
+        let cfg = self.config;
+        let reference = self.reference;
+        let mmap = self.mmap;
+        let acfg = cfg.alignment;
+
+        order_candidates_by_score(alignments);
+
+        let tru = Instant::now();
+        if !cfg.skip_mate_rescue {
+            self.pool.install_compute(|| {
+                rescue_unmapped_mates_with_ref(
+                    reads,
+                    alignments,
+                    reference,
+                    mmap,
+                    paired_cfg,
+                    acfg,
+                    RescueConfig::default(),
+                )
+            });
+        }
+        let rescue_unmapped = tru.elapsed();
+
+        let tpr = Instant::now();
+        if !cfg.skip_pairing {
+            pair_rerank(reads, alignments, paired_cfg, cfg.dp_topk.max(2));
+        }
+        let pair_rerank_t = tpr.elapsed();
+
+        let trd = Instant::now();
+        if !cfg.skip_mate_rescue && !cfg.skip_pairing {
+            self.pool.install_compute(|| {
+                rescue_discordant_pairs_with_ref(
+                    reads,
+                    alignments,
+                    reference,
+                    mmap,
+                    paired_cfg,
+                    acfg,
+                    RescueConfig::default(),
+                )
+            });
+        }
+        let rescue_discordant = trd.elapsed();
+
+        // bwa-mem `-T`: the score floor applies to everything the stages above
+        // produced, rescued placements included, and runs before pairing so
+        // the mate's RNEXT/PNEXT never point at a record that is not emitted.
+        if cfg.min_output_score > i32::MIN {
+            apply_min_output_score(alignments, cfg.min_output_score);
+        }
+        // bwa-mem `-5`: choose the primary segment of a split read by read
+        // coordinate, also before pairing for the same reason.
+        if cfg.primary_5p {
+            apply_primary_5p(reads, alignments);
+        }
+        // ALT contigs: prefer an equivalent primary-assembly placement over an
+        // ALT one (bwa-postalt), before pairing sees the coordinates.
+        if let Some(mask) = cfg.alt_mask {
+            apply_alt_primary_policy(reads, alignments, mask, acfg.mismatch);
+        }
+
+        // Indel left-normalization: canonicalise gap placement so equivalent
+        // alignments of the same variant emit identical CIGARs (GATK
+        // LeftAlignIndels / bcftools norm convention). Runs before pairing so
+        // TLEN/proper-pair geometry sees final coordinates — which in fact
+        // never move: normalization only slides indels within the aligned
+        // span. NM/MD are recomputed for the records that moved.
+        self.pool.install_compute(|| {
+            crate::alignment::normalize::normalize_alignments(reads, alignments, |ref_id| {
+                reference.sequences[ref_id as usize].bases(mmap)
+            })
+        });
+
+        let tap = Instant::now();
+        apply_pairing(reads, alignments, unmapped_mate_info, paired_cfg);
+        let apply_pairing_t = tap.elapsed();
+
+        let refined = match estimator {
+            Some(e) if paired_cfg.is_paired() => e
+                .write()
+                .ok()
+                .and_then(|mut e| e.observe_batch(alignments)),
+            _ => None,
+        };
+
+        PostAlignOutcome {
+            rescue_unmapped,
+            pair_rerank: pair_rerank_t,
+            rescue_discordant,
+            apply_pairing: apply_pairing_t,
+            paired_cfg: refined.unwrap_or(*paired_cfg),
+        }
+    }
+}
+
+/// Put each read's best-scoring candidate in slot 0. Stage 4 pushes DP results
+/// in chain order and the tiled merge concatenates per-tile lists, so without
+/// this a weaker hit could stay primary whenever pair re-ranking found no
+/// concordant pair (mate unmapped, discordant, other chromosome) and the
+/// primary-preserving MAPQ path then reported MAPQ 0 for it. Supplementary
+/// segments keep their relative order after the primaries/secondaries; the
+/// sort is stable so equal scores keep the stage-4 order.
+fn order_candidates_by_score(alignments: &mut [Vec<Alignment>]) {
+    for alns in alignments.iter_mut() {
+        if alns.len() < 2 {
+            continue;
+        }
+        alns.sort_by(|a, b| {
+            a.is_supplementary
+                .cmp(&b.is_supplementary)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.nm.cmp(&b.nm))
+        });
     }
 }
 

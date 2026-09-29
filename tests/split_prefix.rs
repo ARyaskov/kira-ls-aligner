@@ -219,6 +219,7 @@ fn tiled_alignment_recovers_reads_across_tiles() {
         split_prefix: prefix_path.clone(),
         junctions: None,
         junc_bed_tolerance: 2,
+        keep_comment: false,
     };
 
     run_tiled(
@@ -310,6 +311,7 @@ fn tiled_single_tile_is_trivial_and_still_works() {
         split_prefix: prefix_path.clone(),
         junctions: None,
         junc_bed_tolerance: 2,
+        keep_comment: false,
     };
     run_tiled(
         reference,
@@ -331,5 +333,94 @@ fn tiled_single_tile_is_trivial_and_still_works() {
     assert_eq!(flag & 0x1, 0, "single-end → no 0x1");
 
     let _ = std::fs::remove_file(r1_path);
+    let _ = std::fs::remove_file(out_path);
+}
+
+/// Regression: the tiled merge concatenates per-tile hit lists in tile
+/// order, and the paired-end MAPQ path preserves slot 0, so a weaker hit
+/// from tile 1 used to stay primary even when tile 2 held the true locus.
+/// chr1 carries only the first 90 bp of R1's sequence; chr2 carries all
+/// 150 bp. The primary must be the chr2 placement.
+#[test]
+fn tiled_paired_primary_is_the_best_scoring_hit_across_tiles() {
+    let c0_base = synth_dna(0x1111_2222_3333_4444, 2000);
+    let c1 = synth_dna(0x5555_6666_7777_8888, 2000);
+    // Plant a partial copy (90 bp) of chr2[700..850) into chr1 at 300.
+    let mut c0 = c0_base.clone();
+    c0[300..390].copy_from_slice(&c1[700..790]);
+    let reference = Reference {
+        sequences: vec![
+            RefSeq { name: "chr1".to_string(), bases: RefBases::Owned(c0.clone()) },
+            RefSeq { name: "chr2".to_string(), bases: RefBases::Owned(c1.clone()) },
+        ],
+    };
+
+    // R1 = chr2[700..850) (full 150 bp match on chr2, 90 bp partial on chr1).
+    // R2 is unrelated sequence that maps nowhere, so no concordant pair can
+    // promote the right hit: the choice of primary rests on score alone.
+    let r1_seq = &c1[700..850];
+    let r2_seq = synth_dna(0x9999_aaaa_bbbb_cccc, 150);
+    let r1_path = write_fastq("xt-r1", &[("xt/1", r1_seq)]);
+    let r2_path = write_fastq("xt-r2", &[("xt/2", &r2_seq)]);
+    let out_path = std::env::temp_dir().join(format!("kira-split-{}-xt.sam", std::process::id()));
+    let prefix_path =
+        std::env::temp_dir().join(format!("kira-split-{}-xt-prefix", std::process::id()));
+
+    let tile_plan = plan_tiles(&reference, 1500);
+    assert_eq!(tile_plan.n_tiles(), 2, "expected 2 tiles");
+
+    let mut pipe = full_pipeline_cfg();
+    // Keep the chr1 partial hit as a candidate so the ordering matters.
+    pipe.min_chain_ratio = 0.1;
+    pipe.dp_topk = 2;
+    let cfg = TiledRunConfig {
+        threads: 2,
+        num_p_threads: None,
+        num_e_threads: None,
+        batch_bases: 1_000_000,
+        index_cfg: IndexConfig {
+            short_k: 19,
+            short_w: 10,
+            long_k: 19,
+            long_w: 10,
+            max_occ: 500,
+            build_short: true,
+            build_long: false,
+        },
+        pipeline_cfg: pipe,
+        read_group: None,
+        header: Some(HeaderConfig::default()),
+        split_prefix: prefix_path.clone(),
+        junctions: None,
+        junc_bed_tolerance: 2,
+        keep_comment: false,
+    };
+    run_tiled(
+        reference,
+        &[r1_path.clone(), r2_path.clone()],
+        Some(out_path.clone()),
+        cfg,
+        tile_plan,
+    )
+    .expect("run_tiled");
+
+    let sam = std::fs::read_to_string(&out_path).expect("read output sam");
+    let r1_primary = sam
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(parse_sam_record)
+        .find(|c| {
+            let flag: u32 = c[1].parse().unwrap();
+            flag & 0x40 != 0 && flag & 0x900 == 0
+        })
+        .expect("R1 primary record");
+    assert_eq!(r1_primary[2], "chr2", "primary must be the full-length chr2 hit:\n{sam}");
+    assert_eq!(r1_primary[3], "701");
+    assert_eq!(r1_primary[5], "150M");
+    let mapq: u32 = r1_primary[4].parse().unwrap();
+    assert!(mapq > 0, "a full-length unique hit must not be MAPQ 0:\n{sam}");
+
+    let _ = std::fs::remove_file(r1_path);
+    let _ = std::fs::remove_file(r2_path);
     let _ = std::fs::remove_file(out_path);
 }

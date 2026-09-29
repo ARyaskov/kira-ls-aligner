@@ -854,6 +854,7 @@ fn run_split_prefix(
         split_prefix,
         junctions: cfg.junctions.clone(),
         junc_bed_tolerance: cfg.junc_bed_tolerance,
+        keep_comment: args.append_comment,
     };
     run_tiled(
         reference,
