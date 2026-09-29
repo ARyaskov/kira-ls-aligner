@@ -852,32 +852,57 @@ impl OutputConfig {
 /// SAM-formatting state independent of the I/O sink.
 #[derive(Clone)]
 pub struct SamFormatter {
-    reference: std::sync::Arc<Reference>,
+    contigs: std::sync::Arc<ContigCatalog>,
+}
+
+/// Contig names and lengths: everything the SAM/PAF formatter and the header
+/// need from a reference. Built once from `&Reference` so the writer never
+/// clones the bases (an in-process index owns ~3 GB of them for a human
+/// genome).
+#[derive(Clone, Debug)]
+pub struct ContigCatalog {
+    pub names: Vec<String>,
+    pub lens: Vec<u64>,
+}
+
+impl ContigCatalog {
+    pub fn from_reference(reference: &Reference) -> Self {
+        // SAM `SN:` forbids whitespace; older sidecar indices may carry the
+        // full FASTA description line.
+        let names = reference
+            .sequences
+            .iter()
+            .map(|s| match s.name.find(|c: char| c.is_ascii_whitespace()) {
+                Some(pos) => s.name[..pos].to_string(),
+                None => s.name.clone(),
+            })
+            .collect();
+        let lens = reference.sequences.iter().map(|s| s.len(None) as u64).collect();
+        Self { names, lens }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 impl SamFormatter {
     pub fn new(reference: std::sync::Arc<Reference>) -> Self {
-        // SAM `SN:` forbids whitespace; older sidecar indices may carry the full FASTA description.
-        let needs_fixup = reference
-            .sequences
-            .iter()
-            .any(|s| s.name.bytes().any(|b| b.is_ascii_whitespace()));
-        let reference = if needs_fixup {
-            let mut owned = (*reference).clone();
-            for s in owned.sequences.iter_mut() {
-                if let Some(pos) = s.name.find(|c: char| c.is_ascii_whitespace()) {
-                    s.name.truncate(pos);
-                }
-            }
-            std::sync::Arc::new(owned)
-        } else {
-            reference
-        };
-        Self { reference }
+        Self::from_catalog(std::sync::Arc::new(ContigCatalog::from_reference(&reference)))
     }
 
-    pub fn reference(&self) -> &Reference {
-        &self.reference
+    pub fn from_catalog(contigs: std::sync::Arc<ContigCatalog>) -> Self {
+        Self { contigs }
+    }
+
+    pub fn contigs(&self) -> &ContigCatalog {
+        &self.contigs
     }
 
     pub fn append_unmapped(&self, buf: &mut Vec<u8>, read: &ReadRecord) {
@@ -932,7 +957,7 @@ impl SamFormatter {
         // `=`. Otherwise RNAME='*' POS=0. MAPQ=0, CIGAR='*', TLEN=0 always.
         match mate {
             Some(m) if m.mate_ref_id.is_some() && !m.mate_is_unmapped => {
-                let mate_rname = &self.reference.sequences[m.mate_ref_id.unwrap() as usize].name;
+                let mate_rname = &self.contigs.names[m.mate_ref_id.unwrap() as usize];
                 buf.push(b'\t');
                 buf.extend_from_slice(mate_rname.as_bytes());
                 buf.push(b'\t');
@@ -967,7 +992,7 @@ impl SamFormatter {
         extra_tags: Option<&[u8]>,
         cfg: OutputConfig,
     ) {
-        let rname = &self.reference.sequences[aln.ref_id as usize].name;
+        let rname = &self.contigs.names[aln.ref_id as usize];
         let pos = aln.ref_start + 1; // SAM is 1-based
         let flag = sam_flag_with(aln, cfg.split_as_secondary);
 
@@ -1002,7 +1027,7 @@ impl SamFormatter {
                     if mate_ref_id == aln.ref_id {
                         buf.push(b'=');
                     } else {
-                        let mate_rname = &self.reference.sequences[mate_ref_id as usize].name;
+                        let mate_rname = &self.contigs.names[mate_ref_id as usize];
                         buf.extend_from_slice(mate_rname.as_bytes());
                     }
                     buf.push(b'\t');
@@ -1102,7 +1127,7 @@ impl SamFormatter {
         }
         buf.extend_from_slice(b"\tXA:Z:");
         for aln in alignments.iter().skip(1).filter(|a| !a.is_supplementary) {
-            let rname = &self.reference.sequences[aln.ref_id as usize].name;
+            let rname = &self.contigs.names[aln.ref_id as usize];
             buf.extend_from_slice(rname.as_bytes());
             buf.push(b',');
             if aln.is_rev {
@@ -1128,8 +1153,8 @@ impl SamFormatter {
         aln: &Alignment,
         cfg: OutputConfig,
     ) {
-        let tname = &self.reference.sequences[aln.ref_id as usize].name;
-        let tlen = self.reference.sequences[aln.ref_id as usize].len(None) as u32;
+        let tname = &self.contigs.names[aln.ref_id as usize];
+        let tlen = self.contigs.lens[aln.ref_id as usize] as u32;
         let qlen = read.seq.len() as u32;
         let (qstart, qend) = if aln.is_rev {
             (
@@ -1222,7 +1247,7 @@ impl SamFormatter {
                 buf.extend_from_slice(b"\tSA:Z:");
                 added = true;
             }
-            let rname = &self.reference.sequences[aln.ref_id as usize].name;
+            let rname = &self.contigs.names[aln.ref_id as usize];
             buf.extend_from_slice(rname.as_bytes());
             buf.push(b',');
             push_u32(buf, aln.ref_start + 1);
@@ -1311,23 +1336,23 @@ pub struct SamWriter {
 }
 
 impl SamWriter {
-    pub fn new<P: AsRef<Path>>(path: Option<P>, reference: Reference) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: Option<P>, reference: &Reference) -> Result<Self> {
         let writer: Box<dyn Write + Send> = match path {
             Some(p) => Box::new(File::create(p).context("create SAM output")?),
             None => Box::new(io::stdout()),
         };
-        Ok(Self {
-            writer: BufWriter::with_capacity(1 << 20, writer),
-            formatter: SamFormatter::new(std::sync::Arc::new(reference)),
-        })
+        Ok(Self::from_writer(writer, reference))
     }
 
     /// Build a writer over an arbitrary sink (e.g. an in-memory [`VecSink`]),
-    /// for in-process pipelines that consume SAM without touching disk.
-    pub fn from_writer(writer: Box<dyn Write + Send>, reference: Reference) -> Self {
+    /// for in-process pipelines that consume SAM without touching disk. Only
+    /// the contig names and lengths are kept.
+    pub fn from_writer(writer: Box<dyn Write + Send>, reference: &Reference) -> Self {
         Self {
             writer: BufWriter::with_capacity(1 << 20, writer),
-            formatter: SamFormatter::new(std::sync::Arc::new(reference)),
+            formatter: SamFormatter::from_catalog(std::sync::Arc::new(
+                ContigCatalog::from_reference(reference),
+            )),
         }
     }
 
@@ -1355,8 +1380,9 @@ impl SamWriter {
     /// Write the full SAM header from a `HeaderConfig`.
     pub fn write_header_with_ctx(&mut self, cfg: &HeaderConfig) -> Result<()> {
         writeln!(self.writer, "@HD\tVN:1.6\tSO:unsorted")?;
-        for seq in &self.formatter.reference.sequences {
-            writeln!(self.writer, "@SQ\tSN:{}\tLN:{}", seq.name, seq.len(None))?;
+        let contigs = self.formatter.contigs();
+        for (name, len) in contigs.names.iter().zip(&contigs.lens) {
+            writeln!(self.writer, "@SQ\tSN:{name}\tLN:{len}")?;
         }
         if let Some(rg) = cfg.read_group.as_deref() {
             if rg.starts_with("@RG") {

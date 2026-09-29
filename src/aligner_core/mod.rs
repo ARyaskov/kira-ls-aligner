@@ -286,7 +286,7 @@ impl Aligner {
             None
         };
 
-        let mut writer = SamWriter::new(output_path, index.reference.clone())?;
+        let mut writer = SamWriter::new(output_path, &index.reference)?;
         let is_paf = matches!(self.cfg.pipeline.output.format, crate::io::EmitFormat::Paf);
         if !is_paf {
             match &self.cfg.header {
@@ -626,7 +626,7 @@ impl Aligner {
         let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut writer = SamWriter::from_writer(
             Box::new(crate::io::VecSink(sink.clone())),
-            index.reference.clone(),
+            &index.reference,
         );
         match &self.cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,
@@ -704,7 +704,7 @@ impl Aligner {
         let out = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let mut writer = SamWriter::from_writer(
             Box::new(crate::io::VecSink(out.clone())),
-            index.reference.clone(),
+            &index.reference,
         );
         match &self.cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,

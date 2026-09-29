@@ -154,7 +154,7 @@ fn run_tiled_inner(
     }
     let mut merge = MergeIter::new(readers);
 
-    let mut writer = SamWriter::new(output_path.clone(), reference.clone())?;
+    let mut writer = SamWriter::new(output_path.clone(), &reference)?;
     match &cfg.header {
         Some(hdr) => writer.write_header_with_ctx(hdr)?,
         None => writer.write_header_with_rg(cfg.read_group.as_deref())?,
