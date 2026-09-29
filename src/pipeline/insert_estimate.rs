@@ -5,14 +5,19 @@ use std::sync::RwLock;
 use crate::pipeline::pairing::PairedConfig;
 use crate::types::Alignment;
 
-/// Number of unique-proper-pair TLEN samples needed before locking in a refined insert estimate.
-pub const MIN_SAMPLES: usize = 1024;
+/// Number of unique same-contig FR-pair TLEN samples needed before locking
+/// in a refined insert estimate. Large enough to span several batches so a
+/// length- or position-sorted FASTQ does not decide the estimate on its own.
+pub const MIN_SAMPLES: usize = 4096;
 
-/// Scale factor mapping MAD → σ under a Gaussian distribution: `σ ≈ 1.4826 × MAD`.
-const MAD_TO_SIGMA: f64 = 1.4826;
+/// Multiplier from σ → proper-pair window half-width (bwa-mem uses 4σ).
+const WINDOW_SIGMA: f64 = 4.0;
 
-/// Multiplier from σ → max insert window for the *configured* insert range.
-const WINDOW_SIGMA: f64 = 6.0;
+/// σ floor as a fraction of the mean and in bases: a PCR-free or simulated
+/// library with zero spread must not collapse the proper-pair and rescue
+/// windows to a few bases.
+const SD_FLOOR_FRACTION: f64 = 0.05;
+const SD_FLOOR_BASES: f64 = 5.0;
 
 /// One running estimator instance — owned by `Pipeline` and shared across batch threads via.
 #[derive(Debug)]
@@ -74,7 +79,13 @@ impl InsertEstimator {
         }
     }
 
-    /// Convenience: walk a batch of (read, alignments) and push every alignment whose.
+    /// Walk a batch and push the fragment length of every read that is the
+    /// forward mate of a uniquely placed, same-contig FR pair. The
+    /// proper-pair flag is deliberately *not* required: it is decided by the
+    /// prior window, so sampling only proper pairs would censor the fit at
+    /// the prior (a 1.5 kb library never escapes a 0..1000 default). Chimeric
+    /// and long-fragment outliers are removed by the percentile trim in
+    /// [`Self::fit`] instead, as bwa-mem does.
     pub fn observe_batch(&mut self, alignments: &[Vec<Alignment>]) -> Option<PairedConfig> {
         if self.locked.is_some() {
             return None;
@@ -86,10 +97,13 @@ impl InsertEstimator {
             }
             let primary = &alns[0];
             let m = &primary.mate;
-            if !m.is_proper_pair || m.mate_is_unmapped {
-                continue;
-            }
-            if m.tlen <= 0 {
+            if !m.is_paired
+                || m.mate_is_unmapped
+                || m.mate_ref_id != Some(primary.ref_id)
+                || primary.is_rev
+                || !m.mate_is_rev
+                || m.tlen <= 0
+            {
                 continue;
             }
             let abs_tlen = m.tlen as u32;
@@ -100,34 +114,44 @@ impl InsertEstimator {
         latest
     }
 
-    /// Fit a refined `PairedConfig` from the accumulated samples using **median + MAD**.
+    /// Fit a refined `PairedConfig` from the accumulated samples the way
+    /// bwa-mem's `mem_pestat` does: keep the samples inside
+    /// `[p25 - 2·IQR, p75 + 2·IQR]`, take their mean and standard deviation,
+    /// floor σ, and set the proper-pair window to `mean ± 4σ`.
     fn fit(&self) -> PairedConfig {
         debug_assert!(self.samples.len() >= MIN_SAMPLES);
         let mut sorted: Vec<u32> = self.samples.clone();
         sorted.sort_unstable();
-        let median = percentile_sorted(&sorted, 0.5);
+        let p25 = percentile_sorted(&sorted, 0.25) as f64;
+        let p75 = percentile_sorted(&sorted, 0.75) as f64;
+        let iqr = (p75 - p25).max(0.0);
+        let low = (p25 - 2.0 * iqr).max(0.0);
+        let high = p75 + 2.0 * iqr;
 
-        // MAD = median of absolute deviations from the median.
-        let mut devs: Vec<u32> = sorted
+        let kept: Vec<f64> = sorted
             .iter()
-            .map(|&x| (x as i64 - median as i64).unsigned_abs() as u32)
+            .map(|&x| x as f64)
+            .filter(|&x| x >= low && x <= high)
             .collect();
-        devs.sort_unstable();
-        let mad = percentile_sorted(&devs, 0.5) as f64;
-        let sd = (mad * MAD_TO_SIGMA).round().max(1.0);
+        let n = kept.len().max(1) as f64;
+        let mean = kept.iter().sum::<f64>() / n;
+        let var = kept.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        let sd = var
+            .sqrt()
+            .max(mean * SD_FLOOR_FRACTION)
+            .max(SD_FLOOR_BASES)
+            .round();
 
-        let mean_u = median as i64;
-        let sd_u = sd as i64;
-        let half = (sd_u * WINDOW_SIGMA as i64).max(0);
-        let min_new = (mean_u - half).max(0) as u32;
-        let max_new = (mean_u + half).max(min_new as i64 + 1) as u32;
+        let half = sd * WINDOW_SIGMA;
+        let min_new = (mean - half).max(0.0).round() as u32;
+        let max_new = ((mean + half).round() as u32).max(min_new + 1);
 
         PairedConfig {
             mode: self.prior.mode,
             insert_min: min_new,
             insert_max: max_new,
-            insert_mean: mean_u.max(0) as u32,
-            insert_sd: sd_u.max(1) as u32,
+            insert_mean: mean.round().max(0.0) as u32,
+            insert_sd: sd as u32,
             estimator_locked: true,
         }
     }

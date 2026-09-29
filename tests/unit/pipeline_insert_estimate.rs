@@ -86,7 +86,7 @@ fn trimmed_estimate_resists_outliers() {
 }
 
 #[test]
-fn median_mad_handles_asymmetric_chimeric_tail() {
+fn trimmed_fit_handles_asymmetric_chimeric_tail() {
     let mut est = InsertEstimator::new(prior());
     let bulk = (MIN_SAMPLES * 85) / 100;
     let tail = MIN_SAMPLES - bulk;
@@ -105,12 +105,12 @@ fn median_mad_handles_asymmetric_chimeric_tail() {
     let refined = est.current();
     assert!(
         (refined.insert_mean as i64 - 570).abs() < 60,
-        "median drifted under asymmetric tail: got {}",
+        "mean drifted under asymmetric tail: got {}",
         refined.insert_mean
     );
     assert!(
         (10..=200).contains(&refined.insert_sd),
-        "MAD-derived σ implausible: {}",
+        "σ implausible: {}",
         refined.insert_sd
     );
     assert!(refined.estimator_locked);
@@ -158,7 +158,7 @@ fn observe_batch_requires_unique_alignment_slot() {
 
     let mut est = InsertEstimator::new(prior());
     let mut batch: Vec<Vec<Alignment>> = Vec::new();
-    for i in 0..2048 {
+    for i in 0..(MIN_SAMPLES * 2) {
         if i % 2 == 0 {
             batch.push(vec![mk(570, 0, true)]);
         } else {
@@ -172,4 +172,57 @@ fn observe_batch_requires_unique_alignment_slot() {
     );
     let refined = est.current();
     assert_eq!(refined.insert_mean, 570);
+}
+
+/// A same-contig FR pair outside the prior's proper-pair window is still a
+/// sample: sampling only flagged proper pairs censored the fit at the prior.
+#[test]
+fn observe_batch_samples_fr_pairs_beyond_the_prior_window() {
+    use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo};
+    fn mk(tlen: i32, is_rev: bool, mate_is_rev: bool, proper: bool) -> Alignment {
+        Alignment {
+            kind: AlignmentKind::DpAligned,
+            ref_id: 3,
+            ref_start: 0,
+            ref_end: 150,
+            read_start: 0,
+            read_end: 150,
+            cigar: vec![CigarOp { len: 150, op: CigarKind::Match }],
+            score: 150,
+            mapq: 60,
+            is_rev,
+            is_secondary: false,
+            is_supplementary: false,
+            nm: 0,
+            md: "150".to_string(),
+            as_score: 150,
+            xs_score: None,
+            xs_strand: None,
+            mate: MateInfo {
+                is_paired: true,
+                is_proper_pair: proper,
+                mate_is_unmapped: false,
+                mate_is_rev,
+                is_first_in_pair: true,
+                is_second_in_pair: false,
+                mate_ref_id: Some(3),
+                mate_pos: 1400,
+                tlen,
+            },
+        }
+    }
+    // Prior window 0..1000; the library is really 1500 +/- ~0, so no pair is
+    // flagged proper. RF / same-strand pairs and reverse mates are skipped.
+    let mut est = InsertEstimator::new(prior());
+    let mut batch: Vec<Vec<Alignment>> = Vec::new();
+    for _ in 0..MIN_SAMPLES {
+        batch.push(vec![mk(1500, false, true, false)]);
+        batch.push(vec![mk(-1500, true, false, false)]); // reverse mate: not counted
+        batch.push(vec![mk(1500, false, false, false)]); // same strand: not counted
+    }
+    let refined = est.observe_batch(&batch).expect("locks on the FR pairs");
+    assert_eq!(refined.insert_mean, 1500);
+    // Zero spread floors sigma at 5 % of the mean, and the window is +/- 4 sigma.
+    assert_eq!(refined.insert_sd, 75);
+    assert_eq!((refined.insert_min, refined.insert_max), (1200, 1800));
 }
