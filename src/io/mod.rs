@@ -152,23 +152,8 @@ impl ReadStream {
         let keep_comment = self.keep_comment;
         while self.current < self.readers.len() {
             let idx = self.current;
-            let record = self.readers[idx]
-                .reader
-                .next()
-                .map_err(|e| anyhow::anyhow!("read FASTQ record: {e:?}"))?;
-            if let Some(record) = record {
-                let (id, mut seq, qual, comment) = {
-                    let id = extract_fastq_id(record.header());
-                    let comment = if keep_comment {
-                        extract_fastq_comment(record.header())
-                    } else {
-                        None
-                    };
-                    let seq = record.seq().to_vec();
-                    let qual = Some(record.qual().to_vec());
-                    (id, seq, qual, comment)
-                };
-                normalize_bases(&mut seq);
+            let record = self.readers[idx].next_extracted(keep_comment)?;
+            if let Some((id, seq, qual, comment)) = record {
                 bases += seq.len();
                 reads.push(ReadRecord {
                     id,
@@ -204,23 +189,9 @@ impl ReadStream {
     #[allow(clippy::type_complexity)]
     fn read_one(&mut self, which: usize) -> Result<Option<ExtractedRead>> {
         let keep_comment = self.keep_comment;
-        let rec = self.readers[which]
-            .reader
-            .next()
-            .map_err(|e| anyhow::anyhow!("read FASTQ record (file {which}): {e:?}"))?;
-        let extracted = rec.map(|r| {
-            let id = extract_fastq_id(r.header());
-            let comment = if keep_comment {
-                extract_fastq_comment(r.header())
-            } else {
-                None
-            };
-            let mut seq = r.seq().to_vec();
-            normalize_bases(&mut seq);
-            let qual = Some(r.qual().to_vec());
-            (id, seq, qual, comment)
-        });
-        Ok(extracted)
+        self.readers[which]
+            .next_extracted(keep_comment)
+            .with_context(|| format!("read input file {which}"))
     }
 
     /// Two-file paired ingestion.
@@ -360,8 +331,21 @@ fn open_fastx_reader<P: AsRef<Path>>(path: P) -> Result<FastxReaderWithProgress>
     })
 }
 
+/// One read input. FASTQ goes through kira-fastq (mmap / parallel BGZF);
+/// FASTA reads (no qualities) go through needletail, which the reference
+/// parser already uses.
+enum ReadBackend {
+    Fastq(KiraFastqReader),
+    Fasta {
+        reader: Box<dyn needletail::FastxReader>,
+        /// Decoded bytes consumed so far (needletail reports the record's
+        /// byte position in the decoded stream).
+        consumed: u64,
+    },
+}
+
 struct FastqReaderWithProgress {
-    reader: KiraFastqReader,
+    backend: ReadBackend,
     total_bytes: u64,
     basis: ProgressBasis,
 }
@@ -371,13 +355,62 @@ impl FastqReaderWithProgress {
     /// different things per backend, so the conversion lives here rather than
     /// at the three call sites.
     fn consumed(&self) -> u64 {
-        let voff = self.reader.tell();
-        let bytes = match self.basis {
-            ProgressBasis::FileBytes => voff.get(),
-            ProgressBasis::BgzfVirtual => voff.compressed(),
-            ProgressBasis::Decoded => voff.get() / FASTQ_GZIP_RATIO,
+        let decoded = match &self.backend {
+            ReadBackend::Fastq(reader) => {
+                let voff = reader.tell();
+                match self.basis {
+                    ProgressBasis::FileBytes => voff.get(),
+                    ProgressBasis::BgzfVirtual => voff.compressed(),
+                    ProgressBasis::Decoded => voff.get() / FASTQ_GZIP_RATIO,
+                }
+            }
+            ReadBackend::Fasta { consumed, .. } => match self.basis {
+                ProgressBasis::FileBytes => *consumed,
+                _ => *consumed / FASTQ_GZIP_RATIO,
+            },
         };
-        bytes.min(self.total_bytes)
+        decoded.min(self.total_bytes)
+    }
+
+    /// Next record as `(id, seq, qual, comment)`, with the mate suffix
+    /// stripped from the id and the bases normalised to ACGTN. FASTA reads
+    /// carry `qual: None`.
+    fn next_extracted(&mut self, keep_comment: bool) -> Result<Option<ExtractedRead>> {
+        match &mut self.backend {
+            ReadBackend::Fastq(reader) => {
+                let rec = reader
+                    .next()
+                    .map_err(|e| anyhow::anyhow!("read FASTQ record: {e:?}"))?;
+                Ok(rec.map(|r| {
+                    let id = extract_fastq_id(r.header());
+                    let comment = if keep_comment {
+                        extract_fastq_comment(r.header())
+                    } else {
+                        None
+                    };
+                    let mut seq = r.seq().to_vec();
+                    normalize_bases(&mut seq);
+                    (id, seq, Some(r.qual().to_vec()), comment)
+                }))
+            }
+            ReadBackend::Fasta { reader, consumed } => {
+                let Some(rec) = reader.next() else {
+                    return Ok(None);
+                };
+                let rec = rec.map_err(|e| anyhow::anyhow!("read FASTA record: {e}"))?;
+                *consumed = rec.position().byte();
+                let id = extract_fastq_id(rec.id());
+                let comment = if keep_comment {
+                    extract_fastq_comment(rec.id())
+                } else {
+                    None
+                };
+                let mut seq = rec.seq().into_owned();
+                normalize_bases(&mut seq);
+                let qual = rec.qual().map(|q| q.to_vec());
+                Ok(Some((id, seq, qual, comment)))
+            }
+        }
     }
 }
 
@@ -470,7 +503,24 @@ fn open_fastq_reader<P: AsRef<Path>>(path: P) -> Result<FastqReaderWithProgress>
         .len();
     let open_err = |e| anyhow::anyhow!("open FASTQ/FASTQ.GZ/BGZF: {e:?}");
     let threads = bgzf_decode_threads();
-    let (reader, basis) = match detect_compression(path)? {
+    let compression = detect_compression(path)?;
+    if first_decoded_byte(path, compression)? == Some(b'>') {
+        let reader = needletail::parse_fastx_file(path)
+            .map_err(|e| anyhow::anyhow!("open FASTA reads {}: {e}", path.display()))?;
+        return Ok(FastqReaderWithProgress {
+            backend: ReadBackend::Fasta {
+                reader,
+                consumed: 0,
+            },
+            total_bytes,
+            basis: if compression == InputCompression::Plain {
+                ProgressBasis::FileBytes
+            } else {
+                ProgressBasis::Decoded
+            },
+        });
+    }
+    let (reader, basis) = match compression {
         InputCompression::Bgzf if threads > 1 => (
             KiraFastqReader::from_bgzf_path_parallel(path, threads).map_err(open_err)?,
             ProgressBasis::Decoded,
@@ -489,10 +539,23 @@ fn open_fastq_reader<P: AsRef<Path>>(path: P) -> Result<FastqReaderWithProgress>
         ),
     };
     Ok(FastqReaderWithProgress {
-        reader,
+        backend: ReadBackend::Fastq(reader),
         total_bytes,
         basis,
     })
+}
+
+/// First byte of the (decompressed) input, to tell FASTA (`>`) from FASTQ
+/// (`@`). `None` for an empty input.
+fn first_decoded_byte(path: &Path, compression: InputCompression) -> Result<Option<u8>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut first = [0u8; 1];
+    let n = match compression {
+        InputCompression::Plain => io::BufReader::new(file).read(&mut first),
+        _ => flate2::bufread::MultiGzDecoder::new(io::BufReader::new(file)).read(&mut first),
+    }
+    .with_context(|| format!("read {}", path.display()))?;
+    Ok((n == 1).then_some(first[0]))
 }
 
 /// Reads from standard input, plain or gzip/BGZF (sniffed from the first two
@@ -507,15 +570,26 @@ fn open_stdin_reader() -> Result<FastqReaderWithProgress> {
     // CRLF is normalised *after* decompression: a pipe delivers the file in
     // arbitrary pieces, and the stream parser only tolerates CRLF when both
     // bytes arrive in the same piece.
-    let reader = if magic == (Some(0x1f), Some(0x8b)) {
+    let mut decoded: io::BufReader<Box<dyn io::Read + Send>> = if magic == (Some(0x1f), Some(0x8b))
+    {
         // Multi-member so BGZF (one member per block) decodes to the end.
         let dec = flate2::bufread::MultiGzDecoder::new(stdin);
-        KiraFastqReader::from_reader(io::BufReader::with_capacity(1 << 20, CrlfToLf::new(dec)))
+        io::BufReader::with_capacity(1 << 20, Box::new(CrlfToLf::new(dec)))
     } else {
-        KiraFastqReader::from_reader(io::BufReader::with_capacity(1 << 20, CrlfToLf::new(stdin)))
+        io::BufReader::with_capacity(1 << 20, Box::new(CrlfToLf::new(stdin)))
+    };
+    let first = decoded.fill_buf().context("read stdin")?.first().copied();
+    let backend = if first == Some(b'>') {
+        let reader = parse_fastx_reader(decoded).context("parse FASTA reads from stdin")?;
+        ReadBackend::Fasta {
+            reader,
+            consumed: 0,
+        }
+    } else {
+        ReadBackend::Fastq(KiraFastqReader::from_reader(decoded))
     };
     Ok(FastqReaderWithProgress {
-        reader,
+        backend,
         total_bytes: 0,
         basis: ProgressBasis::Decoded,
     })

@@ -138,7 +138,7 @@ memory traffic in sketch/seeding, not the DP kernels.
 ### Stage 0 - Input
 - **Input:** one or more FASTA/FASTQ files.
 - **Output:** `InputBatch` containing `Vec<ReadRecord>`.
-- **Notes:** uses `needletail` and mmap-backed I/O; batches are sized by CLI option `-K` (bases).
+- **Notes:** FASTQ goes through kira-fastq (mmap / parallel BGZF); FASTA reads (sniffed from a leading `>`, plain or gzip, file or stdin) go through `needletail` and carry no qualities. Batches are sized by CLI option `-K` (bases).
 
 ### Stage 1 - Sketch (Minimizers)
 - **Input:** `InputBatch`.

@@ -150,3 +150,43 @@ fn unpaired_mode_concatenates_files() {
     let _ = std::fs::remove_file(p1);
     let _ = std::fs::remove_file(p2);
 }
+
+/// FASTA reads (multi-line, no qualities) are accepted alongside FASTQ, as
+/// the CLI help and README promise; the two-file pairing works across
+/// formats.
+#[test]
+fn fasta_reads_are_ingested_with_no_qualities() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let fa = dir.join(format!("kira_fasta_reads_{pid}.fa"));
+    let fq = dir.join(format!("kira_fasta_reads_{pid}.fq"));
+    std::fs::write(
+        &fa,
+        b">read1/1 some comment\nACGTAC\nGTACGT\n>read2/1\nttttttttTTTT\n",
+    )
+    .unwrap();
+    std::fs::write(&fq, R2_FASTQ).unwrap();
+
+    let mut stream = ReadStream::new_multi_with_opts(
+        &[fa.clone(), fq.clone()],
+        1_000_000,
+        IngestMode::TwoFile,
+        true,
+    )
+    .expect("open FASTA + FASTQ pair");
+    let batch = stream.next_batch().unwrap().expect("one batch");
+    assert_eq!(batch.len(), 4);
+    assert_eq!(batch[0].id, "read1");
+    assert_eq!(batch[0].seq, b"ACGTACGTACGT");
+    assert_eq!(batch[0].qual, None, "FASTA reads carry no qualities");
+    assert_eq!(batch[0].comment.as_deref(), Some("some comment"));
+    assert_eq!(batch[0].pair_role, PairRole::R1);
+    assert_eq!(batch[1].id, "read1");
+    assert_eq!(batch[1].pair_role, PairRole::R2);
+    assert!(batch[1].qual.is_some());
+    assert_eq!(batch[2].seq, b"TTTTTTTTTTTT", "lowercase is normalised");
+    assert!(stream.next_batch().unwrap().is_none());
+
+    let _ = std::fs::remove_file(fa);
+    let _ = std::fs::remove_file(fq);
+}
