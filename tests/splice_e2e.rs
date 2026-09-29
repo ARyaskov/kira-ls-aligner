@@ -307,3 +307,203 @@ fn non_canonical_signal_with_require_emits_d_not_n() {
         aln.cigar
     );
 }
+
+fn splice_cfg_default() -> SpliceConfig {
+    SpliceConfig {
+        enabled: true,
+        min_intron: 30,
+        max_intron: 200_000,
+        strand_policy: SpliceStrandPolicy::Auto,
+        require_signal: false,
+        splice_flank: 20,
+        min_exon_len: 15,
+        polya_min_len: 10,
+    }
+}
+
+fn anchor(read_start: u32, read_end: u32, ref_start: u32) -> Anchor {
+    Anchor {
+        read_start,
+        read_end,
+        ref_id: 0,
+        ref_start,
+        ref_end: ref_start + (read_end - read_start),
+        strand: Strand::Forward,
+        score: (read_end - read_start) as i32,
+    }
+}
+
+fn cigar_string(aln: &kira_ls_aligner::types::Alignment) -> String {
+    aln.cigar
+        .iter()
+        .map(|op| {
+            let c = match op.op {
+                CigarKind::Match => 'M',
+                CigarKind::Ins => 'I',
+                CigarKind::Del => 'D',
+                CigarKind::SoftClip => 'S',
+                CigarKind::Skipped => 'N',
+            };
+            format!("{}{}", op.len, c)
+        })
+        .collect()
+}
+
+/// A SNP inside an exon splits the exact-match anchor into two anchors on
+/// the same diagonal with a 1 bp gap. That gap is one aligned mismatching
+/// column, not `1I1D`.
+#[test]
+fn snp_between_same_diagonal_anchors_is_a_mismatch_not_an_indel() {
+    let ref_seq = synth_dna(0x1234_5678_9abc_def1, 4000);
+    let mut read_seq = ref_seq[2000..2400].to_vec();
+    read_seq[100] = if read_seq[100] == b'A' { b'C' } else { b'A' };
+    let read = ReadRecord {
+        id: "snp".to_string(),
+        seq: read_seq,
+        qual: None,
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+        comment: None,
+    };
+    let chain = Chain {
+        ref_id: 0,
+        strand: Strand::Forward,
+        score: 399,
+        anchors: vec![anchor(0, 100, 2000), anchor(101, 400, 2101)],
+        read_start: 0,
+        read_end: 400,
+        ref_start: 2000,
+        ref_end: 2400,
+    };
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .expect("splice alignment should succeed");
+    assert_eq!(cigar_string(&aln), "400M");
+    assert_eq!(aln.nm, 1);
+    assert_eq!(aln.md, format!("100{}299", ref_seq[2100] as char));
+    assert_eq!(aln.score, 399 - 4);
+}
+
+/// A SNP 40 bp before the donor site leaves the exon remainder unanchored;
+/// the remainder must still be aligned as exon bases on either side of the
+/// intron rather than emitted as `40I 540D`.
+#[test]
+fn unanchored_exon_remainder_before_intron_is_aligned_across_the_junction() {
+    let mut ref_seq = synth_dna(0xDEAD_BEEF_CAFE_BABE, 4000);
+    ref_seq[2200] = b'G';
+    ref_seq[2201] = b'T';
+    ref_seq[2698] = b'A';
+    ref_seq[2699] = b'G';
+    let mut read_seq = ref_seq[2000..2200].to_vec();
+    read_seq.extend_from_slice(&ref_seq[2700..2900]);
+    // SNP at read 160 (ref 2160), 40 bp before the donor.
+    read_seq[160] = if read_seq[160] == b'A' { b'C' } else { b'A' };
+    let read = ReadRecord {
+        id: "snp_before_donor".to_string(),
+        seq: read_seq,
+        qual: None,
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+        comment: None,
+    };
+    let chain = Chain {
+        ref_id: 0,
+        strand: Strand::Forward,
+        score: 360,
+        anchors: vec![anchor(0, 160, 2000), anchor(200, 400, 2700)],
+        read_start: 0,
+        read_end: 400,
+        ref_start: 2000,
+        ref_end: 2900,
+    };
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .expect("splice alignment should succeed");
+    assert_eq!(cigar_string(&aln), "200M500N200M");
+    assert_eq!(aln.nm, 1);
+    assert_eq!(aln.md, format!("160{}239", ref_seq[2160] as char));
+    assert_eq!(aln.read_end, 400);
+    assert_eq!(aln.ref_end, 2900);
+}
+
+/// A gap that differs on the two sides but is far too short to be an
+/// intron is a real indel: the common length stays on the diagonal and the
+/// excess becomes a single I or D, charged to the score.
+#[test]
+fn mixed_short_gap_emits_one_indel_with_gap_penalty() {
+    let ref_seq = synth_dna(0x0f0f_0f0f_0f0f_0f0f, 4000);
+    // read = ref[2000..2100) + ref[2103..2400): a 3 bp deletion.
+    let mut read_seq = ref_seq[2000..2100].to_vec();
+    read_seq.extend_from_slice(&ref_seq[2103..2400]);
+    let read = ReadRecord {
+        id: "del3".to_string(),
+        seq: read_seq,
+        qual: None,
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+        comment: None,
+    };
+    // Anchors stop 2 bp short on each side of the deletion (as a seed-based
+    // chain would): read gap 4, ref gap 7.
+    let chain = Chain {
+        ref_id: 0,
+        strand: Strand::Forward,
+        score: 390,
+        anchors: vec![anchor(0, 98, 2000), anchor(102, 397, 2105)],
+        read_start: 0,
+        read_end: 397,
+        ref_start: 2000,
+        ref_end: 2400,
+    };
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .expect("splice alignment should succeed");
+    let n_ins: u32 = aln
+        .cigar
+        .iter()
+        .filter(|o| o.op == CigarKind::Ins)
+        .map(|o| o.len)
+        .sum();
+    let n_del: u32 = aln
+        .cigar
+        .iter()
+        .filter(|o| o.op == CigarKind::Del)
+        .map(|o| o.len)
+        .sum();
+    assert_eq!(n_ins, 0, "no insertion expected: {}", cigar_string(&aln));
+    assert_eq!(n_del, 3, "3 bp deletion expected: {}", cigar_string(&aln));
+    let consumed: u32 = aln
+        .cigar
+        .iter()
+        .filter(|o| {
+            matches!(
+                o.op,
+                CigarKind::Match | CigarKind::Ins | CigarKind::SoftClip
+            )
+        })
+        .map(|o| o.len)
+        .sum();
+    assert_eq!(consumed, 397);
+    assert!(aln.score < 397, "gap must be charged: score {}", aln.score);
+}

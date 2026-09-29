@@ -199,6 +199,45 @@ fn refine_splice_boundary(
     best.map(|(_, r)| r)
 }
 
+/// Replay `len` aligned columns (read `q0..`, ref `t0..`) as matches and
+/// mismatches into the running MD/NM/score accumulators.
+#[allow(clippy::too_many_arguments)]
+fn replay_diagonal(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    q0: usize,
+    t0: usize,
+    len: usize,
+    cfg: AlignmentConfig,
+    md_bytes: &mut Vec<u8>,
+    md_run: &mut u32,
+    total_nm: &mut u32,
+    total_score: &mut i32,
+) {
+    for k in 0..len {
+        let qb = read_seq[q0 + k];
+        let tb = ref_seq[t0 + k];
+        if qb == tb {
+            *md_run += 1;
+            *total_score += cfg.match_score;
+        } else {
+            push_decimal(md_bytes, *md_run);
+            md_bytes.push(tb);
+            *md_run = 0;
+            *total_nm += 1;
+            *total_score -= cfg.mismatch;
+        }
+    }
+}
+
+/// Number of mismatching columns on the diagonal `read[q0..q0+len)` vs
+/// `ref[t0..t0+len)`.
+fn diagonal_mismatches(read_seq: &[u8], ref_seq: &[u8], q0: usize, t0: usize, len: usize) -> u32 {
+    (0..len)
+        .filter(|&k| read_seq[q0 + k] != ref_seq[t0 + k])
+        .count() as u32
+}
+
 pub fn align_spliced_chain(
     chain: &Chain,
     read: &ReadRecord,
@@ -428,22 +467,108 @@ pub fn align_spliced_chain(
                 }
                 // Fall through to D if signal required and not found.
             }
-            // Regular indel handling (small intron / no signal).
-            if read_gap > 0 {
-                push_cigar(&mut cigar, CigarKind::Ins, read_gap);
-                total_nm += read_gap;
+            // Anchors are exact-match runs, so a SNP (or a few sequencing
+            // errors) inside an exon splits it into two anchors on the same
+            // diagonal. Such a gap is aligned columns, not an insertion plus
+            // a deletion.
+            let q0 = a.read_end as usize;
+            let t0 = a.ref_end as usize;
+            if read_gap > 0 && ref_gap >= read_gap {
+                let intron_len = ref_gap - read_gap;
+                if intron_len >= splice_cfg.min_intron && intron_len <= splice_cfg.max_intron {
+                    // The unanchored read bases belong to the flanking exons:
+                    // split them into a left part (continuing exon `a`) and a
+                    // right part (leading into `next`) where the mismatch
+                    // count is minimal, and put the intron between.
+                    let g = read_gap as usize;
+                    let mut best_left = 0usize;
+                    let mut best_mm = u32::MAX;
+                    for left in 0..=g {
+                        let right = g - left;
+                        let mm = diagonal_mismatches(read_seq, ref_seq, q0, t0, left)
+                            + diagonal_mismatches(
+                                read_seq,
+                                ref_seq,
+                                q0 + left,
+                                next.ref_start as usize - right,
+                                right,
+                            );
+                        if mm < best_mm {
+                            best_mm = mm;
+                            best_left = left;
+                        }
+                    }
+                    // Accept the split unless the gap is mostly noise.
+                    if best_mm as usize * 4 <= g + 4 {
+                        let right = g - best_left;
+                        replay_diagonal(
+                            read_seq,
+                            ref_seq,
+                            q0,
+                            t0,
+                            best_left,
+                            cfg,
+                            &mut md_bytes,
+                            &mut md_run,
+                            &mut total_nm,
+                            &mut total_score,
+                        );
+                        push_cigar(&mut cigar, CigarKind::Match, best_left as u32);
+                        push_cigar(&mut cigar, CigarKind::Skipped, intron_len);
+                        replay_diagonal(
+                            read_seq,
+                            ref_seq,
+                            q0 + best_left,
+                            next.ref_start as usize - right,
+                            right,
+                            cfg,
+                            &mut md_bytes,
+                            &mut md_run,
+                            &mut total_nm,
+                            &mut total_score,
+                        );
+                        push_cigar(&mut cigar, CigarKind::Match, right as u32);
+                        splice_junction_count += 1;
+                        continue;
+                    }
+                }
             }
-            if ref_gap > 0 {
-                push_cigar(&mut cigar, CigarKind::Del, ref_gap);
-                total_nm += ref_gap;
+            // Same-diagonal gap (SNPs / sequencing errors): aligned columns.
+            // Mixed gaps put the common length on the diagonal and the excess
+            // as one indel; left-normalization later slides it to its
+            // canonical position.
+            let diag = read_gap.min(ref_gap) as usize;
+            if diag > 0 {
+                replay_diagonal(
+                    read_seq,
+                    ref_seq,
+                    q0,
+                    t0,
+                    diag,
+                    cfg,
+                    &mut md_bytes,
+                    &mut md_run,
+                    &mut total_nm,
+                    &mut total_score,
+                );
+                push_cigar(&mut cigar, CigarKind::Match, diag as u32);
+            }
+            let ins = read_gap - diag as u32;
+            let del = ref_gap - diag as u32;
+            if ins > 0 {
+                push_cigar(&mut cigar, CigarKind::Ins, ins);
+                total_nm += ins;
+                total_score -= cfg.gap_open + cfg.gap_extend * ins as i32;
+            }
+            if del > 0 {
+                push_cigar(&mut cigar, CigarKind::Del, del);
+                total_nm += del;
+                total_score -= cfg.gap_open + cfg.gap_extend * del as i32;
                 push_decimal(&mut md_bytes, md_run);
                 md_bytes.push(b'^');
-                // Emit reference bases — bounded loop for safety.
-                let rstart = a.ref_end as usize;
-                let rend = (rstart + ref_gap as usize).min(ref_seq.len());
-                for k in rstart..rend {
-                    md_bytes.push(ref_seq[k]);
-                }
+                let rstart = t0 + diag;
+                let rend = (rstart + del as usize).min(ref_seq.len());
+                md_bytes.extend_from_slice(&ref_seq[rstart..rend]);
                 md_run = 0;
             }
         }
