@@ -349,3 +349,25 @@ fn supplementary_keeps_mapq_and_sets_0x800() {
     assert_eq!(flag & 0x100, 0, "must not be secondary");
     assert_eq!(mapq, 45, "supplementary retains MAPQ");
 }
+
+/// Zero-length reads (adapter trimmers emit them) must carry `*` in SEQ
+/// and QUAL rather than two empty columns.
+#[test]
+fn zero_length_read_emits_star_seq_and_qual() {
+    let fmt = SamFormatter::new(Arc::new(make_reference()));
+    let read = ReadRecord {
+        id: "empty".to_string(),
+        seq: Vec::new(),
+        qual: Some(Vec::new()),
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+        comment: None,
+    };
+    let mut buf = Vec::new();
+    fmt.append_unmapped_with_mate(&mut buf, &read, None);
+    let line = String::from_utf8(buf).unwrap();
+    let cols: Vec<&str> = line.trim_end().split('\t').collect();
+    assert_eq!(cols.len(), 11, "{line:?}");
+    assert_eq!(cols[9], "*", "SEQ");
+    assert_eq!(cols[10], "*", "QUAL");
+}

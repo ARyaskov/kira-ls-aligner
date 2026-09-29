@@ -870,12 +870,9 @@ impl SamFormatter {
             }
         }
 
-        buf.extend_from_slice(&read.seq);
+        append_seq_or_star(buf, &read.seq);
         buf.push(b'\t');
-        match read.qual.as_ref() {
-            Some(q) => buf.extend_from_slice(q),
-            None => buf.push(b'*'),
-        }
+        append_qual_or_star(buf, read.qual.as_deref());
         if let Some(extra) = extra_tags {
             buf.extend_from_slice(extra);
         }
@@ -954,13 +951,16 @@ impl SamFormatter {
         let seq_len = read.seq.len();
         let keep_end = seq_len.saturating_sub(clip_trail as usize);
         let keep_start = (clip_lead as usize).min(keep_end);
-        if aln.is_rev {
+        if keep_start == keep_end {
+            buf.push(b'*');
+        } else if aln.is_rev {
             append_reverse_complement_range(buf, &read.seq, keep_start, keep_end);
         } else {
             buf.extend_from_slice(&read.seq[keep_start..keep_end]);
         }
         buf.push(b'\t');
-        match read.qual.as_ref() {
+        match read.qual.as_deref() {
+            Some(q) if q.len() != seq_len || keep_start == keep_end => buf.push(b'*'),
             Some(q) if aln.is_rev => {
                 let n = q.len();
                 buf.extend(q[n - keep_end..n - keep_start].iter().rev().copied())
@@ -1152,6 +1152,26 @@ impl SamFormatter {
             buf.push(b';');
         }
         added
+    }
+}
+
+/// SEQ column: the bases, or `*` for a zero-length read (adapter trimmers
+/// emit those; two empty columns are not valid SAM).
+#[inline]
+fn append_seq_or_star(buf: &mut Vec<u8>, seq: &[u8]) {
+    if seq.is_empty() {
+        buf.push(b'*');
+    } else {
+        buf.extend_from_slice(seq);
+    }
+}
+
+/// QUAL column: the qualities, or `*` when absent or empty.
+#[inline]
+fn append_qual_or_star(buf: &mut Vec<u8>, qual: Option<&[u8]>) {
+    match qual {
+        Some(q) if !q.is_empty() => buf.extend_from_slice(q),
+        _ => buf.push(b'*'),
     }
 }
 
