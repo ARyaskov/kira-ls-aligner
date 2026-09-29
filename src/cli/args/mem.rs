@@ -231,7 +231,9 @@ pub struct MemArgs {
     #[arg(short = 'R', long = "read-group")]
     pub read_group: Option<String>,
 
-    /// Use the CUDA backend for the alignment fast path.
+    /// Use the CUDA backend for the short-read spectral prefilter. Requires a
+    /// build with `--features cuda`; errors otherwise instead of silently
+    /// running on the CPU.
     #[arg(long = "gpu", default_value_t = false)]
     pub gpu: bool,
 

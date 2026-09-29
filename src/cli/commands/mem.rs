@@ -35,6 +35,27 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// `--gpu`: bring up the CUDA worker so stage 4 routes its spectral batches
+/// through it. Idempotent, so the `gpu-server` session (which starts the
+/// dispatcher itself) can pass `gpu: true` as well.
+#[cfg(feature = "cuda")]
+fn start_gpu_dispatcher() -> Result<()> {
+    crate::cuda::dispatcher::start()
+        .map_err(|e| anyhow::anyhow!("--gpu: failed to start the CUDA worker: {e}"))?;
+    if !crate::cuda::dispatcher::is_active() {
+        anyhow::bail!("--gpu: CUDA worker did not come up");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn start_gpu_dispatcher() -> Result<()> {
+    anyhow::bail!(
+        "--gpu: this binary was built without CUDA support; rebuild with \
+         `cargo build --release --features cuda`"
+    )
+}
+
 /// `--insert-window MIN,MAX[,MEAN,SD]` sets the proper-pair window; bwa-mem's
 /// `-I mean[,sd[,max[,min]]]` then overrides it and fixes the distribution.
 fn apply_insert_args(
@@ -221,6 +242,9 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     // knob: every `KIRA_*` is a lazily initialised `OnceLock`, and nothing has
     // touched one yet at this point.
     apply_knob_overrides(args.config.as_deref(), &args.set)?;
+    if args.gpu {
+        start_gpu_dispatcher()?;
+    }
     let ignored = args.ignored_compat_flags();
     if !ignored.is_empty() {
         crate::kira_warn!(
