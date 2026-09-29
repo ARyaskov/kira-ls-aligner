@@ -407,8 +407,8 @@ pub fn wfa_result_to_alignment(
                 qi += op.len as usize;
             }
             CigarKind::Skipped => {
-                push_u32_decimal(&mut md_bytes, match_run);
-                match_run = 0;
+                // MD does not represent reference skips: the match run continues
+                // across the intron (SAM spec; samtools calmd).
                 ti += op.len as usize;
             }
         }
@@ -1720,8 +1720,8 @@ pub(crate) fn compute_nm_md(
                 qpos += op.len as usize;
             }
             CigarKind::Skipped => {
-                push_u32_decimal(&mut md_bytes, match_count);
-                match_count = 0;
+                // MD does not represent reference skips: the match run continues
+                // across the intron (SAM spec; samtools calmd).
                 rpos += op.len as usize;
             }
         }
@@ -2366,6 +2366,34 @@ mod adaptive_band_tests {
             adaptive.read_end - adaptive.read_start >= 79,
             "should align ~all 80 bp"
         );
+    }
+
+    /// MD never contains the N op: the match run continues across the intron
+    /// (`50M500N50M` with no mismatches is `MD:Z:100`, not `5050`).
+    #[test]
+    fn md_continues_across_reference_skips() {
+        let mut reference = vec![b'A'; 600];
+        for (i, b) in reference.iter_mut().enumerate() {
+            *b = b"ACGT"[(i * 7 + i / 3) % 4];
+        }
+        let mut read = Vec::new();
+        read.extend_from_slice(&reference[0..50]);
+        read.extend_from_slice(&reference[550..600]);
+        let cigar = vec![
+            CigarOp { len: 50, op: CigarKind::Match },
+            CigarOp { len: 500, op: CigarKind::Skipped },
+            CigarOp { len: 50, op: CigarKind::Match },
+        ];
+        let (nm, md) = compute_nm_md(&read, &reference, 0, 0, &cigar);
+        assert_eq!(nm, 0);
+        assert_eq!(md, "100");
+
+        // A mismatch right after the intron still splits the run correctly.
+        let mut read2 = read.clone();
+        read2[50] = if read2[50] == b'A' { b'C' } else { b'A' };
+        let (nm, md) = compute_nm_md(&read2, &reference, 0, 0, &cigar);
+        assert_eq!(nm, 1);
+        assert_eq!(md, format!("50{}49", reference[550] as char));
     }
 
     /// Regression for the banded-SW first-row off-by-one. When the read's very first base

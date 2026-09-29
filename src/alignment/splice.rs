@@ -315,8 +315,7 @@ pub fn align_spliced_chain(
                     qpos += op.len as usize;
                 }
                 CigarKind::Skipped => {
-                    push_decimal(&mut md_bytes, md_run);
-                    md_run = 0;
+                    // MD does not represent reference skips; the run continues.
                     rpos += op.len as usize;
                 }
             }
@@ -399,10 +398,9 @@ pub fn align_spliced_chain(
                         push_cigar(&mut cigar, CigarKind::Match, left_shift);
                     }
 
-                    // The intron: N op, closes MD run.
+                    // The intron: N op. MD does not represent reference
+                    // skips, so the match run continues across it.
                     push_cigar(&mut cigar, CigarKind::Skipped, intron_len);
-                    push_decimal(&mut md_bytes, md_run);
-                    md_run = 0;
 
                     // Right extension as Match.
                     if right_shift > 0 {

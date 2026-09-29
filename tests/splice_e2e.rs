@@ -155,6 +155,9 @@ fn two_exon_alignment_emits_n_op_and_forward_xs_strand() {
     assert_eq!(aln.read_end, 400);
     // NM should be 0 (perfect synthetic).
     assert_eq!(aln.nm, 0, "synthetic read should be perfect match");
+    // MD does not represent the N op: a perfect 400 bp spliced read has a
+    // single 400 run, not the two exon runs glued together ("200200").
+    assert_eq!(aln.md, "400", "MD must continue across the intron");
 }
 
 #[test]
