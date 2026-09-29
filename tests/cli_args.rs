@@ -59,3 +59,14 @@ fn insert_window_keeps_the_legacy_form() {
     assert_eq!(a.insert_window, "100,600");
     assert_eq!(a.insert_size, None);
 }
+
+#[test]
+fn unknown_preset_is_rejected_and_bwa_long_read_presets_map_to_long() {
+    assert!(parse(&["-x", "shrot", "ref.fa", "r.fq"]).is_err());
+    for p in ["pacbio", "ont2d", "intractg", "LONG"] {
+        let a = parse(&["-x", p, "ref.fa", "r.fq"]).unwrap();
+        assert_eq!(a.preset, "long", "{p}");
+    }
+    assert_eq!(parse(&["-x", "splice:hq", "ref.fa", "r.fq"]).unwrap().preset, "splice:hq");
+    assert_eq!(parse(&["ref.fa", "r.fq"]).unwrap().preset, "auto");
+}

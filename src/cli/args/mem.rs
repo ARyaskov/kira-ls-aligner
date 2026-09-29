@@ -126,8 +126,10 @@ pub struct MemArgs {
     #[arg(short = 'K', long = "batch", default_value_t = 4_000_000)]
     pub batch_bases: usize,
 
-    /// Preset: short, long, or auto.
-    #[arg(short = 'x', long = "preset", default_value = "auto")]
+    /// Read-type preset: `auto` (default, classifies the first batch), `short`,
+    /// `long`, `splice`, `splice:hq`. bwa-mem's `pacbio`, `ont2d` and
+    /// `intractg` map to `long`.
+    #[arg(short = 'x', long = "preset", default_value = "auto", value_parser = parse_preset)]
     pub preset: String,
 
     /// Seed length (overrides preset for both short and long indices).
@@ -367,6 +369,22 @@ pub struct MemArgs {
     /// sort, which also disables the fused markdup.
     #[arg(long = "sort-memory", default_value = "auto", value_name = "SIZE")]
     pub sort_memory: String,
+}
+
+/// Canonical preset names. bwa-mem's long-read presets map onto `long`; a
+/// typo is an error rather than a silent fall-through to the hybrid tuning.
+pub const PRESETS: &[&str] = &["auto", "short", "long", "splice", "splice:hq"];
+
+fn parse_preset(s: &str) -> Result<String, String> {
+    let lower = s.to_ascii_lowercase();
+    match lower.as_str() {
+        "pacbio" | "ont2d" | "intractg" => Ok("long".to_string()),
+        p if PRESETS.contains(&p) => Ok(lower),
+        _ => Err(format!(
+            "unknown preset {s:?}; expected one of {} (bwa-mem's pacbio/ont2d/intractg map to long)",
+            PRESETS.join(", ")
+        )),
+    }
 }
 
 /// bwa-mem accepts `INT[,INT]` for `-O`/`-E`/`-L` (deletion,insertion or
