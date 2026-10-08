@@ -39,7 +39,7 @@ sysinfo = "0.38"
 thiserror = "2"
 kira-fastq = "0.4.0"
 kira-simd = { version = "0.1.0", features = ["runtime-dispatch", "avx2", "sse42", "neon", "scalar"] }
-kira_kv_engine = { version = "0.6.3", default-features = true }
+kira_kv_engine = { version = "0.7.0", default-features = true }
 
 kira-bam = "0.4.0"
 # Same noodles-sam line kira-bam 0.4.0 builds on, so the `RecordBuf` the fused
@@ -47,12 +47,6 @@ kira-bam = "0.4.0"
 noodles-sam = "0.85"
 # gzip/BGZF sniffing on `-` (stdin) reads; file inputs go through kira-fastq.
 flate2 = "1"
-
-# Restore the default SIGPIPE disposition in the binary so `kira mem ... |
-# head` ends quietly like bwa/samtools instead of exiting 1 with an EPIPE
-# error (Rust ignores SIGPIPE at startup).
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 # Cross-platform thread affinity for the hybrid-aware DualPool
 # (P-core / E-core split on Intel Alder Lake+, AMD homogeneous fallback).
@@ -63,6 +57,12 @@ core_affinity = "0.8"
 # single binary that targets multiple GPU generations including Pascal
 # (compute_61, GTX 1060+).
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "cuda-12060", "dynamic-loading"], optional = true }
+
+# Restore the default SIGPIPE disposition in the binary so `kira mem ... |
+# head` ends quietly like bwa/samtools instead of exiting 1 with an EPIPE
+# error (Rust ignores SIGPIPE at startup).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Topology detection on Windows: GetLogicalProcessorInformationEx
 # exposes EfficiencyClass per physical core (0 = E, > 0 = P).

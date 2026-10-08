@@ -43,11 +43,7 @@ enum HashLookup {
 impl HashLookup {
     fn lookup(&self, hash: u64) -> Option<usize> {
         match self {
-            HashLookup::Mph(idx) => match idx.lookup_u64_fast(hash) {
-                Some(Ok(id)) => Some(id),
-                Some(Err(_)) => None,
-                None => idx.lookup_u64(hash).ok(),
-            },
+            HashLookup::Mph(idx) => idx.lookup_u64(hash).ok(),
             HashLookup::Sorted(arr) => arr.binary_search(&hash).ok(),
         }
     }
@@ -368,7 +364,6 @@ impl MinimizerIndex {
             let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
             let mph = kira_kv_engine::IndexBuilder::new()
                 .with_parallel_build(true)
-                .with_build_fast_profile(true)
                 .build_index(keys_bytes)
                 .expect("PtrHash25 build");
             crate::kira_info!(
@@ -631,7 +626,6 @@ impl MinimizerIndex {
             let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
             let mph = kira_kv_engine::IndexBuilder::new()
                 .with_parallel_build(true)
-                .with_build_fast_profile(true)
                 .build_index(keys_bytes)
                 .expect("PtrHash25 build");
             let assigned: Vec<u32> = unique_hashes
