@@ -1598,30 +1598,13 @@ fn extract_rg_id(rg: &str) -> &str {
     text
 }
 
-fn push_u32(buf: &mut Vec<u8>, mut v: u32) {
-    if v == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = 0usize;
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    for idx in (0..i).rev() {
-        buf.push(tmp[idx]);
-    }
+fn push_u32(buf: &mut Vec<u8>, v: u32) {
+    crate::alignment::push_u32_decimal(buf, v);
 }
 
+/// Also correct for `i32::MIN`, which the former `(-v) as u32` overflowed on.
 fn push_i32(buf: &mut Vec<u8>, v: i32) {
-    if v < 0 {
-        buf.push(b'-');
-        push_u32(buf, (-v) as u32);
-    } else {
-        push_u32(buf, v as u32);
-    }
+    buf.extend_from_slice(v.format_into(&mut core::fmt::NumBuffer::new()).as_bytes());
 }
 
 /// Append a non-negative f64 with 4 fractional digits — matches `printf("%.4f", x)`.
@@ -1652,6 +1635,21 @@ fn is_softclip(op: &CigarOp) -> bool {
 mod format_tests {
     use super::*;
     use crate::types::{AlignmentKind, RefBases, RefSeq};
+
+    #[test]
+    fn integers_are_written_in_decimal_across_the_full_range() {
+        let mut buf = Vec::new();
+        for v in [0, 7, -7, 1_000_000, i32::MAX, i32::MIN] {
+            buf.clear();
+            push_i32(&mut buf, v);
+            assert_eq!(buf, v.to_string().into_bytes());
+        }
+        for v in [0, 9, 10, 4_294_967_295] {
+            buf.clear();
+            push_u32(&mut buf, v);
+            assert_eq!(buf, v.to_string().into_bytes());
+        }
+    }
 
     fn reference() -> Reference {
         Reference {

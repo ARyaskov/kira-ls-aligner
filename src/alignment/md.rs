@@ -18,6 +18,7 @@
 //! `NM` is the edit distance: mismatches plus inserted plus deleted bases.
 
 use crate::types::{CigarKind, CigarOp};
+use core::fmt::NumBuffer;
 
 #[derive(Clone, Debug, Default)]
 pub struct MdBuilder {
@@ -116,19 +117,8 @@ impl MdBuilder {
 
 /// Append the decimal digits of `v` without allocating.
 #[inline]
-pub fn push_u32_decimal(out: &mut Vec<u8>, mut v: u32) {
-    if v == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = 0usize;
-    while v > 0 {
-        tmp[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    out.extend(tmp[..i].iter().rev());
+pub fn push_u32_decimal(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(v.format_into(&mut NumBuffer::new()).as_bytes());
 }
 
 /// Replay `cigar` over `read[read_start..]` and `reference[ref_start..]` and
