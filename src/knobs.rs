@@ -153,7 +153,7 @@ pub const KNOBS: &[Knob] = &[
     knob(
         "KIRA_SHORT_DPTOPK",
         "2",
-        "Chains kept per short read for DP and pair promotion; overrides --dp-topk.",
+        "Override the adaptive 1-3 candidate traceback budget per short read.",
     ),
     knob(
         "KIRA_MATE_GUIDE",
@@ -163,7 +163,7 @@ pub const KNOBS: &[Knob] = &[
     knob(
         "KIRA_TWOTIER",
         "1",
-        "Rank ambiguous candidate loci by bounded Myers edit cost instead of chain score.",
+        "Rank uncertain candidate loci by affine alignment score and adapt the traceback budget.",
     ),
     knob(
         "KIRA_TWOTIER_K",
@@ -173,7 +173,7 @@ pub const KNOBS: &[Knob] = &[
     knob(
         "KIRA_TWOTIER_MAPQ",
         "0",
-        "Feed the two-tier Myers cost gap into MAPQ as the XS proxy.",
+        "Use a measured affine competitor score as XS on otherwise single-DP reads.",
     ),
     knob(
         "KIRA_XS_MINRATIO",

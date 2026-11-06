@@ -175,28 +175,64 @@ pub fn ungapped_beaten_by_gap(
     }
     let text = &ref_seq[win_start..win_start + text_len];
 
-    let ungapped_cost = ungapped_mism as i32 * cfg.mismatch;
+    let ungapped_cost = ungapped_mism as i32 * (cfg.match_score + cfg.mismatch);
     if ungapped_cost <= 0 {
         return false;
     }
-    let pen = wfa::WfaPenalties {
-        mismatch: cfg.mismatch,
-        gap_open: cfg.gap_open,
-        gap_extend: cfg.gap_extend,
-    };
     let opts = wfa::WfaOptions {
         max_score: ungapped_cost - 1,
         adaptive_drop: None,
         text_begin_free: 0,
     };
-    wfa::wfa_score_only(read_seq, text, pen, opts).is_some()
+    wfa::wfa_score_only_scored(read_seq, text, cfg, opts).is_some()
+}
+
+/// Candidate score under exactly the full-query objective used by the WFA
+/// traceback. Myers is only a cheap rejection screen; its unit edit costs are
+/// never converted to an affine AS/XS score or used to order competing loci.
+pub fn locus_alignment_score(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+) -> Option<i32> {
+    let start = (chain.ref_start as usize).checked_sub(chain.read_start as usize)?;
+    let end = start
+        .checked_add(read_seq.len() + cfg.bandwidth.max(1) as usize)?
+        .min(ref_seq.len());
+    let lead = (router::wfa_lead().max(0) as usize)
+        .min(start)
+        .min(cfg.bandwidth.max(1) as usize);
+    let text = ref_seq.get(start - lead..end)?;
+    if read_seq.is_empty() || text.len() < read_seq.len() {
+        return None;
+    }
+    myers::bounded_edit_distance(read_seq, text, router::myers_reject_bound(read_seq.len()))?;
+    wfa::wfa_score_only_scored(
+        read_seq,
+        text,
+        cfg,
+        wfa::WfaOptions {
+            max_score: router::wfa_score_budget(
+                read_seq.len(),
+                cfg.match_score + cfg.mismatch,
+                cfg.gap_open,
+                cfg.match_score + cfg.gap_extend,
+            ),
+            adaptive_drop: None,
+            text_begin_free: if lead > 0 {
+                lead as i32
+            } else {
+                router::wfa_ends_free()
+            },
+        },
+    )
 }
 
 /// Bit-parallel Myers edit distance of `read_seq` against the seed window of `chain` (semi-global
 /// on the reference — best ending position in the window). Returns `None` when the edit distance
 /// exceeds the Myers reject bound: a locus too divergent to be a real competitor. Used by the
-/// two-tier candidate search to rank competing loci by true edit cost — far more discriminating
-/// than the coarse chain (anchor-coverage) score — with bounded, per-call memory (fixed bit-vector
+/// diagnostics and cheap screening, with bounded, per-call memory (fixed bit-vector
 /// state, unlike an unbounded WFA score-only whose wavefront pool balloons on divergent loci) and
 /// bit-parallel speed. Lower cost = better locus; the same seed window as `try_fast_dp_alignment`.
 pub fn locus_edit_cost(
@@ -230,7 +266,7 @@ pub fn locus_edit_cost(
 }
 
 /// Original cascade body.
-fn try_fast_dp_alignment_inner(
+pub(crate) fn try_fast_dp_alignment_inner(
     read_seq: &[u8],
     ref_seq: &[u8],
     chain: &AnchorSpan,
@@ -289,17 +325,18 @@ fn try_fast_dp_alignment_inner(
     let myers_k = router::myers_reject_bound(read_len);
     myers::bounded_edit_distance(read_seq, text, myers_k)?;
 
-    let pen = wfa::WfaPenalties {
-        mismatch: cfg.mismatch,
-        gap_open: cfg.gap_open,
-        gap_extend: cfg.gap_extend,
-    };
-    let budget = router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
+    let budget = router::wfa_score_budget(
+        read_len,
+        cfg.match_score + cfg.mismatch,
+        cfg.gap_open,
+        cfg.match_score + cfg.gap_extend,
+    );
     // Leading-edge slack for WFA only (the spectral/packed paths above require the
     // read to start at text[0]). `text` begins exactly at the seed-implied win_start
     // with only trailing slack, so a 5' deletion before the seed is unrepresentable.
     // When KIRA_WFA_LEAD > 0, extend the WFA text upstream and free those bases.
-    // lead == 0 (default) reproduces prior behavior byte-for-byte.
+    // lead == 0 keeps the initial window pinned; suspect origins may still
+    // receive the bounded automatic retry below.
     let lead = (router::wfa_lead().max(0) as usize)
         .min(win_start)
         .min(band);
@@ -317,18 +354,111 @@ fn try_fast_dp_alignment_inner(
         adaptive_drop: router::wfa_adaptive_drop(),
         text_begin_free,
     };
-    let wfa_aln = wfa::wfa_align(read_seq, wfa_text, pen, opts)?;
+    let mut wfa_aln = wfa::wfa_align_scored(read_seq, wfa_text, cfg, opts)?;
+    let (mut final_text, mut final_start) = (wfa_text, wfa_text_start);
+    // A seed after a 5' indel implies a shifted query origin. A compensating
+    // leading gap is evidence to retry a bounded ends-free window, rather than
+    // silently hiding the variant by clipping the query in the SW fallback.
+    let suspect_origin = wfa_aln
+        .cigar
+        .first()
+        .is_some_and(|op| op.op != CigarKind::Match || (op.len < 19 && wfa_aln.cigar.len() > 1));
+    if suspect_origin && lead == 0 && router::wfa_ends_free() == 0 {
+        let slack = band.min(32).min(win_start);
+        if slack > 0 {
+            // An exact prefix usually identifies the origin before the indel.
+            // Probe it first to avoid seeding 65 free wavefront diagonals.
+            let mut origin = win_start;
+            let mut prefix = 0;
+            for start in win_start - slack..=(win_start + slack).min(ref_seq.len() - 1) {
+                let matched = crate::seq::common_prefix_len(read_seq, &ref_seq[start..]);
+                if matched > prefix {
+                    prefix = matched;
+                    origin = start;
+                }
+            }
+            let origin_end = (origin + read_len + band).min(ref_seq.len());
+            let (expanded, start, free_bases) = if prefix >= 4 {
+                (&ref_seq[origin..origin_end], origin, 0)
+            } else {
+                (
+                    &ref_seq[win_start - slack..win_start + text_len],
+                    win_start - slack,
+                    (slack * 2) as i32,
+                )
+            };
+            let free = wfa::WfaOptions {
+                text_begin_free: free_bases,
+                max_score: wfa_aln.score,
+                ..opts
+            };
+            if let Some(retry) = wfa::wfa_align_scored(read_seq, expanded, cfg, free)
+                && retry.score < wfa_aln.score
+            {
+                wfa_aln = retry;
+                final_text = expanded;
+                final_start = start;
+            }
+        }
+    }
+    // A strongly divergent full-query result may instead be a partial read.
+    // Keep ordinary end-indels in the full-query model; only the low-identity
+    // tail uses local SW's clipping policy.
+    let perfect = cfg.match_score.saturating_mul(read_len as i32);
+    if wfa_aln.score as i64 * 10 > perfect as i64 * 3
+        && clipping_can_improve(read_seq, final_text, &wfa_aln, cfg)
+    {
+        return None;
+    }
 
     let aln = wfa_result_to_alignment(
         read_seq,
-        wfa_text,
-        wfa_text_start,
+        final_text,
+        final_start,
         chain.ref_id,
         wfa_aln,
         cfg,
         is_rev,
     )?;
     Some((aln, FastPathKind::Wfa))
+}
+
+fn clipping_can_improve(
+    read: &[u8],
+    text: &[u8],
+    aln: &wfa::WfaAlignment,
+    cfg: AlignmentConfig,
+) -> bool {
+    let (mut qi, mut ti, mut score, mut min_prefix, mut best_prefix) =
+        (0usize, aln.text_start, 0i32, 0i32, 0i32);
+    for op in &aln.cigar {
+        match op.op {
+            CigarKind::Match => {
+                for _ in 0..op.len {
+                    score += if read.get(qi) == text.get(ti) {
+                        cfg.match_score
+                    } else {
+                        -cfg.mismatch
+                    };
+                    qi += 1;
+                    ti += 1;
+                    min_prefix = min_prefix.min(score);
+                    best_prefix = best_prefix.max(score);
+                }
+            }
+            CigarKind::Ins | CigarKind::Del => {
+                score -= cfg.gap_open + cfg.gap_extend * op.len as i32;
+                if op.op == CigarKind::Ins {
+                    qi += op.len as usize;
+                } else {
+                    ti += op.len as usize;
+                }
+                min_prefix = min_prefix.min(score);
+            }
+            _ => return true,
+        }
+    }
+    min_prefix < 0 || best_prefix > score.saturating_add(cfg.clip_penalty)
 }
 
 /// Convert a `wfa::WfaAlignment` produced by `wfa_align_semi_global` into our in-pipeline.
@@ -642,18 +772,7 @@ pub fn exact_match_alignment(
     cfg: AlignmentConfig,
     is_rev: bool,
 ) -> Option<Alignment> {
-    if chain.read_start != 0 || chain.read_end as usize != read_len {
-        return None;
-    }
-    let ref_start = chain.ref_start as usize;
-    if ref_start + read_len > ref_seq.len() {
-        return None;
-    }
-    if chain.ref_end - chain.ref_start != read_len as u32 {
-        return None;
-    }
-    let ref_slice = &ref_seq[ref_start..ref_start + read_len];
-    if simd::count_mismatches(read_seq, ref_slice) != 0 {
+    if read_len != read_seq.len() || !exact_match_exists(read_seq, ref_seq, chain) {
         return None;
     }
     let cigar = vec![CigarOp {
@@ -681,6 +800,23 @@ pub fn exact_match_alignment(
         xs_strand: None,
         mate: MateInfo::default(),
     })
+}
+
+/// Allocation-free exact-match evidence for candidate ranking. Construct CIGAR
+/// and MD only for candidates that actually survive the traceback budget.
+pub(crate) fn exact_match_exists(read: &[u8], reference: &[u8], chain: &AnchorSpan) -> bool {
+    let len = read.len();
+    if chain.read_start != 0
+        || chain.read_end as usize != len
+        || chain.ref_end.checked_sub(chain.ref_start) != Some(len as u32)
+    {
+        return false;
+    }
+    let start = chain.ref_start as usize;
+    start
+        .checked_add(len)
+        .and_then(|end| reference.get(start..end))
+        .is_some_and(|bases| simd::count_mismatches(read, bases) == 0)
 }
 
 /// Align a chain using banded Smith-Waterman around the anchor span.

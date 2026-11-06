@@ -235,7 +235,7 @@ below covers the ones worth knowing about.
 | `KIRA_BGZF_THREADS` | 2 | Workers inflating a BGZF input — samtools' `-@` for FASTQ, and *per input file*. BGZF blocks are independent, so this scales: HG002 R1 (748 MB) decodes in 5.0 s on one thread, 2.1 s on two, 1.1 s on four. End to end on chr20 30× (16 threads, `--emit bam`) that is **98.8 s → 83.6 s**, with a byte-identical BAM body. Decoding overlaps alignment, so the default stops at 2 rather than taking cores the aligner wants. `1` uses the single-threaded backend; `0` selects the default. Plain `.gz` (non-BGZF) has no block structure and is single-threaded either way. |
 | `KIRA_MATE_GUIDE` | on | Promote the candidate locus that has a plausible mate partner, when exactly one candidate has one. `0` disables. |
 | `KIRA_ANCHOR_CAP_K` | on | Never require an anchor to be longer than the seed length `k`. `0` restores the old `min_anchor_len` behaviour. |
-| `KIRA_TWOTIER` | on | Rank ambiguous candidate loci by bounded Myers edit cost instead of chain score. |
+| `KIRA_TWOTIER` | on | Verify uncertain candidate loci with the final affine scorer, reuse verified alignments, and adapt the traceback budget to 1–3 candidates (at least 2 for paired decisions). |
 | `KIRA_PREFETCH` | on | Parse the next batch on a producer thread while the current one aligns. `0` restores the serial loop. |
 | `KIRA_AC_DISABLE` | auto | Aho-Corasick exact-match fast path. `0` forces on, `1` forces off. See below. |
 | `KIRA_RESCUE_WIDE` | off | After a banded mate-rescue attempt misses its score bar, also run a full-window SW. `1` restores it. |

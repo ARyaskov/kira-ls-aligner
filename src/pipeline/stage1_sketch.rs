@@ -16,7 +16,7 @@ pub struct SketchConfig {
 }
 
 /// Minimizer sketch for a read.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReadSketch {
     pub minimizers: Vec<Minimizer>,
     pub k: usize,
@@ -72,6 +72,16 @@ pub fn run_with_mask(input: InputBatch, cfg: SketchConfig, skip_mask: &[bool]) -
         })
         .collect();
 
+    let total_mins: usize = sketches.iter().map(|s| s.minimizers.len()).sum();
+    let stats = batch_stats(&reads, total_mins);
+    SketchBatch {
+        reads,
+        sketches,
+        stats,
+    }
+}
+
+pub(crate) fn batch_stats(reads: &[ReadRecord], total_mins: usize) -> SketchBatchStats {
     let sample_n = reads.len().min(256);
     let mut lens: Vec<usize> = reads.iter().take(sample_n).map(|r| r.seq.len()).collect();
     lens.sort_unstable();
@@ -91,21 +101,15 @@ pub fn run_with_mask(input: InputBatch, cfg: SketchConfig, skip_mask: &[bool]) -
     } else {
         total_len as f32 / reads.len() as f32
     };
-    let total_mins: usize = sketches.iter().map(|s| s.minimizers.len()).sum();
-    let avg_minimizers = if sketches.is_empty() {
+    let avg_minimizers = if reads.is_empty() {
         0.0
     } else {
-        total_mins as f32 / sketches.len() as f32
+        total_mins as f32 / reads.len() as f32
     };
-    let stats = SketchBatchStats {
+    SketchBatchStats {
         read_len_p50,
         read_len_p90,
         avg_read_len,
         avg_minimizers,
-    };
-    SketchBatch {
-        reads,
-        sketches,
-        stats,
     }
 }

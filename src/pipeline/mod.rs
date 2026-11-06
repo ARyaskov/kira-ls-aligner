@@ -32,10 +32,8 @@ use crate::pipeline::pairing::{
     PairedConfig, RescueConfig, apply_pairing, pair_rerank, rescue_discordant_pairs_with_ref,
     rescue_unmapped_mates_with_ref,
 };
-use crate::pipeline::stage1_sketch::{
-    SketchBatchStats, SketchConfig, run_with_mask as sketch_run_with_mask,
-};
-use crate::pipeline::stage2_seeding::{SeedBatchStats, run as seed_run};
+use crate::pipeline::stage1_sketch::{SketchBatchStats, SketchConfig};
+use crate::pipeline::stage2_seeding::{SeedBatchStats, run_fused as seed_run_fused};
 use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
     AlignmentBatchStats, AlignmentStageConfig, run as align_run,
@@ -198,12 +196,15 @@ impl Pipeline {
             )
         });
         let skip_mask = ac.resolved_mask();
-        let sketch = self
-            .pool
-            .install_compute(|| sketch_run_with_mask(input, self.config.sketch, &skip_mask));
-        let seeds = self
-            .pool
-            .install_light(|| seed_run(sketch, index, self.config.seeding));
+        let (seeds, _) = self.pool.install_compute(|| {
+            seed_run_fused(
+                input,
+                index,
+                self.config.sketch,
+                self.config.seeding,
+                &skip_mask,
+            )
+        });
         let chains = self
             .pool
             .install_light(|| chain_run(seeds, self.config.chaining));
@@ -271,31 +272,40 @@ impl Pipeline {
         let mut stages = [Duration::ZERO; 6];
 
         let t0 = Instant::now();
-        // Stage 1 (AC + sketch) is SIMD-heavy → P-pool. Capture stats
-        // before crossing the pool boundary so the install closure only
-        // returns owned data.
-        let (ac, sketch) = self.pool.install_compute(|| {
-            let ac = ac_batch::run(
+        // Stage 1 now measures AC only. Sketching is fused into stage 2 so
+        // minimizer buffers stay on the worker and never become a batch-sized
+        // intermediate. Compare the sum of stages 1+2 with older profiles.
+        let ac = self.pool.install_compute(|| {
+            ac_batch::run(
                 &input.reads,
                 index,
                 self.config.alignment,
                 self.config.max_alignments,
-            );
-            let skip_mask = ac.resolved_mask();
-            let sketch = sketch_run_with_mask(input, self.config.sketch, &skip_mask);
-            (ac, sketch)
+            )
         });
         let ac_stats = ac.stats;
-        let sketch_stats = sketch.stats;
         stages[0] = t0.elapsed();
 
-        // Stage 2 seeding — memory-bound hash lookups.
+        // Stage 2 combines sketching with memory-bound seed lookups.
         let t1 = Instant::now();
-        let seeds = self
-            .pool
-            .install_light(|| seed_run(sketch, index, self.config.seeding));
+        let skip_mask = ac.resolved_mask();
+        let (seeds, sketch_stats) = self.pool.install_compute(|| {
+            seed_run_fused(
+                input,
+                index,
+                self.config.sketch,
+                self.config.seeding,
+                &skip_mask,
+            )
+        });
         let seed_stats = seeds.stats.clone();
         stages[1] = t1.elapsed();
+        if std::env::var_os("KIRA_STATS").is_some() {
+            crate::kira_info!(
+                "[KIRA_SEED] adaptive_retries={}",
+                seed_stats.adaptive_retries
+            );
+        }
 
         // Stage 3 chaining — scalar predecessor DP.
         let t2 = Instant::now();

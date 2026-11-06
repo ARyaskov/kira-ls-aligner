@@ -236,6 +236,7 @@ struct PerReadResult<'read, 'index> {
     chain_best: i32,
     /// Second-best chain score.
     chain_second: i32,
+    competitor_score: Option<i32>,
     /// Per-read attribution counters — set when a fast-DP cascade step produces the primary.
     packed_spectral_resolved: usize,
     spectral_sieve_resolved: usize,
@@ -267,6 +268,7 @@ impl<'read, 'index> Default for PerReadResult<'read, 'index> {
             potential_accepts: 0,
             chain_best: 0,
             chain_second: 0,
+            competitor_score: None,
             packed_spectral_resolved: 0,
             spectral_sieve_resolved: 0,
             wfa_resolved: 0,
@@ -276,15 +278,21 @@ impl<'read, 'index> Default for PerReadResult<'read, 'index> {
     }
 }
 
-/// Two-tier candidate search (SNP-recall / paralog disambiguation). When enabled, ambiguous
-/// short reads have every competitive candidate LOCUS scored by a cheap exact WFA score-only
-/// pass, and the chains are reordered so the true-lowest-cost loci are the ones that receive the
-/// full DP (and feed pair-reranking + MAPQ) — instead of trusting the coarse chain (anchor-
-/// coverage) score, which mis-ranks the true locus below a cleaner-matching paralog. Score-only +
-/// bounded to ambiguous reads keeps it cheap; unique reads keep the top-1 fast path untouched.
-/// On GIAB HG002 chr20 PE it recovered +41 true SNPs with zero new false positives (paralog
-/// placement) at held speed; larger effect expected genome-wide. Default ON; disable with
-/// `KIRA_TWOTIER=0`.
+fn accept_fast_result(res: &mut PerReadResult<'_, '_>, aln: Alignment, kind: FastPathKind) {
+    res.accepted.push(aln);
+    res.dp_used = true;
+    match kind {
+        FastPathKind::PackedSpectral => res.packed_spectral_resolved += 1,
+        FastPathKind::SpectralSieve => res.spectral_sieve_resolved += 1,
+        FastPathKind::Wfa => res.wfa_resolved += 1,
+        FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
+        FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
+    }
+}
+
+/// Uncertain short reads use a bounded candidate search scored with the same
+/// affine objective and origin repair as the final fast path. Reuse verified
+/// alignments, and keep ordinary unique reads on their one-candidate path.
 fn two_tier_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -294,15 +302,8 @@ fn two_tier_enabled() -> bool {
     })
 }
 
-/// Feed the two-tier Myers locus cost into MAPQ. For a single-DP read with a competing chain,
-/// replace the coarse `score·chain_second/chain_best` XS proxy with one derived from the real
-/// Myers edit-cost gap between the primary and competing loci.
-///
-/// DEFAULT OFF: on GIAB HG002 chr20 PE it was accuracy-NEUTRAL (zero SNPs moved). It only fires
-/// on non-ambiguous single-DP reads — where the competitor is weak and the proxy already clears
-/// the `best/2` floor to MAPQ cap — while ambiguous reads already take a real 2nd-DP XS from the
-/// two-tier. The residual MAPQ-0 alt-read loss is genuine paralog ambiguity, not a calibration
-/// error. Kept as an opt-in for data with a different paralog structure. Enable `KIRA_TWOTIER_MAPQ=1`.
+/// Optional affine-score refinement for single-DP reads outside the adaptive
+/// candidate search. A failed bounded probe is unknown, not a zero-score locus.
 fn twotier_mapq_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -312,8 +313,7 @@ fn twotier_mapq_enabled() -> bool {
     })
 }
 
-/// Max candidate loci the two-tier search score-only-ranks per read (default = chaining's
-/// `max_chains`, capped here). `KIRA_TWOTIER_K`.
+/// Maximum candidate loci verified per uncertain read. `KIRA_TWOTIER_K`.
 fn two_tier_k() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -325,10 +325,16 @@ fn two_tier_k() -> usize {
     })
 }
 
-/// Score-only-rank the min_score-passing candidate chains by exact WFA alignment cost and return
-/// a reordered index list (lowest-cost locus first), or `None` when there is nothing to reorder
-/// (fewer than 2 passing candidates) or the order is already optimal. Non-passing chains are kept
-/// at the tail so the caller's `min_score` filter still applies unchanged.
+/// Candidate evidence plus reusable verified alignments. The order is stable
+/// for ties, and a failed bounded probe never shrinks the traceback budget.
+struct CandidateRanking {
+    order: Vec<usize>,
+    /// Full-query affine scores, indexed by the original chain index.
+    scores: Vec<Option<i32>>,
+    cached: Vec<Option<(Alignment, FastPathKind)>>,
+    dp_limit: usize,
+}
+
 fn two_tier_reorder(
     read_fwd: &[u8],
     read_rev_cache: &mut Option<Vec<u8>>,
@@ -337,7 +343,7 @@ fn two_tier_reorder(
     cfg: AlignmentConfig,
     min_score: i32,
     max_k: usize,
-) -> Option<Vec<usize>> {
+) -> Option<CandidateRanking> {
     let passing: Vec<usize> = chain_list
         .iter()
         .enumerate()
@@ -356,6 +362,7 @@ fn two_tier_reorder(
     }
     let read_rev = read_rev_cache.as_deref();
     let mut scored: Vec<(usize, i32)> = Vec::with_capacity(passing.len());
+    let mut cached = vec![None; chain_list.len()];
     for &ci in passing.iter() {
         let chain = &chain_list[ci];
         let is_rev = matches!(chain.strand, Strand::Reverse);
@@ -369,27 +376,61 @@ fn two_tier_reorder(
             read_end: chain.read_end,
             strand: chain.strand,
         };
-        // Bit-parallel Myers edit distance (bounded memory) — lower = better locus.
-        let cost = crate::alignment::locus_edit_cost(read_seq, ref_seq, &span, cfg)
-            .map(|d| d as i32)
-            .unwrap_or(i32::MAX);
-        scored.push((ci, cost));
+        if crate::alignment::exact_match_exists(read_seq, ref_seq, &span) {
+            scored.push((ci, cfg.match_score * read_seq.len() as i32));
+            continue;
+        }
+        // Global LSH/CGK rescue must not masquerade as evidence for this locus.
+        let hit = crate::alignment::try_fast_dp_alignment_inner(
+            read_seq,
+            ref_seq,
+            &span,
+            chain.score,
+            cfg,
+            is_rev,
+        );
+        let score = hit.as_ref().map(|(aln, _)| aln.score);
+        cached[ci] = hit;
+        scored.push((ci, score.unwrap_or(i32::MIN)));
     }
-    // Sort by exact cost; original chain index breaks ties deterministically so true paralogs
-    // (equal cost) keep the higher-scoring chain first and MAPQ stays honest + reproducible.
-    scored.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    // Original chain index breaks equal affine scores deterministically.
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let new_passing: Vec<usize> = scored.iter().map(|&(ci, _)| ci).collect();
-    // No-op if the score-only order already matches chain order.
-    if new_passing == passing {
-        return None;
+    let mut scores = vec![None; chain_list.len()];
+    for &(ci, score) in &scored {
+        if score != i32::MIN {
+            scores[ci] = Some(score);
+        }
     }
+    // Distinguishable near-ties buy a third traceback; a clear winner needs only one. Failed
+    // score screens are unknown, so retain the historical two-candidate budget
+    // rather than treating a bounded failure as evidence of a poor alignment.
+    let margin = (cfg.match_score + cfg.mismatch).saturating_mul(2).max(1);
+    let dp_limit = if scored.iter().any(|&(_, s)| s == i32::MIN) {
+        2
+    } else if scored.len() >= 3 && scored[2].1 == scored[0].1 {
+        // Two identical copies already establish ambiguity. More identical
+        // placements supply no evidence with which to resolve that tie.
+        2
+    } else {
+        scored
+            .iter()
+            .take_while(|&&(_, s)| s >= scored[0].1.saturating_sub(margin))
+            .count()
+            .clamp(1, 3)
+    };
     let mut order = new_passing;
     for i in 0..chain_list.len() {
         if !order.contains(&i) {
             order.push(i);
         }
     }
-    Some(order)
+    Some(CandidateRanking {
+        order,
+        scores,
+        cached,
+        dp_limit,
+    })
 }
 
 /// Mate-guided candidate search. Default ON; `KIRA_MATE_GUIDE=0` disables.
@@ -516,7 +557,7 @@ fn process_read_prefilter<'read, 'index>(
     }
 
     let best = chain_list[0].score;
-    let min_score = if best > 0 {
+    let mut min_score = if best > 0 {
         (best as f32 * cfg.min_chain_ratio).ceil() as i32
     } else {
         best
@@ -545,6 +586,10 @@ fn process_read_prefilter<'read, 'index>(
     // competitor score rather than the chain-score proxy.
     let ambiguous_chain = chain_list.len() > 1
         && (score_margin <= (best / ambig_div()).max(8) || read.repeat_min_occ > 1);
+    let weak_chain = chain_list.len() > 1 && best < (len as i32 * 2 / 3);
+    if short_read && weak_chain && two_tier_enabled() {
+        min_score = min_score.min(best / 5);
+    }
     // Unique short reads stay top-1. Ambiguous reads pay for one competing DP
     // placement so MAPQ and pair reranking use evidence rather than a proxy.
     let effective_dp_topk = if short_read {
@@ -552,10 +597,10 @@ fn process_read_prefilter<'read, 'index>(
     } else {
         cfg.dp_topk.max(1)
     };
-    // Two-tier candidate search: reorder the loci so the full DP (and pair-rerank + MAPQ inputs)
-    // land on the true-lowest-cost loci by exact score-only, not the coarse chain-score order.
-    // Only ambiguous reads pay for it; `None` (the common path) iterates chains in place.
-    let two_tier_order = if two_tier_enabled() && short_read && ambiguous_chain {
+    // Verify uncertain candidates using the final affine scorer and retain the
+    // result for reuse. Ordinary unique reads iterate their chains in place.
+    let mut two_tier_order = if two_tier_enabled() && short_read && (ambiguous_chain || weak_chain)
+    {
         two_tier_reorder(
             read_fwd,
             &mut read_rev_cache,
@@ -569,7 +614,7 @@ fn process_read_prefilter<'read, 'index>(
         None
     };
     // Mate support layers on top of that order rather than replacing it: the
-    // mate says which loci are geometrically possible, the two-tier Myers cost
+    // mate says which loci are geometrically possible, the two-tier affine score
     // says which of those the read actually matches. Reordering by the mate
     // alone de-ranks the real competitors MAPQ is computed from.
     let mate_pick = if mate_guide_enabled() && short_read && cfg.paired.is_paired() {
@@ -578,13 +623,14 @@ fn process_read_prefilter<'read, 'index>(
         None
     };
     // Move the uniquely mate-supported locus to the front; the rest keep their
-    // relative order, so the Myers ranking still decides what the mate cannot.
+    // relative order, so the affine ranking still decides what the mate cannot.
     let candidate_order: Option<Vec<usize>> = match (&two_tier_order, mate_pick) {
         (None, None) => None,
-        (Some(order), None) => Some(order.clone()),
+        (Some(ranking), None) => Some(ranking.order.clone()),
         (base, Some(pick)) => {
             let mut order: Vec<usize> = base
-                .clone()
+                .as_ref()
+                .map(|ranking| ranking.order.clone())
                 .unwrap_or_else(|| (0..chain_list.len()).collect());
             order.sort_by_key(|&ci| ci != pick);
             Some(order)
@@ -597,13 +643,39 @@ fn process_read_prefilter<'read, 'index>(
         candidate_order
             .as_ref()
             .and_then(|o| o.first().copied())
-            .is_some_and(|first| first == pick && pick != 0)
+            .is_some_and(|first| {
+                first == pick && pick != two_tier_order.as_ref().map_or(0, |r| r.order[0])
+            })
     });
+    let effective_dp_topk = if short_read && short_topk_override.is_none() {
+        two_tier_order.as_ref().map_or(effective_dp_topk, |r| {
+            if cfg.paired.is_paired() {
+                r.dp_limit.max(2)
+            } else {
+                r.dp_limit
+            }
+        })
+    } else {
+        effective_dp_topk
+    };
     let effective_dp_topk = if mate_promoted {
         effective_dp_topk.max(2)
     } else {
         effective_dp_topk
     };
+    if effective_dp_topk == 1
+        && !mate_promoted
+        && let Some(ranking) = &two_tier_order
+    {
+        let primary = candidate_order.as_ref().map_or(0, |o| o[0]);
+        res.competitor_score = ranking
+            .scores
+            .iter()
+            .enumerate()
+            .filter(|&(ci, _)| ci != primary)
+            .filter_map(|(_, &s)| s)
+            .max();
+    }
 
     let mut selected = 0usize;
     for pos in 0..chain_list.len() {
@@ -651,6 +723,18 @@ fn process_read_prefilter<'read, 'index>(
         {
             res.exact_matches += 1;
             res.accepted.push(aln);
+            continue;
+        }
+
+        // Candidate search already verified a complete alignment. Re-running
+        // ungapped extension cannot strengthen that evidence, and its Reject
+        // heuristic must not discard a full-query result proved by affine DP.
+        // Debug modes deliberately keep their normal instrumentation path.
+        if !cfg.debug_force_accept
+            && !cfg.debug_prefilter
+            && let Some((aln, kind)) = two_tier_order.as_mut().and_then(|r| r.cached[ci].take())
+        {
+            accept_fast_result(&mut res, aln, kind);
             continue;
         }
 
@@ -778,18 +862,14 @@ fn process_read_prefilter<'read, 'index>(
         #[cfg(not(feature = "cuda"))]
         let cpu_fast_path_enabled = true;
         if cpu_fast_path_enabled
-            && let Some((aln, fast_kind)) =
-                try_fast_dp_alignment(read_seq, ref_seq, &span, chain.score, cfg.cfg, is_rev)
+            && let Some((aln, fast_kind)) = two_tier_order
+                .as_mut()
+                .and_then(|r| r.cached[ci].take())
+                .or_else(|| {
+                    try_fast_dp_alignment(read_seq, ref_seq, &span, chain.score, cfg.cfg, is_rev)
+                })
         {
-            res.accepted.push(aln);
-            res.dp_used = true;
-            match fast_kind {
-                FastPathKind::PackedSpectral => res.packed_spectral_resolved += 1,
-                FastPathKind::SpectralSieve => res.spectral_sieve_resolved += 1,
-                FastPathKind::Wfa => res.wfa_resolved += 1,
-                FastPathKind::CgkRescue => res.cgk_rescue_resolved += 1,
-                FastPathKind::LshRescue => res.lsh_rescue_resolved += 1,
-            }
+            accept_fast_result(&mut res, aln, fast_kind);
             continue;
         }
 
@@ -822,11 +902,8 @@ fn process_read_prefilter<'read, 'index>(
         res.dp_used = true;
     }
 
-    // Myers-cost MAPQ refinement (single-DP reads with a competing chain). Replaces the coarse
-    // chain-score XS proxy with one derived from the true Myers edit-cost gap between the primary
-    // and competing loci, so a distinguishable paralog gives high MAPQ (recovering alt reads the
-    // --min-MQ floor drops) and a real tie stays MAPQ 0. Two-DP reads already carry a real 2nd-
-    // alignment XS; SIMD/scalar-deferred reads (empty `accepted` here) fall back to the proxy.
+    // Optional measured affine XS for reads outside the adaptive candidate
+    // search. Two-DP reads already have a real competing alignment score.
     // Guard `two_tier_order.is_none()`: only when the chains were NOT reordered do chain_list[0]
     // and [1] reliably correspond to the primary (the sole DP'd locus) and its top competitor.
     if twotier_mapq_enabled()
@@ -843,7 +920,7 @@ fn process_read_prefilter<'read, 'index>(
             read_rev_cache = Some(reverse_complement(read_fwd));
         }
         let read_rev = read_rev_cache.as_deref();
-        let cost_of = |chain: &Chain| -> Option<usize> {
+        let score_of = |chain: &Chain| -> Option<i32> {
             let rseq = if matches!(chain.strand, Strand::Reverse) {
                 read_rev.unwrap()
             } else {
@@ -858,20 +935,13 @@ fn process_read_prefilter<'read, 'index>(
                 read_end: chain.read_end,
                 strand: chain.strand,
             };
-            crate::alignment::locus_edit_cost(rseq, ref_seq, &span, cfg.cfg)
+            crate::alignment::locus_alignment_score(rseq, ref_seq, &span, cfg.cfg)
         };
-        if let Some(c0) = cost_of(&chain_list[0]) {
+        if score_of(&chain_list[0]).is_some() {
             let best = res.accepted[0].score.max(1);
-            // Alignment-score cost of one extra edit (a match becoming a mismatch).
-            let k_pen = cfg.cfg.match_score + cfg.cfg.mismatch;
-            let sub = match cost_of(&chain_list[1]) {
-                // Competitor within the Myers bound: its score gap from the primary is the
-                // edit-cost gap priced at k_pen per edit.
-                Some(c1) => (best - (c1 as i32 - c0 as i32).max(0) * k_pen).clamp(0, best),
-                // Competitor beyond the Myers bound → clearly worse → no MAPQ compression.
-                None => 0,
-            };
-            res.accepted[0].xs_score = Some(sub);
+            if let Some(sub) = score_of(&chain_list[1]) {
+                res.accepted[0].xs_score = Some(sub.clamp(0, best));
+            }
         }
     }
 
@@ -948,6 +1018,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     let mut fallback_lens: Vec<u16> = Vec::new();
     let mut chain_best_per_read: Vec<i32> = Vec::with_capacity(reads.len());
     let mut chain_second_per_read: Vec<i32> = Vec::with_capacity(reads.len());
+    let mut competitor_scores: Vec<Option<i32>> = Vec::with_capacity(reads.len());
 
     for (idx, mut res) in per_read.into_iter().enumerate() {
         if res.short_read {
@@ -980,6 +1051,7 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
         alignments.push(std::mem::take(&mut res.accepted));
         chain_best_per_read.push(res.chain_best);
         chain_second_per_read.push(res.chain_second);
+        competitor_scores.push(res.competitor_score);
         dp_used[idx] = res.dp_used;
         for job in res.simd_jobs.into_iter() {
             let shape = (job.read_seq.len(), job.ref_window.len());
@@ -1132,6 +1204,10 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     };
     for (i, alns) in alignments.iter_mut().enumerate() {
         if alns.len() != 1 {
+            continue;
+        }
+        if let Some(sub) = competitor_scores[i] {
+            alns[0].xs_score = Some(sub.clamp(0, alns[0].score.max(0)));
             continue;
         }
         let cb = chain_best_per_read[i];
@@ -1484,3 +1560,7 @@ fn percentile_u16_sorted(values: &[u16], pct: usize) -> u16 {
 #[cfg(test)]
 #[path = "../../tests/unit/pipeline_stage4_mate_guide.rs"]
 mod mate_guide_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/pipeline_adaptive_candidates.rs"]
+mod adaptive_candidate_tests;

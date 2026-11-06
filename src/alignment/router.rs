@@ -134,7 +134,8 @@ pub fn wfa_ends_free() -> i32 {
 /// Extends the WFA text this many bases upstream of the seed-implied window start
 /// and marks them free-to-skip, so a 5' deletion *before* the seed is representable
 /// (the trailing edge already has `bandwidth` slack; the leading edge had none).
-/// `0` (default) reproduces prior behavior exactly. Capped at the bandwidth by the caller.
+/// `0` leaves the initial window pinned; the fast path can still repair a
+/// suspect seed origin automatically. Explicit slack is capped at the band.
 #[inline]
 pub fn wfa_lead() -> i32 {
     wfa_lead_u32() as i32
