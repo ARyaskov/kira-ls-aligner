@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-06
+
+MSRV is now Rust 1.98.
+
+### Fixed
+
+- Signed SAM fields (`TLEN`, `AS`, `XS`) no longer overflow on `i32::MIN` while being formatted.
+
+### Changed
+
+- SAM and `MD` integers are formatted with `core::fmt::NumBuffer` (about 20% faster per number than the former digit loop, byte-identical output).
+- The tile planner iterates contigs directly, which keeps the crate clippy-clean on Rust 1.100.
+- Depends on `kira_kv_engine` 0.8.1 (was 0.7). Index files and SAM output are unchanged.
+
 ## [0.6.0] - 2026-11-06
 
 GIAB HG002 chr20 (PE 30x, kira-bt 0.8.0 mpileup, defaults): SNP F1 0.9909 -> 0.9911, INDEL F1 0.8767 -> 0.8790 (+41 TP, -5 FP) versus 0.5.0; the kira-solid production profile shows the same gain.
