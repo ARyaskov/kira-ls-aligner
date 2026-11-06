@@ -302,8 +302,9 @@ impl Pipeline {
         stages[1] = t1.elapsed();
         if std::env::var_os("KIRA_STATS").is_some() {
             crate::kira_info!(
-                "[KIRA_SEED] adaptive_retries={}",
-                seed_stats.adaptive_retries
+                "[KIRA_SEED] adaptive_retries={} repeat_rescues={}",
+                seed_stats.adaptive_retries,
+                seed_stats.repeat_rescues
             );
         }
 

@@ -168,6 +168,46 @@ fn minimizers_deque(seq: &[u8], cfg: &MinimizerConfig, mins: &mut Vec<Minimizer>
     }
 }
 
+/// Hash an exact seed extended in the orientation of its canonical k-mer.
+/// Forward seeds grow to the right; reverse seeds grow to the left before
+/// reverse-complement orientation, so read and reference coordinates stay equal.
+pub(crate) fn extended_minimizer_hash(
+    seq: &[u8],
+    pos: u32,
+    k: usize,
+    strand: Strand,
+    extension: usize,
+) -> Option<u64> {
+    let extended_k = k.checked_add(extension)?;
+    if extended_k >= 32 {
+        return None;
+    }
+    let pos = pos as usize;
+    let (start, end) = match strand {
+        Strand::Forward => (pos, pos.checked_add(extended_k)?),
+        Strand::Reverse => (pos.checked_sub(extension)?, pos.checked_add(k)?),
+    };
+    if end > seq.len() {
+        return None;
+    }
+    let mut kmer = 0u64;
+    let forward = strand == Strand::Forward;
+    let mut kmer_index = 0;
+    for i in 0..extended_k {
+        let seq_idx = if forward { start + i } else { end - 1 - i };
+        let code = base_code(seq[seq_idx]);
+        if code >= 4 {
+            kmer = 0;
+            kmer_index = 0;
+            continue;
+        }
+        let code = if forward { code } else { 3 - code };
+        kmer = (kmer << 2) | code as u64;
+        kmer_index += 1;
+    }
+    (kmer_index == extended_k).then(|| hash64(kmer))
+}
+
 fn base_code(b: u8) -> u8 {
     match b {
         b'A' | b'a' => 0,
@@ -236,6 +276,25 @@ mod ring_equivalence_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn extended_seed_hash_is_symmetric_and_rejects_ambiguous_bases() {
+        let seq = b"TGCATGCGTACCTAGCTAGGCTAACCGATGCA";
+        let rc = crate::seq::reverse_complement(seq);
+        let k = 7;
+        let extension = 5;
+        for pos in 0..=seq.len() - k {
+            let forward = extended_minimizer_hash(seq, pos as u32, k, Strand::Forward, extension);
+            let rc_pos = seq.len() - pos - k;
+            let reverse =
+                extended_minimizer_hash(&rc, rc_pos as u32, k, Strand::Reverse, extension);
+            assert_eq!(forward, reverse, "pos {pos}");
+        }
+        assert_eq!(
+            extended_minimizer_hash(b"ACGTNACGT", 0, 3, Strand::Forward, 2),
+            None
+        );
     }
 
     #[test]

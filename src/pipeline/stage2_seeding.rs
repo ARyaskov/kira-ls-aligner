@@ -23,6 +23,7 @@ pub struct SeedBatchStats {
     pub anchors_before_prune: usize,
     pub anchors_after_prune: usize,
     pub adaptive_retries: usize,
+    pub repeat_rescues: usize,
 }
 
 type SeedResult = (Vec<Anchor>, usize, u32);
@@ -51,6 +52,7 @@ pub fn run_fused(
                 let mut ctx = cell.borrow_mut();
                 let mut sketches = std::mem::take(&mut ctx.sketches);
                 let before_retries = ctx.adaptive_retries;
+                let before_rescues = ctx.repeat_rescues;
                 let mut total_mins = 0;
                 let mut out = Vec::with_capacity(block.len());
                 for (template_idx, pair) in block.chunks(2).enumerate() {
@@ -79,16 +81,22 @@ pub fn run_fused(
                     );
                 }
                 ctx.sketches = sketches;
-                (out, total_mins, ctx.adaptive_retries - before_retries)
+                (
+                    out,
+                    total_mins,
+                    ctx.adaptive_retries - before_retries,
+                    ctx.repeat_rescues - before_rescues,
+                )
             })
         })
         .collect();
     let mut anchors = Vec::with_capacity(reads.len());
     let mut stats = SeedBatchStats::default();
     let mut total_mins = 0;
-    for (block, mins, retries) in blocks {
+    for (block, mins, retries, rescues) in blocks {
         total_mins += mins;
         stats.adaptive_retries += retries;
+        stats.repeat_rescues += rescues;
         for (a, before, min_occ) in block {
             reads[anchors.len()].repeat_min_occ = min_occ;
             stats.anchors_before_prune += before;
@@ -171,20 +179,31 @@ pub fn run(input: SketchBatch, index: &Index, cfg: crate::seeding::SeedingConfig
 
     // Paired input is laid out R1, R2, R1, R2 …, so a chunk of two is one
     // template and both mates can inform each other.
-    let results: Vec<(SeedResult, usize)> = reads
+    let results: Vec<(SeedResult, usize, usize)> = reads
         .par_chunks(2)
         .zip(sketches.par_chunks(2))
         .map_init(ThreadCtx::default, |ctx, (read_pair, sketch_pair)| {
             let before = ctx.adaptive_retries;
+            let before_rescues = ctx.repeat_rescues;
             let [first, second] = seed_template(read_pair, sketch_pair, index, cfg, ctx);
-            [(first, ctx.adaptive_retries - before), (second, 0)]
+            [
+                (
+                    first,
+                    ctx.adaptive_retries - before,
+                    ctx.repeat_rescues - before_rescues,
+                ),
+                (second, 0, 0),
+            ]
         })
         .flatten()
         .collect();
 
     let mut anchors: Vec<Vec<Anchor>> = Vec::with_capacity(results.len());
-    for (i, ((a, before, min_occ), retries)) in results.into_iter().take(reads.len()).enumerate() {
+    for (i, ((a, before, min_occ), retries, rescues)) in
+        results.into_iter().take(reads.len()).enumerate()
+    {
         stats.adaptive_retries += retries;
+        stats.repeat_rescues += rescues;
         stats.anchors_before_prune += before;
         stats.anchors_after_prune += a.len();
         reads[i].repeat_min_occ = min_occ;
@@ -269,8 +288,8 @@ fn seed_template(
 }
 
 /// Give discarded-repeat reads one bounded retry when retained anchors cover
-/// less than half the query. Merge both passes so widening never drops a
-/// previously retained locus. Build-truncated buckets remain ineligible.
+/// less than half the query. Build-truncated buckets are then re-seeded with
+/// longer exact seeds. Every pass is merged so widening never drops a locus.
 fn seed_adaptive(
     read: &ReadRecord,
     sketch: &ReadSketch,
@@ -279,43 +298,56 @@ fn seed_adaptive(
     ctx: &mut ThreadCtx,
     hints: Option<&MateHints>,
 ) -> (Vec<Anchor>, usize, u32, bool) {
-    let (mut anchors, before, occ, discarded) = seed_one(read, sketch, index, cfg, ctx, hints);
-    if !discarded || read.seq.len() >= cfg.long_read_threshold {
+    let (mut anchors, mut before, occ, discarded) = seed_one(read, sketch, index, cfg, ctx, hints);
+    if !discarded || anchor_coverage(read.seq.len(), &anchors, ctx) * 2 >= read.seq.len() {
         return (anchors, before, occ, discarded);
     }
+
+    let mut occ = occ;
+    if read.seq.len() < cfg.long_read_threshold {
+        let table = &index.short;
+        let mut wider = cfg;
+        wider.max_occ = cfg.max_occ.saturating_mul(4).min(table.max_occ);
+        wider.max_hits_per_minimizer = cfg
+            .max_hits_per_minimizer
+            .saturating_mul(4)
+            .min(64)
+            .max(cfg.max_hits_per_minimizer);
+        if wider.max_occ > cfg.max_occ || wider.max_hits_per_minimizer > cfg.max_hits_per_minimizer
+        {
+            ctx.adaptive_retries += 1;
+            let (extra, extra_before, extra_occ, _) =
+                seed_one(read, sketch, index, wider, ctx, hints);
+            anchors.extend(extra);
+            sort_dedup_anchors(&mut anchors);
+            before += extra_before;
+            occ = occ.min(extra_occ);
+        }
+    }
+
+    if anchor_coverage(read.seq.len(), &anchors, ctx) * 2 < read.seq.len() {
+        let (extra, extra_before) = seed_repeat_rescue(read, sketch, index, cfg, ctx, hints);
+        if !extra.is_empty() {
+            ctx.repeat_rescues += 1;
+            anchors.extend(extra);
+            sort_dedup_anchors(&mut anchors);
+            before += extra_before;
+        }
+    }
+    (anchors, before, occ, discarded)
+}
+
+fn anchor_coverage(read_len: usize, anchors: &[Anchor], ctx: &mut ThreadCtx) -> usize {
     ctx.coverage.clear();
     ctx.coverage
         .extend(anchors.iter().map(|a| (a.read_start, a.read_end)));
     ctx.coverage.sort_unstable();
     let (mut end, mut covered) = (0, 0);
     for &(start, stop) in &ctx.coverage {
-        covered += stop.saturating_sub(end.max(start));
+        covered += stop.saturating_sub(end.max(start)) as usize;
         end = end.max(stop);
     }
-    if covered as usize * 2 >= read.seq.len() {
-        return (anchors, before, occ, discarded);
-    }
-    let table = &index.short;
-    let mut wider = cfg;
-    wider.max_occ = cfg.max_occ.saturating_mul(4).min(table.max_occ);
-    wider.max_hits_per_minimizer = cfg
-        .max_hits_per_minimizer
-        .saturating_mul(4)
-        .min(64)
-        .max(cfg.max_hits_per_minimizer);
-    if wider.max_occ <= cfg.max_occ && wider.max_hits_per_minimizer <= cfg.max_hits_per_minimizer {
-        return (anchors, before, occ, discarded);
-    }
-    ctx.adaptive_retries += 1;
-    let (extra, extra_before, extra_occ, _) = seed_one(read, sketch, index, wider, ctx, hints);
-    anchors.extend(extra);
-    sort_dedup_anchors(&mut anchors);
-    (
-        anchors,
-        before + extra_before,
-        occ.min(extra_occ),
-        discarded,
-    )
+    covered.min(read_len)
 }
 
 /// Occurrence cap the seeder applies to a table: the smaller of the run-time
@@ -325,6 +357,116 @@ fn seed_adaptive(
 #[inline]
 pub fn effective_max_occ(seeding_max_occ: usize, index_max_occ: usize) -> usize {
     seeding_max_occ.min(index_max_occ)
+}
+
+/// Re-seed only build-truncated primary buckets. Both the number of queried
+/// minimizers and occurrences per longer seed are bounded by index construction.
+fn seed_repeat_rescue(
+    read: &ReadRecord,
+    sketch: &ReadSketch,
+    index: &Index,
+    cfg: crate::seeding::SeedingConfig,
+    ctx: &mut ThreadCtx,
+    hints: Option<&MateHints>,
+) -> (Vec<Anchor>, usize) {
+    const MAX_MINIMIZERS: usize = 64;
+
+    let table = if read.seq.len() >= cfg.long_read_threshold {
+        &index.long
+    } else {
+        &index.short
+    };
+    let Some(extension) = index.repeat_rescue_extension(table) else {
+        return (Vec::new(), 0);
+    };
+    ctx.proto.clear();
+    ctx.merged.clear();
+    ctx.candidates.clear();
+    ctx.diag_counts.clear();
+    ctx.rc_ready = false;
+
+    let k = sketch.k as u32;
+    let proto_soft_limit = anchor_limit(read.seq.len(), sketch.k)
+        .saturating_mul(16)
+        .max(4096);
+    let take_per_seed = cfg.max_hits_per_minimizer.saturating_mul(4).clamp(1, 64);
+    let mut attempted = 0;
+    for m in &sketch.minimizers {
+        let Some((start, end)) = index.bucket(table, m.hash) else {
+            continue;
+        };
+        if end - start <= table.max_occ {
+            continue;
+        }
+        attempted += 1;
+        if attempted > MAX_MINIMIZERS {
+            break;
+        }
+        let Some(hash) =
+            crate::sketch::extended_minimizer_hash(&read.seq, m.pos, sketch.k, m.strand, extension)
+        else {
+            continue;
+        };
+        let Some((start, end)) = index.repeat_rescue_bucket(table, hash) else {
+            continue;
+        };
+        ctx.occs.clear();
+        for idx in start..end {
+            let occ = index
+                .repeat_rescue_occ_at(table, idx)
+                .expect("rescue bucket requires rescue index");
+            ctx.occs.push((occ.ref_id, occ.pos, occ.strand));
+        }
+        let take_n = take_per_seed.min(ctx.occs.len());
+        if take_n < ctx.occs.len() {
+            match (hints, cfg.mate_window) {
+                (Some(h), Some(window)) => {
+                    ctx.occs
+                        .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
+                            (
+                                !h.supports(*rid, *pos, window),
+                                occurrence_sample_key(hash, *rid, *pos, *strand),
+                            )
+                        });
+                }
+                _ => {
+                    ctx.occs
+                        .select_nth_unstable_by_key(take_n, |(rid, pos, strand)| {
+                            occurrence_sample_key(hash, *rid, *pos, *strand)
+                        });
+                }
+            }
+        }
+        for &(rid, pos, ref_strand) in &ctx.occs[..take_n] {
+            let (read_pos, strand, diag) = relative_seed_coordinates(
+                read.seq.len(),
+                sketch.k,
+                m.pos,
+                m.strand,
+                pos,
+                ref_strand,
+            );
+            ctx.proto.push(ProtoAnchor {
+                ref_id: rid,
+                strand,
+                diag,
+                read_start: read_pos,
+                read_end: read_pos + k,
+                ref_start: pos,
+                ref_end: pos + k,
+                hits: 1,
+            });
+        }
+        if ctx.proto.len() > proto_soft_limit {
+            compact_proto_anchors(
+                &mut ctx.proto,
+                &mut ctx.merged,
+                proto_soft_limit,
+                read.seq.len() as u64,
+            );
+        }
+    }
+    finish_anchors(read, index, sketch.k, cfg, ctx)
 }
 
 /// Seed one read. Returns its anchors, the pre-prune anchor count, the minimum
@@ -352,7 +494,6 @@ fn seed_one(
 
     // ranked/pruned seeding: limit each minimizer bucket to top-K occurrences
     let mins = &sketch.minimizers;
-    let read_len = read.seq.len() as u32;
     let k = sketch.k as u32;
 
     let n_mins = mins.len();
@@ -381,12 +522,15 @@ fn seed_one(
         };
         let bucket_len = end - start;
         if bucket_len >= 1 {
-            min_occ = min_occ.min(bucket_len as u32);
+            let true_count = ctx.ids_scratch[m_idx]
+                .and_then(|slot| index.bucket_count_at(table, slot))
+                .unwrap_or(bucket_len as u32);
+            min_occ = min_occ.min(true_count);
         }
         if bucket_len == 0 || bucket_len > max_occ {
-            // A build sentinel is incomplete and cannot become recoverable by
-            // raising run-time limits or consulting a mate.
-            truncated_any |= bucket_len > max_occ && bucket_len <= table.max_occ;
+            // A build sentinel remains ineligible for primary seeding; the flag
+            // makes it eligible for the separate longer-seed rescue pass.
+            truncated_any |= bucket_len > max_occ;
             continue;
         }
 
@@ -476,10 +620,23 @@ fn seed_one(
         }
     }
 
+    let (anchors, before) = finish_anchors(read, index, sketch.k, cfg, ctx);
+    let min_occ = if min_occ == u32::MAX { 0 } else { min_occ };
+    (anchors, before, min_occ, truncated_any)
+}
+
+fn finish_anchors(
+    read: &ReadRecord,
+    index: &Index,
+    k: usize,
+    cfg: crate::seeding::SeedingConfig,
+    ctx: &mut ThreadCtx,
+) -> (Vec<Anchor>, usize) {
     merge_exact_seed_runs(&mut ctx.proto, &mut ctx.merged);
     let before = ctx.merged.len();
     ctx.anchors_before_prune = before;
 
+    let read_len = read.seq.len() as u32;
     let read_len_salt = read.seq.len() as u64;
     for proto in ctx.merged.drain(..) {
         let score = proto
@@ -501,11 +658,11 @@ fn seed_one(
     // region. The short preset ships min_anchor_len=20 against k=19, so cap the
     // requirement at the k in use. `KIRA_ANCHOR_CAP_K=0` restores the old rule.
     let min_anchor_len = if anchor_cap_k() {
-        cfg.min_anchor_len.min(sketch.k as u32)
+        cfg.min_anchor_len.min(k as u32)
     } else {
         cfg.min_anchor_len
     };
-    let max_anchors_per_read = anchor_limit(read.seq.len(), sketch.k);
+    let max_anchors_per_read = anchor_limit(read.seq.len(), k);
     let max_anchors_per_diag = if read.seq.len() >= cfg.long_read_threshold {
         64
     } else {
@@ -547,13 +704,7 @@ fn seed_one(
         }
     }
     sort_dedup_anchors(&mut ctx.anchors);
-    let min_occ = if min_occ == u32::MAX { 0 } else { min_occ };
-    (
-        std::mem::take(&mut ctx.anchors),
-        before,
-        min_occ,
-        truncated_any,
-    )
+    (std::mem::take(&mut ctx.anchors), before)
 }
 
 fn sort_dedup_anchors(anchors: &mut Vec<Anchor>) {
@@ -740,6 +891,7 @@ struct ThreadCtx {
     sketches: [ReadSketch; 2],
     coverage: Vec<(u32, u32)>,
     adaptive_retries: usize,
+    repeat_rescues: usize,
     proto: Vec<ProtoAnchor>,
     merged: Vec<ProtoAnchor>,
     diag_counts: FxHashMap<(u32, Strand, i32), usize>,
@@ -963,8 +1115,8 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_retry_recovers_complete_repeat_buckets_but_not_build_sentinels() {
-        for (build_cap, recovered) in [(100, true), (2, false)] {
+    fn adaptive_retry_and_longer_seeds_recover_complete_and_truncated_repeats() {
+        for build_cap in [100, 2] {
             let (index, read, cfg, seed_cfg) = fixture(6, build_cap);
             let sketch = ReadSketch {
                 minimizers: crate::sketch::minimizers(
@@ -980,12 +1132,17 @@ mod tests {
             let mut ctx = ThreadCtx::default();
             let (initial, _, _, _) = seed_one(&read, &sketch, &index, seed_cfg, &mut ctx, None);
             assert!(initial.is_empty());
-            let (adaptive, _, _, _) =
+            let (adaptive, _, min_occ, _) =
                 seed_adaptive(&read, &sketch, &index, seed_cfg, &mut ctx, None);
-            assert_eq!(!adaptive.is_empty(), recovered);
-            if recovered {
-                assert_eq!(adaptive.len(), 6);
-                assert!(ctx.adaptive_retries > 0);
+            assert_eq!(adaptive.len(), 6, "build cap {build_cap}");
+            assert_eq!(min_occ, 6, "true repeat count, build cap {build_cap}");
+            assert!(ctx.adaptive_retries > 0);
+            assert!(
+                adaptive.iter().any(|a| a.ref_id == 5),
+                "rescue must recover occurrences omitted from primary postings"
+            );
+            if build_cap == 2 {
+                assert_eq!(ctx.repeat_rescues, 1);
             }
         }
     }

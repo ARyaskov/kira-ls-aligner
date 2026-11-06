@@ -25,7 +25,7 @@ pub struct IndexArgs {
     #[arg(short = 'w', long = "window-len")]
     pub window_len: Option<usize>,
 
-    /// Maximum occurrences recorded per minimizer.
+    /// Maximum primary occurrences per minimizer; denser buckets get longer-seed rescue.
     #[arg(long = "max-occ", default_value_t = 500)]
     pub max_occ: usize,
 
