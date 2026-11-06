@@ -76,3 +76,5 @@ desktop.ini
 
 target-profile/
 .claude/
+### Python bytecode ###
+__pycache__/
