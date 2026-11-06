@@ -11,6 +11,8 @@ use crate::types::{
     Alignment, CigarKind, CigarOp, MateInfo, PairRole, ReadRecord, RefBases, RefSeq, Reference,
 };
 
+pub(crate) mod binary;
+
 /// Load reference sequences from FASTA using mmap.
 pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
     let mut reader = open_fastx_reader(path)?.reader;
@@ -936,23 +938,7 @@ impl SamFormatter {
         extra_tags: Option<&[u8]>,
         append_comment: bool,
     ) {
-        let mut flag: u16 = 0x4;
-        if let Some(m) = mate {
-            if m.is_paired {
-                flag |= 0x1;
-            }
-            if m.mate_is_unmapped {
-                flag |= 0x8;
-            } else if m.mate_is_rev {
-                flag |= 0x20;
-            }
-            if m.is_first_in_pair {
-                flag |= 0x40;
-            }
-            if m.is_second_in_pair {
-                flag |= 0x80;
-            }
-        }
+        let (flag, placement) = unmapped_fields(mate);
 
         buf.extend_from_slice(read.id.as_bytes());
         buf.push(b'\t');
@@ -962,15 +948,15 @@ impl SamFormatter {
         // (SAM spec 2.4 recommended practice, as bwa-mem does) so it sorts
         // next to its mate and is returned by region queries; RNEXT is then
         // `=`. Otherwise RNAME='*' POS=0. MAPQ=0, CIGAR='*', TLEN=0 always.
-        match mate {
-            Some(m) if m.mate_ref_id.is_some() && !m.mate_is_unmapped => {
-                let mate_rname = &self.contigs.names[m.mate_ref_id.unwrap() as usize];
+        match placement {
+            Some((ref_id, pos)) => {
+                let mate_rname = &self.contigs.names[ref_id as usize];
                 buf.push(b'\t');
                 buf.extend_from_slice(mate_rname.as_bytes());
                 buf.push(b'\t');
-                push_u32(buf, m.mate_pos + 1);
+                push_u32(buf, pos + 1);
                 buf.extend_from_slice(b"\t0\t*\t=\t");
-                push_u32(buf, m.mate_pos + 1);
+                push_u32(buf, pos + 1);
                 buf.extend_from_slice(b"\t0\t");
             }
             _ => {
@@ -1006,12 +992,8 @@ impl SamFormatter {
         // bwa-mem hard-clips supplementary segments unless `-Y`: the clipped
         // bases become `H` and leave SEQ/QUAL, so a chimeric read's sequence is
         // stored once, on its primary record.
-        let hard_clip = aln.is_supplementary && !cfg.soft_clip_supplementary;
-        let (clip_lead, clip_trail) = if hard_clip {
-            terminal_softclips(&aln.cigar)
-        } else {
-            (0, 0)
-        };
+        let seq_len = read.seq.len();
+        let (hard_clip, keep) = alignment_clip(aln, seq_len, cfg);
 
         buf.extend_from_slice(read.id.as_bytes());
         buf.push(b'\t');
@@ -1026,29 +1008,19 @@ impl SamFormatter {
         append_cigar_for_seq(buf, &aln.cigar, read.seq.len() as u32, hard_clip);
 
         // RNEXT / PNEXT / TLEN — non-trivial only when paired.
-        if aln.mate.is_paired {
-            match aln.mate.mate_ref_id {
-                Some(mate_ref_id) if !aln.mate.mate_is_unmapped => {
-                    buf.push(b'\t');
-                    // SAM convention: emit '=' when RNEXT == RNAME.
-                    if mate_ref_id == aln.ref_id {
-                        buf.push(b'=');
-                    } else {
-                        let mate_rname = &self.contigs.names[mate_ref_id as usize];
-                        buf.extend_from_slice(mate_rname.as_bytes());
-                    }
-                    buf.push(b'\t');
-                    push_u32(buf, aln.mate.mate_pos + 1);
-                    buf.push(b'\t');
-                    push_i32(buf, aln.mate.tlen);
-                    buf.push(b'\t');
-                }
-                _ => {
-                    buf.extend_from_slice(b"\t=\t");
-                    push_u32(buf, pos);
-                    buf.extend_from_slice(b"\t0\t");
-                }
+        let (mate_position, tlen) = mapped_mate_fields(aln);
+        if let Some((mate_ref_id, mate_pos)) = mate_position {
+            buf.push(b'\t');
+            if mate_ref_id == aln.ref_id {
+                buf.push(b'=');
+            } else {
+                buf.extend_from_slice(self.contigs.names[mate_ref_id as usize].as_bytes());
             }
+            buf.push(b'\t');
+            push_u32(buf, mate_pos + 1);
+            buf.push(b'\t');
+            push_i32(buf, tlen);
+            buf.push(b'\t');
         } else {
             buf.extend_from_slice(b"\t*\t0\t0\t");
         }
@@ -1056,9 +1028,7 @@ impl SamFormatter {
         // SEQ/QUAL in reference orientation, minus the hard-clipped ends.
         // `clip_lead` counts from the CIGAR's start, which is the start of
         // the *oriented* sequence, so the trim applies after orientation.
-        let seq_len = read.seq.len();
-        let keep_end = seq_len.saturating_sub(clip_trail as usize);
-        let keep_start = (clip_lead as usize).min(keep_end);
+        let (keep_start, keep_end) = (keep.start, keep.end);
         if keep_start == keep_end {
             buf.push(b'*');
         } else if aln.is_rev {
@@ -1077,37 +1047,28 @@ impl SamFormatter {
             None => buf.push(b'*'),
         }
 
-        if cfg.write_nm {
-            buf.extend_from_slice(b"\tNM:i:");
-            push_u32(buf, aln.nm);
-        }
-        if cfg.write_md {
-            buf.extend_from_slice(b"\tMD:Z:");
-            buf.extend_from_slice(aln.md.as_bytes());
-        }
-        if cfg.write_as {
-            buf.extend_from_slice(b"\tAS:i:");
-            push_i32(buf, aln.as_score);
-        }
-        if cfg.write_xs
-            && let Some(xs) = aln.xs_score
-        {
-            buf.extend_from_slice(b"\tXS:i:");
-            push_i32(buf, xs);
-        }
-        if let Some(strand) = aln.xs_strand {
-            buf.extend_from_slice(b"\tXS:A:");
-            buf.push(match strand {
-                crate::types::Strand::Forward => b'+',
-                crate::types::Strand::Reverse => b'-',
-            });
-        }
-        if cfg.write_rg
-            && let Some(rg) = read_group
-        {
-            buf.extend_from_slice(b"\tRG:Z:");
-            buf.extend_from_slice(extract_rg_id(rg).as_bytes());
-        }
+        alignment_tags(aln, read_group, cfg, |tag, value| {
+            buf.push(b'\t');
+            buf.extend_from_slice(&tag);
+            match value {
+                AlignmentTag::Unsigned(n) => {
+                    buf.extend_from_slice(b":i:");
+                    push_u32(buf, n);
+                }
+                AlignmentTag::Signed(n) => {
+                    buf.extend_from_slice(b":i:");
+                    push_i32(buf, n);
+                }
+                AlignmentTag::Text(text) => {
+                    buf.extend_from_slice(b":Z:");
+                    buf.extend_from_slice(text);
+                }
+                AlignmentTag::Char(c) => {
+                    buf.extend_from_slice(b":A:");
+                    buf.push(c);
+                }
+            }
+        });
         if let Some(extra) = extra_tags {
             buf.extend_from_slice(extra);
         }
@@ -1130,6 +1091,25 @@ impl SamFormatter {
         alignments: &[Alignment],
         xa_max: u32,
     ) -> bool {
+        self.append_xa_with_prefix(buf, alignments, xa_max, b"\tXA:Z:")
+    }
+
+    pub(crate) fn append_xa_value(
+        &self,
+        buf: &mut Vec<u8>,
+        alignments: &[Alignment],
+        xa_max: u32,
+    ) -> bool {
+        self.append_xa_with_prefix(buf, alignments, xa_max, b"")
+    }
+
+    fn append_xa_with_prefix(
+        &self,
+        buf: &mut Vec<u8>,
+        alignments: &[Alignment],
+        xa_max: u32,
+        prefix: &[u8],
+    ) -> bool {
         if alignments.len() <= 1 {
             return false;
         }
@@ -1141,7 +1121,7 @@ impl SamFormatter {
         if n_secondary == 0 || n_secondary as u32 > xa_max {
             return false;
         }
-        buf.extend_from_slice(b"\tXA:Z:");
+        buf.extend_from_slice(prefix);
         for aln in alignments.iter().skip(1).filter(|a| !a.is_supplementary) {
             let rname = &self.contigs.names[aln.ref_id as usize];
             buf.extend_from_slice(rname.as_bytes());
@@ -1253,16 +1233,28 @@ impl SamFormatter {
     /// 1.5; SV callers read `SA` on the 0x800 records). Secondaries are not
     /// segments of the chimera and are skipped.
     pub fn append_sa(&self, buf: &mut Vec<u8>, alignments: &[Alignment], self_idx: usize) -> bool {
-        let mut added = false;
+        let start = buf.len();
+        buf.extend_from_slice(b"\tSA:Z:");
+        if self.append_sa_value(buf, alignments, self_idx) {
+            true
+        } else {
+            buf.truncate(start);
+            false
+        }
+    }
+
+    pub(crate) fn append_sa_value(
+        &self,
+        buf: &mut Vec<u8>,
+        alignments: &[Alignment],
+        self_idx: usize,
+    ) -> bool {
+        let start = buf.len();
         for (_, aln) in alignments
             .iter()
             .enumerate()
             .filter(|(idx, a)| *idx != self_idx && (*idx == 0 || a.is_supplementary))
         {
-            if !added {
-                buf.extend_from_slice(b"\tSA:Z:");
-                added = true;
-            }
             let rname = &self.contigs.names[aln.ref_id as usize];
             buf.extend_from_slice(rname.as_bytes());
             buf.push(b',');
@@ -1277,7 +1269,101 @@ impl SamFormatter {
             push_u32(buf, aln.nm);
             buf.push(b';');
         }
-        added
+        buf.len() > start
+    }
+}
+
+fn unmapped_fields(mate: Option<&MateInfo>) -> (u16, Option<(u32, u32)>) {
+    let mut flag = 0x4;
+    let Some(mate) = mate else {
+        return (flag, None);
+    };
+    if mate.is_paired {
+        flag |= 0x1;
+    }
+    if mate.mate_is_unmapped {
+        flag |= 0x8;
+    } else if mate.mate_is_rev {
+        flag |= 0x20;
+    }
+    if mate.is_first_in_pair {
+        flag |= 0x40;
+    }
+    if mate.is_second_in_pair {
+        flag |= 0x80;
+    }
+    let placement = mate
+        .mate_ref_id
+        .filter(|_| !mate.mate_is_unmapped)
+        .map(|id| (id, mate.mate_pos));
+    (flag, placement)
+}
+
+fn mapped_mate_fields(aln: &Alignment) -> (Option<(u32, u32)>, i32) {
+    if !aln.mate.is_paired {
+        return (None, 0);
+    }
+    match aln.mate.mate_ref_id {
+        Some(id) if !aln.mate.mate_is_unmapped => (Some((id, aln.mate.mate_pos)), aln.mate.tlen),
+        _ => (Some((aln.ref_id, aln.ref_start)), 0),
+    }
+}
+
+fn alignment_clip(
+    aln: &Alignment,
+    seq_len: usize,
+    cfg: OutputConfig,
+) -> (bool, std::ops::Range<usize>) {
+    let hard_clip = aln.is_supplementary && !cfg.soft_clip_supplementary;
+    let (lead, trail) = if hard_clip {
+        terminal_softclips(&aln.cigar)
+    } else {
+        (0, 0)
+    };
+    let end = seq_len.saturating_sub(trail as usize);
+    (hard_clip, (lead as usize).min(end)..end)
+}
+
+enum AlignmentTag<'a> {
+    Unsigned(u32),
+    Signed(i32),
+    Text(&'a [u8]),
+    Char(u8),
+}
+
+fn alignment_tags(
+    aln: &Alignment,
+    read_group: Option<&str>,
+    cfg: OutputConfig,
+    mut tag: impl FnMut([u8; 2], AlignmentTag<'_>),
+) {
+    if cfg.write_nm {
+        tag(*b"NM", AlignmentTag::Unsigned(aln.nm));
+    }
+    if cfg.write_md {
+        tag(*b"MD", AlignmentTag::Text(aln.md.as_bytes()));
+    }
+    if cfg.write_as {
+        tag(*b"AS", AlignmentTag::Signed(aln.as_score));
+    }
+    if cfg.write_xs
+        && let Some(xs) = aln.xs_score
+    {
+        tag(*b"XS", AlignmentTag::Signed(xs));
+    }
+    if let Some(strand) = aln.xs_strand {
+        tag(
+            *b"XS",
+            AlignmentTag::Char(match strand {
+                crate::types::Strand::Forward => b'+',
+                crate::types::Strand::Reverse => b'-',
+            }),
+        );
+    }
+    if cfg.write_rg
+        && let Some(rg) = read_group
+    {
+        tag(*b"RG", AlignmentTag::Text(extract_rg_id(rg).as_bytes()));
     }
 }
 
@@ -1487,6 +1573,10 @@ fn append_cigar(buf: &mut Vec<u8>, ops: &[CigarOp]) {
         buf.push(b'*');
         return;
     }
+    append_cigar_ops(buf, ops);
+}
+
+pub(crate) fn append_cigar_ops(buf: &mut Vec<u8>, ops: &[CigarOp]) {
     for op in ops {
         push_u32(buf, op.len);
         buf.push(match op.op {
@@ -1522,25 +1612,15 @@ fn cigar_query_consumed(ops: &[CigarOp]) -> u32 {
 /// supplementary convention); the consumed-length check still runs against
 /// the soft-clipped form, since that is what the aligner produced.
 fn append_cigar_for_seq(buf: &mut Vec<u8>, ops: &[CigarOp], seq_len: u32, hard_clip: bool) {
-    let consumed = cigar_query_consumed(ops);
-    if consumed != seq_len {
-        debug_assert_eq!(
-            consumed, seq_len,
-            "alignment CIGAR consumes {consumed} query bases, expected {seq_len}"
-        );
-        buf.push(b'*');
-        return;
-    }
+    let ops = checked_cigar(ops, seq_len);
     if !hard_clip || ops.is_empty() {
         append_cigar(buf, ops);
         return;
     }
-    let last = ops.len() - 1;
     for (i, op) in ops.iter().enumerate() {
         push_u32(buf, op.len);
-        let terminal_clip = op.op == CigarKind::SoftClip && (i == 0 || i == last);
         buf.push(match op.op {
-            CigarKind::SoftClip if terminal_clip => b'H',
+            CigarKind::SoftClip if terminal_cigar_op(i, ops.len()) => b'H',
             CigarKind::Match => b'M',
             CigarKind::Ins => b'I',
             CigarKind::Del => b'D',
@@ -1548,6 +1628,22 @@ fn append_cigar_for_seq(buf: &mut Vec<u8>, ops: &[CigarOp], seq_len: u32, hard_c
             CigarKind::Skipped => b'N',
         });
     }
+}
+
+fn checked_cigar(ops: &[CigarOp], seq_len: u32) -> &[CigarOp] {
+    let consumed = cigar_query_consumed(ops);
+    if consumed != seq_len {
+        debug_assert_eq!(
+            consumed, seq_len,
+            "alignment CIGAR consumes {consumed} query bases, expected {seq_len}"
+        );
+        return &[];
+    }
+    ops
+}
+
+fn terminal_cigar_op(i: usize, len: usize) -> bool {
+    i == 0 || i + 1 == len
 }
 
 /// Build a SAM bitwise FLAG from an Alignment. With bwa-mem `-M`

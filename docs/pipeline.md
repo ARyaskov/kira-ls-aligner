@@ -70,9 +70,8 @@ see the README knob table for the GIAB trade-off).
 ## Fused binary output (`--emit bam | sorted-bam | cram | sorted-cram`)
 
 `src/cli/commands/emit.rs` drives the pipeline through `Aligner::align_streaming`
-and hands each scored batch, serialised by stage 6, to a converter thread that
-parses the SAM text into kira-bam records in parallel (line-aligned chunks on
-the rayon pool). Unsorted output streams straight into kira-bam's multi-threaded
+and hands each scored batch to a converter thread that builds kira-bam records
+directly in parallel on the rayon pool. Unsorted output streams into kira-bam's multi-threaded
 BGZF (or CRAM) writer. Sorted output collects records up to `--sort-memory`,
 then runs kira-bam's in-memory coordinate sort with fused markdup and writes
 once; past the budget everything collected so far is spilled to an unsorted

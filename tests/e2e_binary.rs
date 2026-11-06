@@ -14,6 +14,78 @@ use std::process::{Command, Stdio};
 
 use common::*;
 
+#[test]
+fn binary_formats_preserve_primary_placements() -> anyhow::Result<()> {
+    use kira_bam::io::BamReader;
+    use noodles_sam::{self as sam, alignment::RecordBuf};
+
+    let ds = build_dataset("direct_emit", &SimParams::default());
+    let reads = [&*ds.r1, &*ds.r2];
+    let text = run_mem(
+        &ds.reference,
+        &reads,
+        &ds.dir.join("expected.sam"),
+        &["-x", "short", "-t", "2", "--no-PG"],
+    );
+    let key = |record: &RecordBuf| {
+        (
+            record.name().map(|name| name.to_vec()),
+            record.flags().bits(),
+            record.reference_sequence_id(),
+            record.alignment_start(),
+            record.mate_reference_sequence_id(),
+            record.mate_alignment_start(),
+            record.template_length(),
+        )
+    };
+    let mut sam = sam::io::Reader::new(text.as_bytes());
+    let header = sam.read_header()?;
+    let expected = sam
+        .record_bufs(&header)
+        .map(|record| record.map(|r| key(&r)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort_unstable();
+
+    for (format, suffix, sort_memory) in [
+        ("bam", "bam", "auto"),
+        ("cram", "cram", "auto"),
+        ("sorted-bam", "bam", "64K"),
+        ("sorted-cram", "cram", "auto"),
+    ] {
+        let output = ds.dir.join(&format!("{format}.{suffix}"));
+        run_bin(&mem_args(
+            &ds.reference,
+            &reads,
+            &output,
+            &[
+                "-x",
+                "short",
+                "-t",
+                "2",
+                "--no-PG",
+                "--emit",
+                format,
+                "--sort-memory",
+                sort_memory,
+            ],
+        ));
+        let mut reader = BamReader::open_with_reference(&output, Some(&ds.reference))?;
+        let mut record = RecordBuf::default();
+        let mut actual = Vec::new();
+        while reader.read_record_buf(&mut record)? {
+            actual.push(key(&record));
+        }
+        if format.starts_with("sorted") {
+            actual.sort_unstable();
+            assert_eq!(actual, expected_sorted, "{format}");
+        } else {
+            assert_eq!(actual, expected, "{format}");
+        }
+    }
+    Ok(())
+}
+
 /// Placement tolerance around the truth start, in bp.
 const POS_TOLERANCE: i64 = 5;
 /// Minimum fraction of reads that must land on the truth locus.

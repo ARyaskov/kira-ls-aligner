@@ -43,7 +43,7 @@ kira_kv_engine = { version = "0.8.1", default-features = true }
 
 kira-bam = "0.4.0"
 # Same noodles-sam line kira-bam 0.4.0 builds on, so the `RecordBuf` the fused
-# `--emit bam` path parses is the type kira-bam's sort/markdup/writer take.
+# `--emit bam` path builds is the type kira-bam's sort/markdup/writer take.
 noodles-sam = "0.85"
 # gzip/BGZF sniffing on `-` (stdin) reads; file inputs go through kira-fastq.
 flate2 = "1"

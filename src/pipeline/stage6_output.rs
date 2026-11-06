@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use noodles_sam::alignment::RecordBuf;
 use rayon::prelude::*;
 
-use crate::io::{EmitFormat, OutputConfig, SamFormatter, SamWriter};
-use crate::types::{PairRole, ReadRecord};
+use crate::io::{EmitFormat, OutputConfig, SamFormatter, SamWriter, append_cigar_ops, binary};
+use crate::types::{Alignment, PairRole, ReadRecord};
 
 use super::stage5_scoring::ScoredBatch;
 
@@ -196,14 +197,108 @@ pub fn serialize_into(
     }
 }
 
-/// `\tMC:Z:<cigar>\tMQ:i:<mapq>\tms:i:<AS>` for read `i`'s mate, when the
-/// mate is the adjacent slot and has a primary alignment. These are the tags
-/// `samtools fixmate -m` derives, and `samtools markdup` keys on `MC`/`ms`.
+/// Build writer records in input order without serializing the batch to SAM.
+pub(crate) fn binary_records(
+    input: ScoredBatch,
+    formatter: &SamFormatter,
+    read_group: Option<&str>,
+    cfg: OutputConfig,
+    max_alignments: usize,
+) -> Result<Vec<RecordBuf>> {
+    const CHUNK_SIZE: usize = 128;
+    let chunks: Result<Vec<Vec<RecordBuf>>> = input
+        .reads
+        .par_chunks(CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk, reads)| {
+            let mut records = Vec::with_capacity(reads.len());
+            for (offset, read) in reads.iter().enumerate() {
+                let i = chunk * CHUNK_SIZE + offset;
+                let alns = &input.alignments[i];
+                let mate = cfg
+                    .write_mate_tags
+                    .then(|| mate_primary(&input.reads, &input.alignments, i))
+                    .flatten();
+                let comment = if cfg.append_comment {
+                    read.comment
+                        .as_deref()
+                        .map(binary::parse_comment)
+                        .transpose()
+                        .with_context(|| format!("read {}", read.id))?
+                } else {
+                    None
+                };
+                if alns.is_empty() {
+                    let mut record = binary::unmapped(read, input.unmapped_mate_info[i].as_ref())?;
+                    if let Some(mate) = mate {
+                        binary::mate_tags(&mut record, mate);
+                    }
+                    if let Some(comment) = &comment {
+                        binary::append_comment(&mut record, comment)?;
+                    }
+                    records.push(record);
+                    continue;
+                }
+
+                let mut report = alignment_report_filter(max_alignments);
+                for (idx, aln) in alns.iter().enumerate().filter(|(_, aln)| report(aln)) {
+                    let mut record = binary::mapped(read, aln, read_group, cfg)?;
+                    if idx == 0 && cfg.write_xa && alns.len() > 1 {
+                        let mut xa = Vec::new();
+                        if formatter.append_xa_value(&mut xa, alns, cfg.xa_max) {
+                            binary::string_tag(&mut record, *b"XA", xa);
+                        }
+                    }
+                    if idx == 0 || aln.is_supplementary {
+                        if cfg.write_sa && alns.len() > 1 {
+                            let mut sa = Vec::new();
+                            if formatter.append_sa_value(&mut sa, alns, idx) {
+                                binary::string_tag(&mut record, *b"SA", sa);
+                            }
+                        }
+                        if let Some(mate) = mate {
+                            binary::mate_tags(&mut record, mate);
+                        }
+                    }
+                    if let Some(comment) = &comment {
+                        binary::append_comment(&mut record, comment)?;
+                    }
+                    records.push(record);
+                }
+            }
+            Ok(records)
+        })
+        .collect();
+    let chunks = chunks?;
+    let mut records = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+    for chunk in chunks {
+        records.extend(chunk);
+    }
+    Ok(records)
+}
+
+/// The `MC`, `MQ` and `ms` SAM fields derived from the mate's primary alignment.
 fn mate_tag_bytes(
     reads: &[ReadRecord],
-    alignments: &[Vec<crate::types::Alignment>],
+    alignments: &[Vec<Alignment>],
     i: usize,
 ) -> Option<Vec<u8>> {
+    let primary = mate_primary(reads, alignments, i)?;
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(b"\tMC:Z:");
+    append_cigar_ops(&mut out, &primary.cigar);
+    out.extend_from_slice(b"\tMQ:i:");
+    out.extend_from_slice(primary.mapq.to_string().as_bytes());
+    out.extend_from_slice(b"\tms:i:");
+    out.extend_from_slice(primary.as_score.to_string().as_bytes());
+    Some(out)
+}
+
+fn mate_primary<'a>(
+    reads: &[ReadRecord],
+    alignments: &'a [Vec<Alignment>],
+    i: usize,
+) -> Option<&'a Alignment> {
     let mate_idx = match reads[i].pair_role {
         PairRole::R1 => i + 1,
         PairRole::R2 => i.checked_sub(1)?,
@@ -217,33 +312,26 @@ fn mate_tag_bytes(
     if mate.pair_role != expected {
         return None;
     }
-    let primary = alignments[mate_idx].first()?;
-    let mut out = Vec::with_capacity(48);
-    out.extend_from_slice(b"\tMC:Z:");
-    for op in &primary.cigar {
-        use std::io::Write as _;
-        let _ = write!(out, "{op}");
-    }
-    out.extend_from_slice(b"\tMQ:i:");
-    out.extend_from_slice(primary.mapq.to_string().as_bytes());
-    out.extend_from_slice(b"\tms:i:");
-    out.extend_from_slice(primary.as_score.to_string().as_bytes());
-    Some(out)
+    alignments[mate_idx].first()
 }
 
 fn retain_reported_alignments(
     alignments: &mut Vec<crate::types::Alignment>,
     max_alignments: usize,
 ) {
+    alignments.retain(alignment_report_filter(max_alignments));
+}
+
+fn alignment_report_filter(max_alignments: usize) -> impl FnMut(&Alignment) -> bool {
     let mut primary_or_secondary = 0usize;
-    alignments.retain(|aln| {
-        if aln.is_supplementary {
+    move |aln| {
+        if max_alignments == 0 || aln.is_supplementary {
             return true;
         }
         let keep = primary_or_secondary < max_alignments;
         primary_or_secondary += 1;
         keep
-    });
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +397,109 @@ mod tests {
         assert_eq!(alignments.len(), 2);
         assert!(!alignments[0].is_supplementary);
         assert!(alignments[1].is_supplementary);
+    }
+
+    #[test]
+    fn binary_records_match_parsed_sam() -> Result<()> {
+        use crate::types::Strand;
+        use noodles_sam as sam;
+
+        let header_text = b"@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr2\tLN:1000\n";
+        let header = sam::io::Reader::new(&header_text[..]).read_header()?;
+        let formatter = SamFormatter::from_catalog(std::sync::Arc::new(crate::io::ContigCatalog {
+            names: vec!["chr1".into(), "chr2".into()],
+            lens: vec![1000, 1000],
+        }));
+        let mut r1 = ReadRecord::new_unpaired(
+            "pair".into(),
+            b"ACGTAACCTG".to_vec(),
+            Some(b"ABCDEFGHIJ".to_vec()),
+        );
+        r1.pair_role = PairRole::R1;
+        r1.comment = Some("BC:Z:ACGT\tFI:i:1\tXY:B:c,-2,3".into());
+        let mut r2 = r1.clone();
+        r2.pair_role = PairRole::R2;
+        r2.comment = Some("BC:Z:ACGT\tFI:i:2".into());
+        let fasta = ReadRecord::new_unpaired("fasta".into(), b"ACGTAACCTG".to_vec(), None);
+        let mut primary = alignment(100, false);
+        primary.mapq = 42;
+        primary.is_rev = true;
+        primary.xs_score = Some(80);
+        primary.mate = MateInfo {
+            is_paired: true,
+            mate_is_unmapped: true,
+            is_first_in_pair: true,
+            ..MateInfo::default()
+        };
+        let mut secondary = alignment(80, false);
+        secondary.ref_id = 1;
+        secondary.ref_start = 12;
+        secondary.mate = primary.mate;
+        let mut supp = alignment(60, true);
+        supp.is_rev = true;
+        supp.ref_id = 1;
+        supp.xs_strand = Some(Strand::Reverse);
+        supp.mate = primary.mate;
+        supp.cigar = vec![
+            CigarOp {
+                len: 2,
+                op: CigarKind::SoftClip,
+            },
+            CigarOp {
+                len: 3,
+                op: CigarKind::Match,
+            },
+            CigarOp {
+                len: 77,
+                op: CigarKind::Skipped,
+            },
+            CigarOp {
+                len: 4,
+                op: CigarKind::Match,
+            },
+            CigarOp {
+                len: 1,
+                op: CigarKind::SoftClip,
+            },
+        ];
+        let mut other = alignment(100, false);
+        other.mate = MateInfo {
+            is_paired: true,
+            is_proper_pair: true,
+            mate_ref_id: Some(1),
+            mate_pos: 123,
+            tlen: -250,
+            ..MateInfo::default()
+        };
+        let input = ScoredBatch {
+            reads: vec![r1, r2, fasta],
+            alignments: vec![vec![primary, secondary, supp], vec![], vec![other]],
+            unmapped_mate_info: vec![
+                None,
+                Some(MateInfo {
+                    is_paired: true,
+                    is_second_in_pair: true,
+                    mate_is_rev: true,
+                    mate_ref_id: Some(0),
+                    ..MateInfo::default()
+                }),
+                None,
+            ],
+            stats: Default::default(),
+        };
+        let rg = Some("@RG\tID:group\tSM:sample");
+        for (mut cfg, max_alignments) in [(OutputConfig::full(), 1), (OutputConfig::fast(), 0)] {
+            cfg.append_comment = true;
+            cfg.soft_clip_supplementary = max_alignments == 0;
+            cfg.split_as_secondary = max_alignments == 0;
+            let sam_text = serialize(input.clone(), &formatter, rg, cfg, max_alignments);
+            let mut reader = sam::io::Reader::new(sam_text.as_slice());
+            let expected = reader
+                .record_bufs(&header)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let actual = binary_records(input.clone(), &formatter, rg, cfg, max_alignments)?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 }

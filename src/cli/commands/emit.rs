@@ -1,9 +1,7 @@
 //! Fused binary output for `--emit bam | sorted-bam | cram | sorted-cram`.
 //!
-//! Alignment batches leave the pipeline as SAM text — the one formatter that
-//! knows every tag — and are parsed straight into kira-bam records, in
-//! parallel, on a converter thread that overlaps the next batch's alignment.
-//! Nothing is written to disk except the final file:
+//! The converter builds kira-bam records directly from scored batches in
+//! parallel, overlapping the next batch's alignment.
 //!
 //! * `bam` / `cram` go through kira-bam's writer as they arrive
 //!   (multi-threaded BGZF for BAM);
@@ -30,8 +28,8 @@ use sam::alignment::RecordBuf;
 
 use crate::aligner_core::Aligner;
 use crate::index::Index;
-use crate::io::SamFormatter;
-use crate::pipeline::stage6_output;
+use crate::io::{ContigCatalog, OutputConfig, SamFormatter, binary::estimated_record_bytes};
+use crate::pipeline::{stage5_scoring::ScoredBatch, stage6_output};
 
 /// Which fused output was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,12 +83,6 @@ pub struct EmitOptions {
     pub no_pg: bool,
 }
 
-/// Bytes of RAM one SAM byte becomes as a decoded `RecordBuf` — sequence and
-/// qualities stay one byte per base, but name, CIGAR and tags gain the
-/// container overhead. Generous on purpose: overshooting the budget is a
-/// slower finish, undershooting it is an OOM.
-const RECORD_BYTES_PER_SAM_BYTE: usize = 2;
-
 /// `--sort-memory auto`: a quarter of RAM, never below this.
 const AUTO_SORT_MIN_BYTES: usize = 512 << 20;
 
@@ -126,20 +118,35 @@ pub fn run_fused(
         plain_header.clone()
     };
 
-    // The parse/encode work below runs on rayon's global pool; the aligner
+    // Record construction and encoding run on rayon's global pool; the aligner
     // keeps its own pools. Ignoring the error keeps a pool an embedding
     // program already installed.
     kira_bam::io::install_thread_pool(opts.threads);
 
-    let formatter = SamFormatter::new(Arc::new(index.reference.clone()));
-    let output_cfg = cfg.pipeline.output;
-    let max_alignments = cfg.pipeline.max_alignments;
-    let read_group = cfg.read_group.clone();
-
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(2);
+    let formatter =
+        SamFormatter::from_catalog(Arc::new(ContigCatalog::from_reference(&index.reference)));
+    anyhow::ensure!(
+        formatter
+            .contigs()
+            .names
+            .iter()
+            .enumerate()
+            .all(|(id, name)| {
+                plain_header
+                    .reference_sequences()
+                    .get_index(id)
+                    .is_some_and(|(key, _)| key.as_slice() == name.as_bytes())
+            }),
+        "reference order in binary header does not match the index"
+    );
+    let (tx, rx) = mpsc::sync_channel::<ScoredBatch>(2);
     let conv = Converter {
         plain_header,
         sorted_header,
+        formatter,
+        output_cfg: cfg.pipeline.output,
+        max_alignments: cfg.pipeline.max_alignments,
+        read_group: cfg.read_group.clone(),
         opts,
     };
     let handle = thread::Builder::new()
@@ -147,18 +154,8 @@ pub fn run_fused(
         .spawn(move || conv.run(rx))
         .context("spawn emit converter thread")?;
 
-    let mut buf: Vec<u8> = Vec::new();
     let drive = aligner.align_streaming(index, reads, |scored| {
-        stage6_output::serialize_into(
-            scored,
-            &formatter,
-            read_group.as_deref(),
-            output_cfg,
-            max_alignments,
-            &mut buf,
-        );
-        let out = std::mem::take(&mut buf);
-        tx.send(out)
+        tx.send(scored)
             .map_err(|_| anyhow::anyhow!("emit converter thread stopped early"))
     });
     drop(tx);
@@ -218,6 +215,10 @@ enum Sink {
 struct Converter {
     plain_header: sam::Header,
     sorted_header: sam::Header,
+    formatter: SamFormatter,
+    output_cfg: OutputConfig,
+    max_alignments: usize,
+    read_group: Option<String>,
     opts: EmitOptions,
 }
 
@@ -247,7 +248,7 @@ impl Converter {
         .with_context(|| format!("create {}", self.opts.output.display()))
     }
 
-    fn run(self, rx: mpsc::Receiver<Vec<u8>>) -> Result<Finished> {
+    fn run(self, rx: mpsc::Receiver<ScoredBatch>) -> Result<Finished> {
         let kind = self.opts.kind;
         let mut sink = if kind.is_sorted() {
             let budget = kira_bam::io::resolve_memory_hint(
@@ -268,11 +269,15 @@ impl Converter {
             Sink::Stream(w)
         };
 
-        while let Ok(bytes) = rx.recv() {
-            if bytes.is_empty() {
-                continue;
-            }
-            let recs = parse_records(&self.plain_header, &bytes)?;
+        while let Ok(batch) = rx.recv() {
+            let recs = stage6_output::binary_records(
+                batch,
+                &self.formatter,
+                self.read_group.as_deref(),
+                self.output_cfg,
+                self.max_alignments,
+            )
+            .context("build BAM/CRAM records")?;
             match &mut sink {
                 Sink::Stream(w) => write_records(w, &recs, kind.format())?,
                 Sink::Spilled { writer, .. } => write_records(writer, &recs, OutputFormat::Bam)?,
@@ -281,7 +286,8 @@ impl Converter {
                     est_bytes,
                     budget,
                 } => {
-                    *est_bytes += bytes.len() * RECORD_BYTES_PER_SAM_BYTE;
+                    *est_bytes =
+                        est_bytes.saturating_add(recs.iter().map(estimated_record_bytes).sum());
                     records.extend(recs);
                     if *est_bytes > *budget {
                         crate::kira_warn!(
@@ -454,54 +460,6 @@ fn set_sort_order(text: &[u8], so: &str) -> Vec<u8> {
         first = false;
     }
     out
-}
-
-/// Parse a batch of SAM record lines into records, in line-aligned chunks
-/// across the rayon pool. The header is only needed for reference-name
-/// resolution.
-fn parse_records(header: &sam::Header, bytes: &[u8]) -> Result<Vec<RecordBuf>> {
-    let n_chunks = (rayon::current_num_threads() * 2).max(1);
-    let target = bytes.len().div_ceil(n_chunks).max(1);
-    let mut bounds = Vec::with_capacity(n_chunks + 1);
-    bounds.push(0usize);
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let mut end = (cursor + target).min(bytes.len());
-        if end < bytes.len() {
-            match bytes[end..].iter().position(|&b| b == b'\n') {
-                Some(nl) => end += nl + 1,
-                None => end = bytes.len(),
-            }
-        }
-        bounds.push(end);
-        cursor = end;
-    }
-    let chunks: Vec<Result<Vec<RecordBuf>>> = bounds
-        .windows(2)
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|w| {
-            let slice = &bytes[w[0]..w[1]];
-            let mut reader = sam::io::Reader::new(slice);
-            let mut out = Vec::with_capacity(slice.len() / 300 + 1);
-            let mut rec = RecordBuf::default();
-            loop {
-                let n = reader
-                    .read_record_buf(header, &mut rec)
-                    .context("parse SAM record")?;
-                if n == 0 {
-                    break;
-                }
-                out.push(std::mem::take(&mut rec));
-            }
-            Ok(out)
-        })
-        .collect();
-    let mut all = Vec::new();
-    for c in chunks {
-        all.extend(c?);
-    }
-    Ok(all)
 }
 
 /// Write records: pre-encoded in parallel and streamed through BGZF for BAM,
