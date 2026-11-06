@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+GIAB HG002 chr20 (PE 30x, kira-bt 0.8.0 mpileup, defaults): SNP F1 0.9909 -> 0.9911, INDEL F1 0.8767 -> 0.8790 (+41 TP, -5 FP) versus 0.5.0; the kira-solid production profile shows the same gain.
+
 Breaking: `SeedBatchStats` gained `adaptive_retries`; stage timers changed meaning (stage 1 = AC only, stage 2 = fused sketch + seeding).
 
 ### Added
