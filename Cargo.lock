@@ -711,12 +711,13 @@ checksum = "02a7de5f0cf02d66f73b1b1289df74ad96b465546fe5a184d78e57fa6df608d3"
 
 [[package]]
 name = "kira_kv_engine"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caf2edbafc54946b80080158e1a22364760c75b78ecfd23d49feec9390874dc5"
+checksum = "365c2f8bd1964a26c6e5a00b8c255c975b89c1eea5d9e0c8fcbb99247cdc6a42"
 dependencies = [
  "core_affinity",
  "hashbrown 0.16.1",
+ "memmap2",
  "rayon",
  "thiserror",
  "wyhash",

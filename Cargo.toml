@@ -39,7 +39,7 @@ sysinfo = "0.38"
 thiserror = "2"
 kira-fastq = "0.4.0"
 kira-simd = { version = "0.1.0", features = ["runtime-dispatch", "avx2", "sse42", "neon", "scalar"] }
-kira_kv_engine = { version = "0.7.0", default-features = true }
+kira_kv_engine = { version = "0.8.1", default-features = true }
 
 kira-bam = "0.4.0"
 # Same noodles-sam line kira-bam 0.4.0 builds on, so the `RecordBuf` the fused
