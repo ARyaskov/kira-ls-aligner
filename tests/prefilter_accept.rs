@@ -124,7 +124,7 @@ fn prefilter_not_top1_fallback() {
         false,
     );
 
-    assert!(matches!(outcome.result, PrefilterResult::Fallback));
+    std::assert_matches!(outcome.result, PrefilterResult::Fallback);
     assert_eq!(outcome.reason, PrefilterReason::NotTop1);
 }
 
@@ -159,7 +159,7 @@ fn prefilter_mism_too_high() {
         false,
     );
 
-    assert!(matches!(outcome.result, PrefilterResult::Fallback));
+    std::assert_matches!(outcome.result, PrefilterResult::Fallback);
     assert_eq!(outcome.reason, PrefilterReason::MismTooHigh);
 }
 
@@ -194,6 +194,6 @@ fn prefilter_not_short_preset() {
         false,
     );
 
-    assert!(matches!(outcome.result, PrefilterResult::Fallback));
+    std::assert_matches!(outcome.result, PrefilterResult::Fallback);
     assert_eq!(outcome.reason, PrefilterReason::NotShortPreset);
 }

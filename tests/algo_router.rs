@@ -29,9 +29,9 @@ fn short_reads_get_fast_path() {
 
 #[test]
 fn long_reads_get_banded_sw() {
-    assert!(matches!(choose_aligner(301), AlignerKind::BandedSw));
-    assert!(matches!(choose_aligner(1_000), AlignerKind::BandedSw));
-    assert!(matches!(choose_aligner(10_000), AlignerKind::BandedSw));
+    std::assert_matches!(choose_aligner(301), AlignerKind::BandedSw);
+    std::assert_matches!(choose_aligner(1_000), AlignerKind::BandedSw);
+    std::assert_matches!(choose_aligner(10_000), AlignerKind::BandedSw);
 }
 
 #[test]

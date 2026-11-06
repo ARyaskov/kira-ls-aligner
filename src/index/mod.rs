@@ -1647,7 +1647,7 @@ mod tests {
         let occ = packed.to_occ();
         assert_eq!(occ.ref_id, 123);
         assert_eq!(occ.pos, u32::MAX);
-        assert!(matches!(occ.strand, Strand::Reverse));
+        std::assert_matches!(occ.strand, Strand::Reverse);
     }
 
     /// Over-cap buckets keep a deterministic `max_occ + 1` subset in both
