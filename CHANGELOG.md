@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Breaking: `SeedBatchStats` gained `adaptive_retries`; stage timers changed meaning (stage 1 = AC only, stage 2 = fused sketch + seeding).
+
+### Added
+
+- Bounded adaptive seeding: a short read with discarded repeat occurrences and < 50% query coverage gets one wider seeding pass (occurrence limit and sample size grow by at most 4x, the index build cap is always respected).
+- `wfa_align_scored` / `wfa_score_only_scored`: WFA driven by the full affine reward model (match reward, distinct insertion/deletion extension costs); the legacy penalty-only API is kept.
+- `stage2_seeding::run_fused` runs sketching and seeding together in pair-aligned blocks of 128 reads.
+
+### Changed
+
+- Uncertain candidate loci are ranked by verified affine alignment score instead of Myers edit cost; the traceback budget adapts to 1–3 candidates (at least 2 for paired decisions). `KIRA_SHORT_DPTOPK` still overrides it.
+- Verified non-exact alignments are reused instead of repeating ungapped extension and traceback; exact-candidate evidence allocates no CIGAR/MD.
+- Minimizer buffers are reused per worker across blocks and batches (peak working set −2…−8% on the synthetic benchmark).
+- CGK rescue verifies with the affine-scored WFA; global LSH/CGK rescue no longer counts as evidence for a specific locus.
+
+### Fixed
+
+- WFA rejects transitions beyond the query/reference matrix before they can win a wavefront cell.
+- A compensating gap near the read start triggers a bounded search for a better seed origin (±32 bp, band-limited); the retry is kept only if its affine score improves.
+
 ## [0.5.0] - 2026-09-30
 
 Breaking: `-I` takes bwa-mem's `mean[,sd[,max[,min]]]` (the old `MIN,MAX[,MEAN,SD]` form is `--insert-window`), `-w` is the DP band width (the minimizer window is `--window-len`), `SamWriter::new`/`from_writer` borrow the reference, `SamFormatter::append_sa` takes the record index, `FusedAlignerParams` gained `insert_window` and `insert_size` became optional, `AlignerConfig` gained `sketch_explicit`, `TiledRunConfig` gained `keep_comment`, and `ModeFeatures` holds only read-length statistics.

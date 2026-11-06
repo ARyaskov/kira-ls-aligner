@@ -116,6 +116,12 @@ by an assumed FASTQ compression ratio, because only the progress bar consumes it
 
 ## Where the time goes (chr20, 30×, 16 threads, SAM output)
 
+The table below is a historical profile. In the current implementation sketching
+is fused with seeding in pair-aligned worker blocks: stage 1 measures AC only,
+and stage 2 includes both sketching and seeding. Compare their combined time
+across versions. See [the before/after report](improvements-1-3.md) for the
+changes to candidate search, memory reuse, and affine scoring.
+
 Measured 2026-09-01 with `KIRA_STATS=1` on HG002 chr20 (12.44M reads, 99 s wall):
 
 | Stage | Sum over batches | Share |
