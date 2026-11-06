@@ -16,6 +16,68 @@ pub struct WfaPenalties {
     pub gap_extend: i32,
 }
 
+/// Internal costs also support the asymmetric loss induced by rewarding matches.
+/// For a fixed query length, `A * query_len - SW_score` is exactly
+/// `(A+B)*mismatches + (A+E)*insertions + E*deletions + O*gap_runs`.
+#[derive(Clone, Copy)]
+struct WfaCosts {
+    mismatch: i32,
+    gap_open: i32,
+    ins_extend: i32,
+    del_extend: i32,
+}
+
+impl From<WfaPenalties> for WfaCosts {
+    fn from(p: WfaPenalties) -> Self {
+        Self {
+            mismatch: p.mismatch,
+            gap_open: p.gap_open,
+            ins_extend: p.gap_extend,
+            del_extend: p.gap_extend,
+        }
+    }
+}
+
+impl WfaCosts {
+    fn scored(cfg: super::AlignmentConfig) -> Option<Self> {
+        if cfg.match_score <= 0 || cfg.mismatch <= 0 || cfg.gap_open < 0 || cfg.gap_extend <= 0 {
+            return None;
+        }
+        Some(Self {
+            mismatch: cfg.match_score.checked_add(cfg.mismatch)?,
+            gap_open: cfg.gap_open,
+            ins_extend: cfg.match_score.checked_add(cfg.gap_extend)?,
+            del_extend: cfg.gap_extend,
+        })
+    }
+}
+
+/// Query-global / reference-ends-free alignment maximizing the pipeline's affine
+/// score, including match rewards. `opts.max_score` bounds loss, not edit distance.
+/// The local/clipped SW fallback remains responsible for partial-query alignment.
+pub fn wfa_align_scored(
+    pattern: &[u8],
+    text: &[u8],
+    cfg: super::AlignmentConfig,
+    opts: WfaOptions,
+) -> Option<WfaAlignment> {
+    wfa_align_with_costs(pattern, text, WfaCosts::scored(cfg)?, opts)
+}
+
+/// Same objective and endpoints as `wfa_align_scored`, without traceback.
+/// Returns the affine score (larger is better), not the transformed WFA loss.
+pub fn wfa_score_only_scored(
+    pattern: &[u8],
+    text: &[u8],
+    cfg: super::AlignmentConfig,
+    opts: WfaOptions,
+) -> Option<i32> {
+    let loss = wfa_score_with_costs(pattern, text, WfaCosts::scored(cfg)?, opts)?;
+    (pattern.len() as i32)
+        .checked_mul(cfg.match_score)?
+        .checked_sub(loss)
+}
+
 /// WFA2-style alignment options.
 #[derive(Clone, Copy, Debug)]
 pub struct WfaOptions {
@@ -308,27 +370,31 @@ fn get_src(hist: &History, score: i32) -> Option<&WaveFront> {
 }
 
 /// Compute the next M/I/D wavefronts at score `s` from history.
+#[allow(clippy::too_many_arguments)]
 fn step(
     s: i32,
-    pen: WfaPenalties,
+    pen: WfaCosts,
     m_hist: &History,
     i_hist: &History,
     d_hist: &History,
     pool: &mut Vec<Vec<i32>>,
+    pattern_len: i32,
+    text_len: i32,
 ) -> (WaveFront, WaveFront, WaveFront) {
     let s_x = s - pen.mismatch;
-    let s_oe = s - pen.gap_open - pen.gap_extend;
-    let s_e = s - pen.gap_extend;
+    let s_oi = s - pen.gap_open - pen.ins_extend;
+    let s_od = s - pen.gap_open - pen.del_extend;
 
     let src_m_x = get_src(m_hist, s_x);
-    let src_m_oe = get_src(m_hist, s_oe);
-    let src_i_e = get_src(i_hist, s_e);
-    let src_d_e = get_src(d_hist, s_e);
+    let src_m_oi = get_src(m_hist, s_oi);
+    let src_m_od = get_src(m_hist, s_od);
+    let src_i_e = get_src(i_hist, s - pen.ins_extend);
+    let src_d_e = get_src(d_hist, s - pen.del_extend);
 
     // Determine new I range: from source diagonals shifted by -1 (k = k_src - 1).
     let mut i_lo = i32::MAX;
     let mut i_hi = i32::MIN;
-    if let Some(w) = src_m_oe {
+    if let Some(w) = src_m_oi {
         i_lo = i_lo.min(w.lo - 1);
         i_hi = i_hi.max(w.hi - 1);
     }
@@ -339,7 +405,7 @@ fn step(
     // Determine new D range: from source diagonals shifted by +1 (k = k_src + 1).
     let mut d_lo = i32::MAX;
     let mut d_hi = i32::MIN;
-    if let Some(w) = src_m_oe {
+    if let Some(w) = src_m_od {
         d_lo = d_lo.min(w.lo + 1);
         d_hi = d_hi.max(w.hi + 1);
     }
@@ -383,15 +449,15 @@ fn step(
     };
     for k in new_i.lo..=new_i.hi {
         let mut best = NONE_OFFSET;
-        if let Some(w) = src_m_oe {
+        if let Some(w) = src_m_oi {
             let v = w.get(k + 1);
-            if v != NONE_OFFSET {
+            if v != NONE_OFFSET && v < pattern_len {
                 best = best.max(v + 1);
             }
         }
         if let Some(w) = src_i_e {
             let v = w.get(k + 1);
-            if v != NONE_OFFSET {
+            if v != NONE_OFFSET && v < pattern_len {
                 best = best.max(v + 1);
             }
         }
@@ -409,15 +475,15 @@ fn step(
     };
     for k in new_d.lo..=new_d.hi {
         let mut best = NONE_OFFSET;
-        if let Some(w) = src_m_oe {
+        if let Some(w) = src_m_od {
             let v = w.get(k - 1);
-            if v != NONE_OFFSET {
+            if v != NONE_OFFSET && v + k <= text_len {
                 best = best.max(v);
             }
         }
         if let Some(w) = src_d_e {
             let v = w.get(k - 1);
-            if v != NONE_OFFSET {
+            if v != NONE_OFFSET && v + k <= text_len {
                 best = best.max(v);
             }
         }
@@ -437,7 +503,7 @@ fn step(
         let mut best = NONE_OFFSET;
         if let Some(w) = src_m_x {
             let v = w.get(k);
-            if v != NONE_OFFSET {
+            if v != NONE_OFFSET && v < pattern_len && v + k < text_len {
                 best = best.max(v + 1);
             }
         }
@@ -475,6 +541,15 @@ pub fn wfa_align(
     pattern: &[u8],
     text: &[u8],
     pen: WfaPenalties,
+    opts: WfaOptions,
+) -> Option<WfaAlignment> {
+    wfa_align_with_costs(pattern, text, pen.into(), opts)
+}
+
+fn wfa_align_with_costs(
+    pattern: &[u8],
+    text: &[u8],
+    pen: WfaCosts,
     opts: WfaOptions,
 ) -> Option<WfaAlignment> {
     let m = pattern.len() as i32;
@@ -533,7 +608,7 @@ pub fn wfa_align(
         m_hist[0] = m0;
 
         for s in 1..=max_score {
-            let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool);
+            let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool, m, n);
             extend_wavefront(pattern, text, &mut new_m);
             if let Some(drop) = opts.adaptive_drop {
                 prune_wavefront(&mut new_m, drop);
@@ -597,6 +672,15 @@ pub fn wfa_score_only(
     pen: WfaPenalties,
     opts: WfaOptions,
 ) -> Option<i32> {
+    wfa_score_with_costs(pattern, text, pen.into(), opts)
+}
+
+fn wfa_score_with_costs(
+    pattern: &[u8],
+    text: &[u8],
+    pen: WfaCosts,
+    opts: WfaOptions,
+) -> Option<i32> {
     let m = pattern.len() as i32;
     let n = text.len() as i32;
     if m == 0 {
@@ -606,8 +690,8 @@ pub fn wfa_score_only(
     let tbf = opts.text_begin_free.max(0).min((n - 1).max(0));
     let lookback = pen
         .mismatch
-        .max(pen.gap_open + pen.gap_extend)
-        .max(pen.gap_extend);
+        .max(pen.gap_open + pen.ins_extend)
+        .max(pen.gap_open + pen.del_extend);
 
     WFA_SCRATCH.with(|scratch_cell| {
         let mut scratch = scratch_cell.borrow_mut();
@@ -638,7 +722,7 @@ pub fn wfa_score_only(
         m_hist[0] = m0;
 
         for s in 1..=max_score {
-            let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool);
+            let (mut new_m, new_i, new_d) = step(s, pen, m_hist, i_hist, d_hist, pool, m, n);
             extend_wavefront(pattern, text, &mut new_m);
             if let Some(drop) = opts.adaptive_drop {
                 prune_wavefront(&mut new_m, drop);
@@ -683,7 +767,7 @@ fn build_cigar(
     d_hist: &History,
     s_final: i32,
     k_final: i32,
-    pen: WfaPenalties,
+    pen: WfaCosts,
 ) -> (Vec<CigarOp>, i32) {
     let m_len = pattern.len() as i32;
 
@@ -805,24 +889,24 @@ fn build_cigar(
             }
             Layer::I => {
                 let mut took = false;
-                if s >= pen.gap_open + pen.gap_extend {
-                    let prev = get_layer(Layer::M, s - pen.gap_open - pen.gap_extend, k + 1);
+                if s >= pen.gap_open + pen.ins_extend {
+                    let prev = get_layer(Layer::M, s - pen.gap_open - pen.ins_extend, k + 1);
                     if prev != NONE_OFFSET && prev + 1 == offset {
                         push_cigar(&mut ops, CigarKind::Ins, 1);
                         offset -= 1;
                         k += 1;
-                        s -= pen.gap_open + pen.gap_extend;
+                        s -= pen.gap_open + pen.ins_extend;
                         layer = Layer::M;
                         took = true;
                     }
                 }
-                if !took && s >= pen.gap_extend {
-                    let prev = get_layer(Layer::I, s - pen.gap_extend, k + 1);
+                if !took && s >= pen.ins_extend {
+                    let prev = get_layer(Layer::I, s - pen.ins_extend, k + 1);
                     if prev != NONE_OFFSET && prev + 1 == offset {
                         push_cigar(&mut ops, CigarKind::Ins, 1);
                         offset -= 1;
                         k += 1;
-                        s -= pen.gap_extend;
+                        s -= pen.ins_extend;
                         // stay in I
                         took = true;
                     }
@@ -833,23 +917,23 @@ fn build_cigar(
             }
             Layer::D => {
                 let mut took = false;
-                if s >= pen.gap_open + pen.gap_extend {
-                    let prev = get_layer(Layer::M, s - pen.gap_open - pen.gap_extend, k - 1);
+                if s >= pen.gap_open + pen.del_extend {
+                    let prev = get_layer(Layer::M, s - pen.gap_open - pen.del_extend, k - 1);
                     if prev != NONE_OFFSET && prev == offset {
                         push_cigar(&mut ops, CigarKind::Del, 1);
                         // pattern position unchanged; text decreases by 1; k decreases
                         k -= 1;
-                        s -= pen.gap_open + pen.gap_extend;
+                        s -= pen.gap_open + pen.del_extend;
                         layer = Layer::M;
                         took = true;
                     }
                 }
-                if !took && s >= pen.gap_extend {
-                    let prev = get_layer(Layer::D, s - pen.gap_extend, k - 1);
+                if !took && s >= pen.del_extend {
+                    let prev = get_layer(Layer::D, s - pen.del_extend, k - 1);
                     if prev != NONE_OFFSET && prev == offset {
                         push_cigar(&mut ops, CigarKind::Del, 1);
                         k -= 1;
-                        s -= pen.gap_extend;
+                        s -= pen.del_extend;
                         // stay in D
                         took = true;
                     }

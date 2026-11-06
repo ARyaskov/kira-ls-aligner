@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::types::{Alignment, Strand};
 
-use super::wfa::{self, WfaPenalties};
+use super::wfa;
 use super::{AlignmentConfig, wfa_result_to_alignment};
 
 /// Number of probe positions per fingerprint.
@@ -425,15 +425,14 @@ impl CgkRescue {
             return None;
         }
 
-        let pen = WfaPenalties {
-            mismatch: self.cfg.mismatch,
-            gap_open: self.cfg.gap_open,
-            gap_extend: self.cfg.gap_extend,
-        };
         let read_len = read_seq.len();
         let pad = self.cfg.bandwidth.max(1) as usize;
-        let budget =
-            super::router::wfa_score_budget(read_len, pen.mismatch, pen.gap_open, pen.gap_extend);
+        let budget = super::router::wfa_score_budget(
+            read_len,
+            self.cfg.match_score + self.cfg.mismatch,
+            self.cfg.gap_open,
+            self.cfg.match_score + self.cfg.gap_extend,
+        );
 
         let is_rev = matches!(strand, Strand::Reverse);
         let mut best: Option<Alignment> = None;
@@ -453,7 +452,12 @@ impl CgkRescue {
             }
             let text = &bases[win_start..win_start + text_len];
 
-            let wfa_aln = match wfa::wfa_align_semi_global(read_seq, text, pen, budget) {
+            let wfa_aln = match wfa::wfa_align_scored(
+                read_seq,
+                text,
+                self.cfg,
+                wfa::WfaOptions::exact(budget),
+            ) {
                 Some(a) => a,
                 None => continue,
             };
