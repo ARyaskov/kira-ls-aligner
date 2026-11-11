@@ -330,6 +330,95 @@ fn polya_tail_is_soft_clipped() {
         aln.read_end,
         original_read_len - 50
     );
+    // Post-trim tags, derived independently: both exons match the reference
+    // perfectly and the N skip is invisible in MD, so the match run is
+    // 200+200 = 400 with NM 0. (Here the tail was already soft-clipped by the
+    // generic trailing clip, so no aligned bases were peeled.)
+    assert_eq!(aln.nm, 0, "NM must be 0 for the perfect fixture");
+    assert_eq!(aln.md, "400", "MD must count the 400 matched exon columns");
+}
+
+/// PolyA trimming that actually peels aligned bases: a forward-strand read
+/// whose 50 bp polyA tail is aligned to reference A's (the anchor covers it)
+/// must get NM/MD recomputed after the peel. The pre-trim CIGAR is
+/// 200M500N250M with stale tags MD "450"/NM 0; after the peel the CIGAR is
+/// 200M500N200M50S and MD must drop to "400".
+#[test]
+fn polya_trim_recomputes_nm_md() {
+    let mut ref_seq = synth_dna(0xDEAD_BEEF_FACE_8BAD, 4000);
+    // Force a canonical GT/AG so the splice path emits an N op.
+    ref_seq[2200] = b'G';
+    ref_seq[2201] = b'T';
+    ref_seq[2698] = b'A';
+    ref_seq[2699] = b'G';
+    // Reference A's right after exon 2, so the anchor aligns the polyA tail.
+    for b in &mut ref_seq[2900..2950] {
+        *b = b'A';
+    }
+
+    // Two-exon read whose 50 bp polyA tail is covered by the second anchor.
+    let mut read_seq = ref_seq[2000..2200].to_vec();
+    read_seq.extend_from_slice(&ref_seq[2700..2900]);
+    read_seq.extend(std::iter::repeat_n(b'A', 50));
+    let read = ReadRecord {
+        id: "polya_aligned_tail".to_string(),
+        seq: read_seq,
+        qual: None,
+        pair_role: PairRole::Unpaired,
+        repeat_min_occ: 1,
+        comment: None,
+    };
+    let chain = Chain {
+        ref_id: 0,
+        strand: Strand::Forward,
+        score: 400,
+        anchors: vec![
+            Anchor {
+                read_start: 0,
+                read_end: 200,
+                ref_id: 0,
+                ref_start: 2000,
+                ref_end: 2200,
+                strand: Strand::Forward,
+                score: 200,
+            },
+            Anchor {
+                read_start: 200,
+                read_end: 450,
+                ref_id: 0,
+                ref_start: 2700,
+                ref_end: 2950,
+                strand: Strand::Forward,
+                score: 250,
+            },
+        ],
+        read_start: 0,
+        read_end: 450,
+        ref_start: 2000,
+        ref_end: 2950,
+    };
+
+    let aln = align_spliced_chain(
+        &chain,
+        &read,
+        &ref_seq,
+        align_cfg(),
+        splice_cfg_default(),
+        None,
+        2,
+    )
+    .unwrap();
+
+    // The peel converted the trailing 250M into 200M + 50S.
+    let last_op = aln.cigar.last().expect("non-empty cigar");
+    assert_eq!(last_op.op, CigarKind::SoftClip, "last op must be the peel");
+    assert_eq!(last_op.len, 50, "peeled polyA tail must be soft-clipped");
+    assert_eq!(aln.read_end, 400, "read_end must exclude the peeled tail");
+    assert_eq!(aln.ref_end, 2900, "ref_end must shrink with the peel");
+    // Recomputed over the final CIGAR: both exons match perfectly, the N skip
+    // is invisible in MD, so NM 0 / MD "400". Stale tags would say "450".
+    assert_eq!(aln.nm, 0, "NM must be 0 after the peel");
+    assert_eq!(aln.md, "400", "MD must describe the post-trim CIGAR");
 }
 
 /// PolyA disabled (min_len=0): a polyA-tail read stays as-is (no

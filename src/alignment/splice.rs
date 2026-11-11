@@ -593,12 +593,14 @@ pub fn align_spliced_chain(
         mate: MateInfo::default(),
     };
     let _ = splice_junction_count; // currently unused — reserved for future per-junction MAPQ
-    let aln = trim_polya(aln, read_seq, splice_cfg.polya_min_len);
+    let aln = trim_polya(aln, read_seq, ref_seq, splice_cfg.polya_min_len);
     Some(aln)
 }
 
-/// Detect and soft-clip a leading or trailing polyA / polyT run.
-fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
+/// Detect and soft-clip a leading or trailing polyA / polyT run. When an
+/// actual trim mutates the alignment, `nm`/`md` are recomputed over the final
+/// CIGAR: the pre-trim tags describe bases that are now soft-clipped.
+fn trim_polya(aln: Alignment, read_seq: &[u8], ref_seq: &[u8], min_len: u32) -> Alignment {
     if min_len == 0 {
         return aln;
     }
@@ -652,8 +654,8 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
         is_rev,
         is_secondary,
         is_supplementary,
-        nm,
-        md,
+        nm: _,
+        md: _,
         as_score,
         xs_score,
         xs_strand,
@@ -772,6 +774,12 @@ fn trim_polya(aln: Alignment, read_seq: &[u8], min_len: u32) -> Alignment {
         new_cigar.extend(head_ops);
         read_start = read_start.saturating_add(run);
     }
+
+    // The peel changed the CIGAR/ref span, so replay the final alignment for
+    // NM/MD exactly like normalize_indels does (oriented read, whole-contig
+    // reference, absolute ref_start; soft clips advance the read cursor).
+    let (nm, md) =
+        crate::alignment::compute_nm_md(read_seq, ref_seq, 0, ref_start as usize, &new_cigar);
 
     Alignment {
         kind,
