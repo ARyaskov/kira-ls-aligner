@@ -187,10 +187,11 @@ pub struct MemArgs {
     #[arg(short = 'a', long = "all")]
     pub output_all: bool,
 
-    /// Emit `XA` only when the read has at most INT close secondary hits
-    /// (bwa-mem `-h INT[,INT]`; the second value is accepted and ignored).
+    /// Emit `XA` only when the read has at most this many close secondary
+    /// hits (bwa-mem `-h INT[,INT]`: one INT sets both caps, a pair sets the
+    /// non-ALT and ALT caps). More than that is reported through MAPQ alone.
     #[arg(short = 'h', long = "xa-max", default_value = "5,200", value_parser = parse_bwa_xa_max)]
-    pub xa_max: u32,
+    pub xa_max: (u32, u32),
 
     /// Append the FASTQ comment to every SAM record (bwa-mem `-C`), so
     /// `BC:Z:`/`RX:Z:` tags written by the demultiplexer survive alignment.
@@ -413,13 +414,22 @@ fn parse_bwa_int_pair(s: &str) -> Result<i32, String> {
         .map_err(|_| format!("expected INT or INT,INT, got {s:?}"))
 }
 
-/// bwa-mem `-h INT[,INT]`: the first value caps XA hits; the second (ALT
-/// hits) is accepted and ignored.
-fn parse_bwa_xa_max(s: &str) -> Result<u32, String> {
-    let first = s.split(',').next().unwrap_or("").trim();
-    first
+/// bwa-mem `-h INT[,INT]`: one INT sets both caps; a pair sets the non-ALT
+/// (first) and ALT (second) caps.
+fn parse_bwa_xa_max(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once(',').map_or((s, None), |(a, b)| (a, Some(b)));
+    let first = a
+        .trim()
         .parse::<u32>()
-        .map_err(|_| format!("expected INT or INT,INT, got {s:?}"))
+        .map_err(|_| format!("expected INT or INT,INT, got {s:?}"))?;
+    let second = match b {
+        None => first,
+        Some(v) => v
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("expected INT or INT,INT, got {s:?}"))?,
+    };
+    Ok((first, second))
 }
 
 impl MemArgs {
@@ -473,7 +483,7 @@ impl MemArgs {
             xdrop: 100,
             min_score: 30,
             output_all: false,
-            xa_max: 5,
+            xa_max: (5, 200),
             append_comment: false,
             header_insert: Vec::new(),
             mark_split_secondary: false,

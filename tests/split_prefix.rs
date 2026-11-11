@@ -25,6 +25,7 @@
 #![allow(clippy::field_reassign_with_default)]
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use kira_ls_aligner::alignment::AlignmentConfig;
 use kira_ls_aligner::alignment::splice::SpliceConfig;
@@ -219,6 +220,7 @@ fn tiled_alignment_recovers_reads_across_tiles() {
         junctions: None,
         junc_bed_tolerance: 2,
         keep_comment: false,
+        alt_contigs: None,
     };
 
     run_tiled(
@@ -311,6 +313,7 @@ fn tiled_single_tile_is_trivial_and_still_works() {
         junctions: None,
         junc_bed_tolerance: 2,
         keep_comment: false,
+        alt_contigs: None,
     };
     run_tiled(
         reference,
@@ -399,6 +402,7 @@ fn tiled_paired_primary_is_the_best_scoring_hit_across_tiles() {
         junctions: None,
         junc_bed_tolerance: 2,
         keep_comment: false,
+        alt_contigs: None,
     };
     run_tiled(
         reference,
@@ -433,5 +437,119 @@ fn tiled_paired_primary_is_the_best_scoring_hit_across_tiles() {
 
     let _ = std::fs::remove_file(r1_path);
     let _ = std::fs::remove_file(r2_path);
+    let _ = std::fs::remove_file(out_path);
+}
+
+/// The tiled driver must resolve `alt_contigs` against the full reference and
+/// install the ALT mask before stage 5: a secondary candidate on an ALT
+/// contig makes `xa_has_alt` true, which selects the `-h` second cap and lets
+/// a candidate list over the first cap through (bwa would suppress it
+/// without the ALT awareness). chr1 carries the exact copy (primary); the
+/// ALT contig chr2 plus chr3/chr4 carry one-SNV copies (secondaries, score
+/// 145 vs 150).
+#[test]
+fn tiled_alt_mask_reaches_stage5_xa() {
+    let c0 = synth_dna(0x1111_2222_3333_4444, 2000);
+    let seg = c0[500..650].to_vec(); // the read: 150 bp exact copy on chr1
+    let variant = || -> Vec<u8> {
+        let mut v = seg.clone();
+        v[75] = if v[75] == b'A' { b'G' } else { b'A' };
+        v
+    };
+    let mut c1 = synth_dna(0x5555_6666_7777_8888, 2000);
+    c1[800..950].copy_from_slice(&variant());
+    let mut c2 = synth_dna(0x9999_aaaa_bbbb_cccc, 2000);
+    c2[1200..1350].copy_from_slice(&variant());
+    let mut c3 = synth_dna(0xdddd_eeee_ffff_0000, 2000);
+    c3[300..450].copy_from_slice(&variant());
+    let reference = Reference {
+        sequences: vec![
+            RefSeq {
+                name: "chr1".to_string(),
+                bases: RefBases::Owned(c0.clone()),
+            },
+            RefSeq {
+                name: "chr2".to_string(),
+                bases: RefBases::Owned(c1),
+            },
+            RefSeq {
+                name: "chr3".to_string(),
+                bases: RefBases::Owned(c2),
+            },
+            RefSeq {
+                name: "chr4".to_string(),
+                bases: RefBases::Owned(c3),
+            },
+        ],
+    };
+
+    let r1_path = write_fastq("alt-r1", &[("alt/1", &seg)]);
+    let out_path = std::env::temp_dir().join(format!("kira-split-{}-alt.sam", std::process::id()));
+    let prefix_path =
+        std::env::temp_dir().join(format!("kira-split-{}-alt-prefix", std::process::id()));
+
+    let tile_plan = plan_tiles(&reference, 1500);
+    assert_eq!(tile_plan.n_tiles(), 4, "expected one contig per tile");
+
+    let mut pipe = full_pipeline_cfg();
+    pipe.paired.mode = IngestMode::Unpaired;
+    // Keep every SNV copy as a candidate.
+    pipe.min_chain_ratio = 0.1;
+    pipe.dp_topk = 4;
+    // First cap below the 3 secondary candidates; ALT cap above them.
+    pipe.output.xa_max = 2;
+    pipe.output.xa_max_alt = 200;
+    let cfg = TiledRunConfig {
+        threads: 2,
+        num_p_threads: None,
+        num_e_threads: None,
+        batch_bases: 1_000_000,
+        index_cfg: IndexConfig {
+            short_k: 19,
+            short_w: 10,
+            long_k: 19,
+            long_w: 10,
+            max_occ: 500,
+            build_short: true,
+            build_long: false,
+        },
+        pipeline_cfg: pipe,
+        read_group: None,
+        header: Some(HeaderConfig::default()),
+        split_prefix: prefix_path.clone(),
+        junctions: None,
+        junc_bed_tolerance: 2,
+        keep_comment: false,
+        alt_contigs: Some(Arc::new(["chr2".to_string()].into_iter().collect())),
+    };
+    run_tiled(
+        reference,
+        std::slice::from_ref(&r1_path),
+        Some(out_path.clone()),
+        cfg,
+        tile_plan,
+    )
+    .expect("run_tiled alt");
+
+    let sam = std::fs::read_to_string(&out_path).expect("read alt output");
+    let body: Vec<&str> = sam.lines().filter(|l| !l.starts_with('@')).collect();
+    assert_eq!(body.len(), 1, "one unpaired read:\n{sam}");
+    let cols = parse_sam_record(body[0]);
+    assert_eq!(cols[2], "chr1", "exact copy must be the primary:\n{sam}");
+    let xa = cols
+        .iter()
+        .find(|c| c.starts_with("XA:Z:"))
+        .expect("a secondary ALT candidate must select the second cap and keep XA");
+    assert_eq!(
+        xa.matches(';').count(),
+        3,
+        "all 3 secondary candidates must be listed (ALT one included):\n{sam}"
+    );
+    assert!(
+        xa.contains("chr2,") && xa.contains("chr3,") && xa.contains("chr4,"),
+        "XA must name the ALT and both non-ALT variants:\n{sam}"
+    );
+
+    let _ = std::fs::remove_file(r1_path);
     let _ = std::fs::remove_file(out_path);
 }

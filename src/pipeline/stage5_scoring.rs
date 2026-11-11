@@ -12,6 +12,10 @@ use super::stage4_alignment::{AlignBatch, AlignmentBatchStats};
 pub struct ScoredBatch {
     pub reads: Vec<crate::types::ReadRecord>,
     pub alignments: Vec<Vec<Alignment>>,
+    /// Whether any non-primary, non-supplementary candidate of each read
+    /// sits on an ALT contig — parallel to `alignments`; drives the bwa-mem
+    /// `-h` second (ALT) XA cap in stage 6.
+    pub xa_has_alt: Vec<bool>,
     pub unmapped_mate_info: Vec<Option<MateInfo>>,
     pub stats: AlignmentBatchStats,
 }
@@ -60,10 +64,110 @@ pub fn run_with_primary_policy(
             }
         });
 
+    // `XA` ALT metadata: any qualifying ALT candidate among the counted
+    // (non-primary, non-supplementary) candidates selects the `-h` second
+    // cap in stage 6. A primary-only ALT placement must stay `false`.
+    let xa_has_alt: Vec<bool> = alignments
+        .par_iter()
+        .map(|alns| {
+            alns.iter()
+                .skip(1)
+                .filter(|a| !a.is_supplementary)
+                .any(|a| cfg.is_alt(a.ref_id))
+        })
+        .collect();
+
     ScoredBatch {
         reads,
         alignments,
+        xa_has_alt,
         unmapped_mate_info,
         stats,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AlignmentKind, CigarKind, CigarOp};
+
+    fn aln(ref_id: u32, secondary: bool) -> Alignment {
+        Alignment {
+            kind: AlignmentKind::DpAligned,
+            ref_id,
+            ref_start: 100,
+            ref_end: 150,
+            read_start: 0,
+            read_end: 50,
+            cigar: vec![CigarOp {
+                len: 50,
+                op: CigarKind::Match,
+            }],
+            score: 50,
+            mapq: 0,
+            is_rev: false,
+            is_secondary: secondary,
+            is_supplementary: false,
+            nm: 0,
+            md: "50".to_string(),
+            as_score: 50,
+            xs_score: None,
+            xs_strand: None,
+            mate: MateInfo::default(),
+        }
+    }
+
+    fn run_stage5(mask: Option<&'static [bool]>, alns: Vec<Vec<Alignment>>) -> ScoredBatch {
+        let reads: Vec<crate::types::ReadRecord> = (0..alns.len())
+            .map(|i| crate::types::ReadRecord {
+                id: format!("r{i}"),
+                seq: vec![b'A'; 50],
+                qual: None,
+                pair_role: PairRole::Unpaired,
+                repeat_min_occ: 1,
+                comment: None,
+            })
+            .collect();
+        run(
+            AlignBatch {
+                reads,
+                alignments: alns,
+                unmapped_mate_info: Vec::new(),
+                stats: Default::default(),
+            },
+            MapqConfig {
+                short_read_len: 500,
+                mapq_cap_short: 60,
+                mapq_cap_long: 60,
+                alt_mask: mask,
+            },
+            None,
+        )
+    }
+
+    /// `xa_has_alt` counts ALT candidates among the non-primary,
+    /// non-supplementary candidates only: a primary-only ALT placement must
+    /// stay `false`.
+    #[test]
+    fn xa_has_alt_flags_secondary_alt_candidates_only() {
+        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let scored = run_stage5(
+            Some(mask),
+            vec![
+                // Secondary on the ALT contig -> true.
+                vec![aln(0, false), aln(1, true)],
+                // Primary-only ALT with a non-ALT secondary -> false.
+                vec![aln(1, false), aln(0, true)],
+                // No ALT anywhere -> false.
+                vec![aln(0, false), aln(0, true)],
+            ],
+        );
+        assert_eq!(scored.xa_has_alt, vec![true, false, false]);
+    }
+
+    #[test]
+    fn xa_has_alt_is_false_without_alt_mask() {
+        let scored = run_stage5(None, vec![vec![aln(0, false), aln(1, true)]]);
+        assert_eq!(scored.xa_has_alt, vec![false]);
     }
 }

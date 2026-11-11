@@ -58,7 +58,8 @@ see the README knob table for the GIAB trade-off).
    - Assigns MAPQ, primary/secondary flags, and suboptimal score (`XS`).
    - Competitors on ALT contigs are left out of the score-gap model for a
      primary-assembly placement.
-   - Output: `ScoredBatch { reads, alignments }`.
+   - Output: `ScoredBatch { reads, alignments, xa_has_alt }` (the ALT flag
+     drives the bwa-mem `-h` second XA cap in stage 6).
 
 7. **Stage 6 - Output** (`stage6_output.rs`)
    - Writes SAM records with bwa-mem compatible flags and tags (NM, MD, AS, XS, RG,

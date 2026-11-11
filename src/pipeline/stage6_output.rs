@@ -68,6 +68,7 @@ pub fn serialize_into(
 ) {
     let reads: Vec<ReadRecord> = input.reads;
     let mut alignments = input.alignments;
+    let xa_has_alt = input.xa_has_alt;
     let unmapped_mate_info = input.unmapped_mate_info;
 
     // `max_alignments` caps the primary/secondary *records* emitted per read
@@ -79,10 +80,17 @@ pub fn serialize_into(
         if output_cfg.write_xa && matches!(output_cfg.format, EmitFormat::Sam) {
             alignments
                 .iter()
-                .map(|alns| {
+                .zip(&xa_has_alt)
+                .map(|(alns, has_alt)| {
                     let mut buf = Vec::new();
                     formatter
-                        .append_xa_capped(&mut buf, alns, output_cfg.xa_max)
+                        .append_xa_capped(
+                            &mut buf,
+                            alns,
+                            output_cfg.xa_max,
+                            output_cfg.xa_max_alt,
+                            *has_alt,
+                        )
                         .then_some(buf)
                 })
                 .collect()
@@ -245,7 +253,13 @@ pub(crate) fn binary_records(
                     let mut record = binary::mapped(read, aln, read_group, cfg)?;
                     if idx == 0 && cfg.write_xa && alns.len() > 1 {
                         let mut xa = Vec::new();
-                        if formatter.append_xa_value(&mut xa, alns, cfg.xa_max) {
+                        if formatter.append_xa_value(
+                            &mut xa,
+                            alns,
+                            cfg.xa_max,
+                            cfg.xa_max_alt,
+                            input.xa_has_alt[i],
+                        ) {
                             binary::string_tag(&mut record, *b"XA", xa);
                         }
                     }
@@ -471,9 +485,24 @@ mod tests {
             tlen: -250,
             ..MateInfo::default()
         };
+        // A second candidate on the first read plus the discriminating cap
+        // below make the `has_alt` wiring observable: with `xa_max = 1` (ALT
+        // cap 200, `write_xa` on), the two secondaries exceed the first cap,
+        // so the XA tag appears in text and binary only when `binary_records`
+        // receives `has_alt = true`; a stale `false` there would suppress XA
+        // and diverge from the text path.
+        let mut secondary2 = alignment(80, false);
+        secondary2.ref_id = 1;
+        secondary2.ref_start = 40;
+        secondary2.mate = primary.mate;
         let input = ScoredBatch {
             reads: vec![r1, r2, fasta],
-            alignments: vec![vec![primary, secondary, supp], vec![], vec![other]],
+            alignments: vec![
+                vec![primary, secondary, secondary2, supp],
+                vec![],
+                vec![other],
+            ],
+            xa_has_alt: vec![true, false, false],
             unmapped_mate_info: vec![
                 None,
                 Some(MateInfo {
@@ -492,6 +521,10 @@ mod tests {
             cfg.append_comment = true;
             cfg.soft_clip_supplementary = max_alignments == 0;
             cfg.split_as_secondary = max_alignments == 0;
+            // Discriminating `has_alt` condition: two secondaries exceed the
+            // first cap, so XA survives only when the binary path receives
+            // `has_alt = true` (no effect on the `write_xa = false` case).
+            cfg.xa_max = 1;
             let sam_text = serialize(input.clone(), &formatter, rg, cfg, max_alignments);
             let mut reader = sam::io::Reader::new(sam_text.as_slice());
             let expected = reader

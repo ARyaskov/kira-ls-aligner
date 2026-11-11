@@ -441,7 +441,8 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     if emit_lower != "paf" {
         output_cfg.split_as_secondary = args.mark_split_secondary;
         output_cfg.soft_clip_supplementary = args.soft_clip_supplementary;
-        output_cfg.xa_max = args.xa_max;
+        output_cfg.xa_max = args.xa_max.0;
+        output_cfg.xa_max_alt = args.xa_max.1;
         output_cfg.append_comment = args.append_comment;
     }
 
@@ -893,6 +894,7 @@ fn run_split_prefix(
         junctions: cfg.junctions.clone(),
         junc_bed_tolerance: cfg.junc_bed_tolerance,
         keep_comment: args.append_comment,
+        alt_contigs: cfg.alt_contigs.clone(),
     };
     run_tiled(
         reference,

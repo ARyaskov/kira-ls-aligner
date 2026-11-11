@@ -62,7 +62,7 @@ fn unmodified_bwa_mem_command_line_parses() {
     assert_eq!(a.gap_open, 6);
     assert_eq!(a.gap_extend, 1);
     assert_eq!(a.clip_penalty, 5);
-    assert_eq!(a.xa_max, 5);
+    assert_eq!(a.xa_max, (5, 200));
     assert_eq!(a.verbosity, 1);
     assert_eq!(a.reads.len(), 2);
     let ignored = a.ignored_compat_flags();
@@ -128,5 +128,23 @@ fn bwa_max_occ_parses_and_is_not_ignored() {
     assert!(
         !a.ignored_compat_flags().contains(&"-c"),
         "-c must not be listed as accepted without effect"
+    );
+}
+
+/// bwa-mem `-h INT[,INT]`: one INT sets BOTH caps; a pair sets the non-ALT
+/// (first) and ALT (second) caps. Default mirrors upstream 5/200.
+#[test]
+fn xa_max_takes_one_or_two_values() {
+    let a = parse(&["ref.fa", "r.fq"]).unwrap();
+    assert_eq!(a.xa_max, (5, 200), "default mirrors bwa-mem -h 5,200");
+    assert_eq!(
+        parse(&["-h", "7", "ref.fa", "r.fq"]).unwrap().xa_max,
+        (7, 7),
+        "one INT must set both caps"
+    );
+    assert_eq!(
+        parse(&["-h", "7,300", "ref.fa", "r.fq"]).unwrap().xa_max,
+        (7, 300),
+        "a pair sets first/second caps"
     );
 }

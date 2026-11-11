@@ -61,30 +61,38 @@ impl Aligner {
     }
 
     /// Resolve the configured ALT-contig names against `index` into a
-    /// per-ref-id mask, leaked to `'static` (a bool per contig, once per run)
-    /// so the `Copy` pipeline/MAPQ configs can carry it.
+    /// per-ref-id mask (see [`resolve_alt_mask`]).
     fn alt_mask_for(&self, index: &Index) -> Option<&'static [bool]> {
         let names = self.cfg.alt_contigs.as_ref()?;
-        let mask: Vec<bool> = index
-            .reference
-            .sequences
-            .iter()
-            .map(|s| names.contains(&s.name))
-            .collect();
-        let n_alt = mask.iter().filter(|&&b| b).count();
-        if n_alt == 0 {
-            crate::kira_warn!(
-                "[KIRA] warning: none of the {} ALT contig names in the .alt file match a reference contig; ALT handling is off",
-                names.len()
-            );
-            return None;
-        }
-        crate::kira_info!(
-            "[KIRA] ALT-aware: {n_alt} of {} contigs are ALT",
-            mask.len()
-        );
-        Some(Box::leak(mask.into_boxed_slice()))
+        resolve_alt_mask(names, &index.reference)
     }
+}
+
+/// Resolve ALT-contig names against a reference into a per-ref-id mask,
+/// leaked to `'static` (a bool per contig, once per run) so the `Copy`
+/// pipeline/MAPQ configs can carry it.
+pub(crate) fn resolve_alt_mask(
+    names: &std::collections::HashSet<String>,
+    reference: &crate::types::Reference,
+) -> Option<&'static [bool]> {
+    let mask: Vec<bool> = reference
+        .sequences
+        .iter()
+        .map(|s| names.contains(&s.name))
+        .collect();
+    let n_alt = mask.iter().filter(|&&b| b).count();
+    if n_alt == 0 {
+        crate::kira_warn!(
+            "[KIRA] warning: none of the {} ALT contig names in the .alt file match a reference contig; ALT handling is off",
+            names.len()
+        );
+        return None;
+    }
+    crate::kira_info!(
+        "[KIRA] ALT-aware: {n_alt} of {} contigs are ALT",
+        mask.len()
+    );
+    Some(Box::leak(mask.into_boxed_slice()))
 }
 
 fn adjust_auto_params(

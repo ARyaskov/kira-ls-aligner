@@ -43,6 +43,9 @@ pub struct TiledRunConfig {
     pub junc_bed_tolerance: u32,
     /// Keep the FASTQ comment on every read (`-C`).
     pub keep_comment: bool,
+    /// ALT-contig names (`REF.alt`); resolved against the full reference
+    /// into the pipeline ALT mask before any stage uses it.
+    pub alt_contigs: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 /// Run the full tiled pipeline.
@@ -79,9 +82,19 @@ fn run_tiled_inner(
     tile_plan: TilePlan,
     pool: Arc<DualPool>,
 ) -> Result<()> {
+    let mut cfg = cfg;
     if tile_plan.tiles.is_empty() {
         return Err(anyhow::anyhow!("tile plan is empty (no contigs?)"));
     }
+
+    // Resolve the ALT names against the full reference once so the mask
+    // indexes global ref_ids, and install it before the per-tile pipelines
+    // and the merge-phase stage 5/MAPQ read the config.
+    cfg.pipeline_cfg.set_alt_mask(
+        cfg.alt_contigs
+            .as_ref()
+            .and_then(|names| crate::aligner_core::resolve_alt_mask(names, &reference)),
+    );
 
     crate::kira_info!(
         "[KIRA_TILE] running split-prefix pipeline with {} tile(s); temp prefix = {}",

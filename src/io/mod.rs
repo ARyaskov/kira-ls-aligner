@@ -788,9 +788,13 @@ pub struct OutputConfig {
     /// bwa-mem `-Y`: keep supplementary segments soft-clipped. Off (the bwa
     /// default) hard-clips them, dropping the unaligned bases from SEQ/QUAL.
     pub soft_clip_supplementary: bool,
-    /// bwa-mem `-h INT`: emit `XA` only when the read has at most this many
-    /// close secondary hits; more than that is reported through MAPQ alone.
+    /// bwa-mem `-h INT[,INT]`: emit `XA` only when the read's candidate
+    /// count is within the caps; more than that is reported through MAPQ
+    /// alone. `xa_max` is the non-ALT cap, `xa_max_alt` the ALT cap.
     pub xa_max: u32,
+    /// bwa-mem `-h` second cap, applied when a counted candidate sits on an
+    /// ALT contig (it always applies — see the suppression rule).
+    pub xa_max_alt: u32,
     /// bwa-mem `-C`: append the FASTQ comment verbatim to every record.
     pub append_comment: bool,
 }
@@ -810,6 +814,7 @@ impl OutputConfig {
             split_as_secondary: false,
             soft_clip_supplementary: false,
             xa_max: 5,
+            xa_max_alt: 200,
             append_comment: false,
         }
     }
@@ -828,6 +833,7 @@ impl OutputConfig {
             split_as_secondary: false,
             soft_clip_supplementary: false,
             xa_max: 5,
+            xa_max_alt: 200,
             append_comment: false,
         }
     }
@@ -847,6 +853,7 @@ impl OutputConfig {
             split_as_secondary: false,
             soft_clip_supplementary: true,
             xa_max: 0,
+            xa_max_alt: 0,
             append_comment: false,
         }
     }
@@ -1079,19 +1086,21 @@ impl SamFormatter {
     }
 
     pub fn append_xa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
-        self.append_xa_capped(buf, alignments, u32::MAX)
+        self.append_xa_with_prefix(buf, alignments, u32::MAX, u32::MAX, false, b"\tXA:Z:")
     }
 
-    /// `XA` for the secondary hits, or nothing when there are more than
-    /// `xa_max` of them (bwa-mem `-h`): past that point the list stops
+    /// `XA` for the secondary hits, or nothing when the candidate count
+    /// exceeds the caps (bwa-mem `-h INT[,INT]`): a suppressed list stops
     /// naming a locus and only restates what MAPQ already says.
     pub fn append_xa_capped(
         &self,
         buf: &mut Vec<u8>,
         alignments: &[Alignment],
         xa_max: u32,
+        xa_max_alt: u32,
+        has_alt: bool,
     ) -> bool {
-        self.append_xa_with_prefix(buf, alignments, xa_max, b"\tXA:Z:")
+        self.append_xa_with_prefix(buf, alignments, xa_max, xa_max_alt, has_alt, b"\tXA:Z:")
     }
 
     pub(crate) fn append_xa_value(
@@ -1099,8 +1108,10 @@ impl SamFormatter {
         buf: &mut Vec<u8>,
         alignments: &[Alignment],
         xa_max: u32,
+        xa_max_alt: u32,
+        has_alt: bool,
     ) -> bool {
-        self.append_xa_with_prefix(buf, alignments, xa_max, b"")
+        self.append_xa_with_prefix(buf, alignments, xa_max, xa_max_alt, has_alt, b"")
     }
 
     fn append_xa_with_prefix(
@@ -1108,6 +1119,8 @@ impl SamFormatter {
         buf: &mut Vec<u8>,
         alignments: &[Alignment],
         xa_max: u32,
+        xa_max_alt: u32,
+        has_alt: bool,
         prefix: &[u8],
     ) -> bool {
         if alignments.len() <= 1 {
@@ -1118,7 +1131,17 @@ impl SamFormatter {
             .skip(1)
             .filter(|a| !a.is_supplementary)
             .count();
-        if n_secondary == 0 || n_secondary as u32 > xa_max {
+        if n_secondary == 0 {
+            return false;
+        }
+        // bwa-mem `-h INT[,INT]` (mem_gen_alt): a qualifying ALT candidate
+        // among the counted candidates selects the second cap, but the
+        // second cap applies universally; either cap exceeded suppresses
+        // the ENTIRE tag — no truncation.
+        let first_cap = xa_max as usize;
+        let alt_cap = xa_max_alt as usize;
+        let suppress = n_secondary > alt_cap || (!has_alt && n_secondary > first_cap);
+        if suppress {
             return false;
         }
         buf.extend_from_slice(prefix);
@@ -1975,10 +1998,10 @@ mod format_tests {
             alns.push(s);
         }
         let mut buf = Vec::new();
-        assert!(fmt.append_xa_capped(&mut buf, &alns, 5));
+        assert!(fmt.append_xa_capped(&mut buf, &alns, 5, 200, false));
         assert!(buf.starts_with(b"\tXA:Z:"));
         buf.clear();
-        assert!(!fmt.append_xa_capped(&mut buf, &alns, 2));
+        assert!(!fmt.append_xa_capped(&mut buf, &alns, 2, 200, false));
         assert!(buf.is_empty());
     }
 
