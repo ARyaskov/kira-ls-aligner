@@ -143,8 +143,14 @@ set (alternating arms, minimum per stage) use this plus `KIRA_STATS=1`.
 The `mem` command line is a drop-in for `bwa mem`: the flags below carry
 bwa-mem's letters and meanings, an unmodified `bwa mem` invocation parses, and
 reads may come from stdin (`-`, plain or gzip). Flags bwa-mem has for
-heuristics this pipeline does not run (`-r -y -D -W -m -U -e -c`) are
-accepted without effect and listed once on stderr.
+heuristics this pipeline does not run (`-r -y -D -W -m -U`) are
+accepted without effect and listed once on stderr. `-e` is not implemented
+and is rejected as an unknown option (bwa-mem v0.7.17 and master have no
+`-e` either). `-c N` approximates bwa-mem's seed-occurrence cap: an explicit
+value overrides `--seed-occ-cap` as the per-minimizer hit cap
+(deterministically hash-sampled, seed retained). This is not exact parity:
+bwa strides occurrences upstream, Kira's separate repetitive-seed `max_occ`
+stays at 500, and the default hit cap is 16 rather than bwa's 500.
 
 - `index REF` : Build a minimizer index.
 - `mem REF READS...` : Align reads (one or more FASTQ/FASTA files, or `-`).

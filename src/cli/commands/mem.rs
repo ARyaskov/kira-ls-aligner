@@ -80,6 +80,14 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Fallback for the per-minimizer hit cap: an explicit bwa-mem `-c`
+/// overrides `--seed-occ-cap`; the `KIRA_K_HITS` knob still wins when set
+/// (the caller applies it via `env_usize`). Not exact bwa `-c` parity — see
+/// the `-c` argument docs.
+fn resolve_max_hits_default(compat_max_occ: Option<u32>, seed_occ_cap: u32) -> usize {
+    compat_max_occ.map_or(seed_occ_cap as usize, |n| n as usize)
+}
+
 /// Parameters for the fused in-process aligner ([`build_short_pe_aligner`]).
 pub struct FusedAlignerParams {
     pub reference: std::path::PathBuf,
@@ -315,7 +323,10 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     let mut seeding_cfg = SeedingConfig {
         min_anchor_len: 20,
         max_occ: 500,
-        max_hits_per_minimizer: env_usize("KIRA_K_HITS", args.seed_occ_cap as usize),
+        max_hits_per_minimizer: env_usize(
+            "KIRA_K_HITS",
+            resolve_max_hits_default(args.compat_max_occ, args.seed_occ_cap),
+        ),
         long_read_threshold: args.long_read_threshold,
         mate_window: None,
     };

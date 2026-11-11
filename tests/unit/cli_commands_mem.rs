@@ -52,3 +52,18 @@ fn explicit_accept_setting_overrides_output_mode() {
     assert!(resolve_accept_enable(Some(true), false));
     assert!(!resolve_accept_enable(Some(false), true));
 }
+
+/// An explicit bwa-mem `-c` overrides `--seed-occ-cap` as the per-minimizer
+/// hit-cap default; `KIRA_K_HITS` precedence is applied by the caller's
+/// `env_usize` and is not observable in a pure helper test.
+#[test]
+fn explicit_bwa_c_overrides_seed_occ_cap_default() {
+    assert_eq!(resolve_max_hits_default(Some(7), 16), 7);
+    assert_eq!(resolve_max_hits_default(Some(1), 16), 1);
+}
+
+#[test]
+fn absent_bwa_c_preserves_seed_occ_cap() {
+    assert_eq!(resolve_max_hits_default(None, 16), 16);
+    assert_eq!(resolve_max_hits_default(None, 3), 3);
+}

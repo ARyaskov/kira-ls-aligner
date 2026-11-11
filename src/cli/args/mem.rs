@@ -274,11 +274,13 @@ pub struct MemArgs {
     /// bwa-mem `-U`: unpaired read pair penalty. No effect.
     #[arg(short = 'U', hide = true)]
     pub compat_unpaired_penalty: Option<i32>,
-    /// bwa-mem `-e`: discard full-length exact matches. No effect.
-    #[arg(short = 'e', hide = true)]
-    pub compat_discard_exact: bool,
-    /// bwa-mem `-c`: discard a MEM above this many occurrences. Mapped onto
-    /// `--seed-occ-cap` semantics would change results; accepted, no effect.
+    /// bwa-mem `-c`: caps processed seed occurrences. Nearest projection: an
+    /// explicit value overrides `--seed-occ-cap` as the per-minimizer hit cap
+    /// (`max_hits_per_minimizer`, deterministically hash-sampled with the
+    /// seed retained). Not exact parity: bwa strides occurrences upstream,
+    /// the separate repetitive-seed `max_occ` stays at 500, and the default
+    /// hit cap is 16 rather than bwa's 500. bwa-mem master has no `-e`;
+    /// that flag is rejected as unknown.
     #[arg(short = 'c', hide = true)]
     pub compat_max_occ: Option<u32>,
     /// bwa-mem `-q`: don't modify mapQ of supplementary alignments. No effect
@@ -490,7 +492,6 @@ impl MemArgs {
             compat_min_chain_weight: None,
             compat_max_rescue_rounds: None,
             compat_unpaired_penalty: None,
-            compat_discard_exact: false,
             compat_max_occ: None,
             compat_keep_supp_mapq: false,
             compat_xr_header: false,
@@ -537,12 +538,6 @@ impl MemArgs {
         }
         if self.compat_unpaired_penalty.is_some() {
             v.push("-U");
-        }
-        if self.compat_discard_exact {
-            v.push("-e");
-        }
-        if self.compat_max_occ.is_some() {
-            v.push("-c");
         }
         if self.compat_keep_supp_mapq {
             v.push("-q");

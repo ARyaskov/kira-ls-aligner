@@ -110,3 +110,23 @@ fn unknown_preset_is_rejected_and_bwa_long_read_presets_map_to_long() {
     );
     assert_eq!(parse(&["ref.fa", "r.fq"]).unwrap().preset, "auto");
 }
+
+/// bwa-mem v0.7.17/master have no `-e`; it must be rejected like any other
+/// unknown option, not accepted as a no-op.
+#[test]
+fn bwa_discard_exact_flag_is_rejected() {
+    let err = parse(&["-e", "ref.fa", "r.fq"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+/// `-c` is no longer an accepted-without-effect flag: it parses, carries its
+/// value, and is dropped from the ignored-flags warning.
+#[test]
+fn bwa_max_occ_parses_and_is_not_ignored() {
+    let a = parse(&["-c", "7", "ref.fa", "r.fq"]).unwrap();
+    assert_eq!(a.compat_max_occ, Some(7));
+    assert!(
+        !a.ignored_compat_flags().contains(&"-c"),
+        "-c must not be listed as accepted without effect"
+    );
+}
