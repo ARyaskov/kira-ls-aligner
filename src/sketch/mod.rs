@@ -9,9 +9,10 @@ pub struct MinimizerConfig {
     pub w: usize,
 }
 
-/// Capacity of the fixed monotonic-window ring buffer. The window holds at most
-/// `w` entries, so any `w` up to this bound runs allocation-free; larger `w`
-/// falls back to [`minimizers_deque`].
+/// Capacity of the fixed monotonic-window ring buffer. The window holds at
+/// most `w` entries and every insert needs one free slot past the live range,
+/// so only `w < RING_CAP` runs allocation-free; `w >= RING_CAP` falls back to
+/// [`minimizers_deque`].
 const RING_CAP: usize = 256;
 
 /// Compute minimizers for a sequence using minimap2-style canonical k-mers.
@@ -27,7 +28,7 @@ pub fn minimizers_into(seq: &[u8], cfg: &MinimizerConfig, mins: &mut Vec<Minimiz
     if cfg.k == 0 || cfg.w == 0 || cfg.k >= 32 || seq.len() < cfg.k {
         return;
     }
-    if cfg.w > RING_CAP {
+    if cfg.w >= RING_CAP {
         minimizers_deque(seq, cfg, mins);
         return;
     }
@@ -80,9 +81,10 @@ pub fn minimizers_into(seq: &[u8], cfg: &MinimizerConfig, mins: &mut Vec<Minimiz
         while len > 0 && ring[(head + len - 1) % RING_CAP].0 >= hash {
             len -= 1;
         }
-        // `len < w <= RING_CAP` here: the eviction above dropped everything
+        // `len <= w < RING_CAP` here: the eviction above dropped everything
         // with hash >= this one, and the front eviction keeps the live range
-        // at most `w` wide, so this write cannot overrun the buffer.
+        // at most `w` wide, so the write slot `head + len` always stays
+        // outside the live range and cannot overrun the buffer.
         ring[(head + len) % RING_CAP] = (hash, kmer_index, pos, strand);
         len += 1;
 
@@ -107,7 +109,7 @@ pub fn minimizers_into(seq: &[u8], cfg: &MinimizerConfig, mins: &mut Vec<Minimiz
     }
 }
 
-/// Heap-deque fallback for `w > RING_CAP`.
+/// Heap-deque fallback for `w >= RING_CAP`.
 fn minimizers_deque(seq: &[u8], cfg: &MinimizerConfig, mins: &mut Vec<Minimizer>) {
     use std::collections::VecDeque;
 
@@ -239,7 +241,7 @@ mod ring_equivalence_tests {
     }
 
     /// The ring-buffer and heap-deque windows must emit identical minimizers;
-    /// only `w > RING_CAP` reaches the deque path in production.
+    /// only `w >= RING_CAP` reaches the deque path in production.
     #[test]
     fn ring_and_deque_windows_agree() {
         let alphabet = b"ACGTN";
@@ -273,6 +275,50 @@ mod ring_equivalence_tests {
                     (a.hash, a.pos, a.strand),
                     (b.hash, b.pos, b.strand),
                     "trial {trial}: k={k} w={w}"
+                );
+            }
+        }
+    }
+
+    /// Boundary regression for the ring-capacity routing guard: `w` at
+    /// `RING_CAP` must not run the fixed ring. With the old `w > RING_CAP`
+    /// guard, `w == RING_CAP` took the ring path, where a full window
+    /// (`len == RING_CAP` at insert) would overwrite the live head slot
+    /// before the front eviction. Reaching that state needs a 257-long
+    /// strictly ascending hash run: these sequences did not fail the old
+    /// guard, and whether a constructive input exists at all is unproven.
+    /// The regression net is therefore the routing edges (255 exercises the
+    /// widest real ring path, 257 the deque fallback) plus the guard itself,
+    /// which now keeps `len < RING_CAP` by construction. The sequence wraps
+    /// the ring many times.
+    #[test]
+    fn ring_and_deque_agree_at_ring_cap_boundaries() {
+        // Long enough to wrap the 256-slot ring repeatedly, with N runs so
+        // the window-reset path is covered at each boundary width.
+        let mut rng = 0x0BAD_C0DE_CAFE_F00Du64;
+        let alphabet = b"ACGT";
+        let seq: Vec<u8> = (0..8192)
+            .map(|i| {
+                if i % 97 < 3 {
+                    b'N'
+                } else {
+                    alphabet[(xorshift(&mut rng) % 4) as usize]
+                }
+            })
+            .collect();
+        let k = 15;
+        for w in [255usize, 256, 257] {
+            let cfg = MinimizerConfig { k, w };
+            let mut ring_path = Vec::new();
+            minimizers_into(&seq, &cfg, &mut ring_path);
+            let mut deque_ref = Vec::new();
+            minimizers_deque(&seq, &cfg, &mut deque_ref);
+            assert_eq!(ring_path.len(), deque_ref.len(), "w={w}");
+            for (a, b) in ring_path.iter().zip(deque_ref.iter()) {
+                assert_eq!(
+                    (a.hash, a.pos, a.strand),
+                    (b.hash, b.pos, b.strand),
+                    "w={w} output divergence"
                 );
             }
         }
