@@ -1346,11 +1346,10 @@ fn alignment_tags(
     if cfg.write_as {
         tag(*b"AS", AlignmentTag::Signed(aln.as_score));
     }
-    if cfg.write_xs
-        && let Some(xs) = aln.xs_score
-    {
-        tag(*b"XS", AlignmentTag::Signed(xs));
-    }
+    // Both splice annotations share the `XS` tag: the strand (`XS:A`, the
+    // splice-mode contract) and the suboptimal score (`XS:i`). Spliced records
+    // keep only one `XS` — the strand takes precedence, or the score would
+    // appear twice in SAM and the binary tag map would reject the duplicate.
     if let Some(strand) = aln.xs_strand {
         tag(
             *b"XS",
@@ -1359,6 +1358,10 @@ fn alignment_tags(
                 crate::types::Strand::Reverse => b'-',
             }),
         );
+    } else if cfg.write_xs
+        && let Some(xs) = aln.xs_score
+    {
+        tag(*b"XS", AlignmentTag::Signed(xs));
     }
     if cfg.write_rg
         && let Some(rg) = read_group
@@ -1832,6 +1835,76 @@ mod format_tests {
             "256",
             "-M reports the split segment as secondary"
         );
+    }
+
+    #[test]
+    fn spliced_record_carries_one_xs_tag_strand_wins_over_score() {
+        use noodles_sam::alignment::{record::data::field::Tag, record_buf::data::field::Value};
+
+        let fmt = SamFormatter::new(std::sync::Arc::new(reference()));
+        let read = ReadRecord::new_unpaired(
+            "q".into(),
+            (0..150u8).map(|i| b"ACGT"[(i % 4) as usize]).collect(),
+            Some(vec![b'I'; 150]),
+        );
+        // A splice-mode primary can hold both the junction strand and a
+        // suboptimal score set later by MAPQ; both want the `XS` tag.
+        let mut aln = supp_alignment();
+        aln.is_supplementary = false;
+        aln.cigar = vec![
+            CigarOp {
+                len: 70,
+                op: CigarKind::Match,
+            },
+            CigarOp {
+                len: 60,
+                op: CigarKind::Skipped,
+            },
+            CigarOp {
+                len: 80,
+                op: CigarKind::Match,
+            },
+        ];
+        aln.xs_score = Some(35);
+        aln.xs_strand = Some(crate::types::Strand::Forward);
+
+        let mut buf = Vec::new();
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        let f = fields(&buf);
+        let xs: Vec<&str> = f
+            .iter()
+            .map(String::as_str)
+            .filter(|s| s.starts_with("XS:"))
+            .collect();
+        assert_eq!(xs, ["XS:A:+"], "SAM must hold exactly one XS: the strand");
+
+        // The tag bridge feeding BAM/CRAM must not see a duplicate `XS`.
+        let record = super::binary::mapped(&read, &aln, None, OutputConfig::full())
+            .expect("binary record builds without duplicate XS");
+        let xs: Vec<&Value> = record
+            .data()
+            .iter()
+            .filter(|(tag, _)| *tag == Tag::from(*b"XS"))
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(xs.len(), 1, "one XS tag in the binary record");
+        assert!(
+            matches!(xs[0], Value::Character(b'+')),
+            "splice XS must stay the strand, got {:?}",
+            xs[0]
+        );
+
+        // Without a strand the ordinary `XS:i` score path is unchanged.
+        aln.xs_strand = None;
+        buf.clear();
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        let f = fields(&buf);
+        let xs: Vec<&str> = f
+            .iter()
+            .map(String::as_str)
+            .filter(|s| s.starts_with("XS:"))
+            .collect();
+        assert_eq!(xs, ["XS:i:35"], "non-splice XS:i is written as before");
     }
 
     #[test]
