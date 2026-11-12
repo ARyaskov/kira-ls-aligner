@@ -790,9 +790,11 @@ pub struct OutputConfig {
     pub soft_clip_supplementary: bool,
     /// bwa-mem `-h INT[,INT]`: emit `XA` only when the read's candidate
     /// count is within the caps; more than that is reported through MAPQ
-    /// alone. `xa_max` is the non-ALT cap, `xa_max_alt` the ALT cap.
+    /// alone. Candidates are counted after the bwa-mem 0.80 score-drop
+    /// filter (see [`xa_candidates`]). `xa_max` is the non-ALT cap,
+    /// `xa_max_alt` the ALT cap.
     pub xa_max: u32,
-    /// bwa-mem `-h` second cap, applied when a counted candidate sits on an
+    /// bwa-mem `-h` second cap, applied when a filtered candidate sits on an
     /// ALT contig (it always applies — see the suppression rule).
     pub xa_max_alt: u32,
     /// bwa-mem `-C`: append the FASTQ comment verbatim to every record.
@@ -857,6 +859,23 @@ impl OutputConfig {
             append_comment: false,
         }
     }
+}
+
+/// bwa-mem v0.7.17 XA drop filter (`XA_drop_ratio = 0.80` in `mem_opt_init`,
+/// applied by `mem_gen_alt`): a non-primary, non-supplementary candidate
+/// counts for the XA tag only when its score reaches 80% of the primary's
+/// score, compared in floating point as bwa does. The primary is the
+/// reported alignment in slot 0 — pair re-ranking, `-5` or the ALT policy
+/// can put a lower-score candidate there; the threshold follows the
+/// reported primary, not the global best score. Counting, the `has_alt`
+/// flag, the `-h` caps and the emitted candidates all use this one
+/// filtered set.
+pub(crate) fn xa_candidates(alignments: &[Alignment]) -> impl Iterator<Item = &Alignment> {
+    let threshold = alignments.first().map_or(0.0, |a| a.score as f64 * 0.80);
+    alignments
+        .iter()
+        .skip(1)
+        .filter(move |a| !a.is_supplementary && a.score as f64 >= threshold)
 }
 
 /// SAM-formatting state independent of the I/O sink.
@@ -1123,29 +1142,23 @@ impl SamFormatter {
         has_alt: bool,
         prefix: &[u8],
     ) -> bool {
-        if alignments.len() <= 1 {
+        // bwa-mem `-h INT[,INT]` (mem_gen_alt): the 0.80 score-drop filter
+        // (`xa_candidates`) is applied BEFORE counting, capping and emitting.
+        let candidates: Vec<&Alignment> = xa_candidates(alignments).collect();
+        if candidates.is_empty() {
             return false;
         }
-        let n_secondary = alignments
-            .iter()
-            .skip(1)
-            .filter(|a| !a.is_supplementary)
-            .count();
-        if n_secondary == 0 {
-            return false;
-        }
-        // bwa-mem `-h INT[,INT]` (mem_gen_alt): a qualifying ALT candidate
-        // among the counted candidates selects the second cap, but the
-        // second cap applies universally; either cap exceeded suppresses
-        // the ENTIRE tag — no truncation.
+        // A qualifying ALT candidate among the filtered candidates selects
+        // the second cap, but the second cap applies universally; either cap
+        // exceeded suppresses the ENTIRE tag — no truncation.
         let first_cap = xa_max as usize;
         let alt_cap = xa_max_alt as usize;
-        let suppress = n_secondary > alt_cap || (!has_alt && n_secondary > first_cap);
+        let suppress = candidates.len() > alt_cap || (!has_alt && candidates.len() > first_cap);
         if suppress {
             return false;
         }
         buf.extend_from_slice(prefix);
-        for aln in alignments.iter().skip(1).filter(|a| !a.is_supplementary) {
+        for aln in candidates {
             let rname = &self.contigs.names[aln.ref_id as usize];
             buf.extend_from_slice(rname.as_bytes());
             buf.push(b',');

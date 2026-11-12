@@ -351,6 +351,9 @@ fn alignment_report_filter(max_alignments: usize) -> impl FnMut(&Alignment) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mapq::MapqConfig;
+    use crate::pipeline::stage4_alignment::AlignBatch;
+    use crate::pipeline::stage5_scoring;
     use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo};
 
     fn alignment(score: i32, supplementary: bool) -> Alignment {
@@ -533,6 +536,96 @@ mod tests {
             let actual = binary_records(input.clone(), &formatter, rg, cfg, max_alignments)?;
             assert_eq!(actual, expected);
         }
+        Ok(())
+    }
+
+    /// bwa-mem `-h 2,200` drop-filter witness batch: primary 100, three
+    /// non-ALT 95 secondaries and an ALT-contig candidate at
+    /// `weak_alt_score`, run through stage 5 with an ALT mask so
+    /// `xa_has_alt` reflects the 0.80 filter.
+    fn witness_batch(weak_alt_score: i32) -> ScoredBatch {
+        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let witness_alignment = |score: i32, ref_id: u32| {
+            let mut a = alignment(score, false);
+            a.ref_id = ref_id;
+            a
+        };
+        let alns = vec![
+            witness_alignment(100, 0),
+            witness_alignment(95, 0),
+            witness_alignment(95, 0),
+            witness_alignment(95, 0),
+            witness_alignment(weak_alt_score, 1),
+        ];
+        stage5_scoring::run(
+            AlignBatch {
+                reads: vec![ReadRecord::new_unpaired("w".into(), vec![b'A'; 10], None)],
+                alignments: vec![alns],
+                unmapped_mate_info: vec![None],
+                stats: Default::default(),
+            },
+            MapqConfig {
+                short_read_len: 500,
+                mapq_cap_short: 60,
+                mapq_cap_long: 60,
+                alt_mask: Some(mask),
+            },
+            None,
+        )
+    }
+
+    fn witness_formatter() -> SamFormatter {
+        SamFormatter::from_catalog(std::sync::Arc::new(crate::io::ContigCatalog {
+            names: vec!["chr1".into(), "chr2".into()],
+            lens: vec![1000, 1000],
+        }))
+    }
+
+    fn witness_cfg() -> OutputConfig {
+        let mut cfg = OutputConfig::full();
+        cfg.xa_max = 2;
+        cfg.xa_max_alt = 200;
+        cfg
+    }
+
+    /// Text-mode witness for the bwa XA drop filter: with the weak (70 < 80)
+    /// ALT candidate dropped, three filtered candidates exceed the first cap
+    /// and XA is suppressed entirely; before the filter stage 5 reported
+    /// `has_alt = true` over four candidates and the tag was emitted. An ALT
+    /// candidate surviving the filter (95 >= 80) keeps the tag emitted.
+    #[test]
+    fn xa_drop_filter_suppresses_text_xa_for_the_bwa_witness() {
+        let formatter = witness_formatter();
+        let cfg = witness_cfg();
+        let weak = serialize(witness_batch(70), &formatter, None, cfg, 1);
+        assert!(
+            !String::from_utf8_lossy(&weak).contains("\tXA:Z:"),
+            "XA must be suppressed when the only ALT candidate falls below the 0.80 drop ratio"
+        );
+        let strong = serialize(witness_batch(95), &formatter, None, cfg, 1);
+        assert!(
+            String::from_utf8_lossy(&strong).contains("\tXA:Z:"),
+            "XA must survive when the ALT candidate passes the 0.80 drop ratio"
+        );
+    }
+
+    /// Binary-mode counterpart: `binary_records` forwards the stage 5
+    /// `has_alt` into `append_xa_value`, which applies the same filtered set.
+    #[test]
+    fn xa_drop_filter_suppresses_binary_xa_for_the_bwa_witness() -> Result<()> {
+        use noodles_sam::alignment::record::data::field::Tag;
+
+        let formatter = witness_formatter();
+        let cfg = witness_cfg();
+        let has_xa = |records: &[RecordBuf]| {
+            records
+                .iter()
+                .any(|r| r.data().iter().any(|(tag, _)| tag == Tag::from(*b"XA")))
+        };
+        let weak = binary_records(witness_batch(70), &formatter, None, cfg, 1)?;
+        assert!(!has_xa(&weak));
+        let strong = binary_records(witness_batch(95), &formatter, None, cfg, 1)?;
+        assert!(has_xa(&strong));
         Ok(())
     }
 }

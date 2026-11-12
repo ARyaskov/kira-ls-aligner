@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 
+use crate::io::xa_candidates;
 use crate::mapq::{
     MapqConfig, PairMapqContext, assign_mapq_preserving_primary, assign_mapq_with_qual,
 };
@@ -12,9 +13,10 @@ use super::stage4_alignment::{AlignBatch, AlignmentBatchStats};
 pub struct ScoredBatch {
     pub reads: Vec<crate::types::ReadRecord>,
     pub alignments: Vec<Vec<Alignment>>,
-    /// Whether any non-primary, non-supplementary candidate of each read
-    /// sits on an ALT contig — parallel to `alignments`; drives the bwa-mem
-    /// `-h` second (ALT) XA cap in stage 6.
+    /// Whether any bwa-mem-filtered (0.80 drop ratio, non-primary,
+    /// non-supplementary) candidate of each read sits on an ALT contig —
+    /// parallel to `alignments`; drives the bwa-mem `-h` second (ALT) XA cap
+    /// in stage 6.
     pub xa_has_alt: Vec<bool>,
     pub unmapped_mate_info: Vec<Option<MateInfo>>,
     pub stats: AlignmentBatchStats,
@@ -64,17 +66,13 @@ pub fn run_with_primary_policy(
             }
         });
 
-    // `XA` ALT metadata: any qualifying ALT candidate among the counted
-    // (non-primary, non-supplementary) candidates selects the `-h` second
-    // cap in stage 6. A primary-only ALT placement must stay `false`.
+    // `XA` ALT metadata: any qualifying ALT candidate among the
+    // bwa-mem-filtered (0.80 drop ratio, non-primary, non-supplementary)
+    // candidates selects the `-h` second cap in stage 6. A primary-only ALT
+    // placement must stay `false`.
     let xa_has_alt: Vec<bool> = alignments
         .par_iter()
-        .map(|alns| {
-            alns.iter()
-                .skip(1)
-                .filter(|a| !a.is_supplementary)
-                .any(|a| cfg.is_alt(a.ref_id))
-        })
+        .map(|alns| xa_candidates(alns).any(|a| cfg.is_alt(a.ref_id)))
         .collect();
 
     ScoredBatch {
@@ -169,5 +167,38 @@ mod tests {
     fn xa_has_alt_is_false_without_alt_mask() {
         let scored = run_stage5(None, vec![vec![aln(0, false), aln(1, true)]]);
         assert_eq!(scored.xa_has_alt, vec![false]);
+    }
+
+    /// Discriminating bwa-mem `-h 2,200` witness: primary 100, two
+    /// non-ALT 95 secondaries and an ALT-contig 70. bwa's 0.80 drop filter
+    /// (70 < 80) drops the weak ALT candidate, so `has_alt` stays `false`.
+    /// Before the filter this returned `true` and stage 6 emitted XA.
+    #[test]
+    fn xa_has_alt_ignores_candidates_below_the_bwa_drop_ratio() {
+        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mut primary = aln(0, false);
+        primary.score = 100;
+        let mut strong = aln(0, true);
+        strong.score = 95;
+        let mut strong2 = aln(0, true);
+        strong2.score = 95;
+        let mut weak_alt = aln(1, true);
+        weak_alt.score = 70;
+        let scored = run_stage5(Some(mask), vec![vec![primary, strong, strong2, weak_alt]]);
+        assert_eq!(scored.xa_has_alt, vec![false]);
+    }
+
+    /// A filtered ALT candidate at exactly the bwa threshold (score == 0.8 *
+    /// primary, kept because bwa only drops `score < 0.8 * primary`) still
+    /// sets `has_alt` and selects the `-h` second cap.
+    #[test]
+    fn xa_has_alt_keeps_a_candidate_at_the_drop_threshold() {
+        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mut primary = aln(0, false);
+        primary.score = 100;
+        let mut alt = aln(1, true);
+        alt.score = 80;
+        let scored = run_stage5(Some(mask), vec![vec![primary, alt]]);
+        assert_eq!(scored.xa_has_alt, vec![true]);
     }
 }

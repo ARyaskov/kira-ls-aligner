@@ -59,12 +59,18 @@ see the README knob table for the GIAB trade-off).
    - Competitors on ALT contigs are left out of the score-gap model for a
      primary-assembly placement.
    - Output: `ScoredBatch { reads, alignments, xa_has_alt }` (the ALT flag
-     drives the bwa-mem `-h` second XA cap in stage 6).
+     drives the bwa-mem `-h` second XA cap in stage 6). The flag is computed
+     over the bwa-mem 0.80 score-drop-filtered candidate set: only
+     non-primary, non-supplementary hits scoring at least 80% of the
+     primary's score qualify (`mem_gen_alt`, `XA_drop_ratio = 0.80`).
 
 7. **Stage 6 - Output** (`stage6_output.rs`)
    - Writes SAM records with bwa-mem compatible flags and tags (NM, MD, AS, XS, RG,
      XA/SA) plus the mate tags `MC`/`MQ`/`ms` on paired records, built from the
      adjacent mate's primary in a pre-pass so the parallel chunks stay independent.
+   - `XA` candidates are counted, capped and emitted over the same
+     bwa-mem-filtered set as `xa_has_alt` (0.80 score-drop ratio, see stage 5);
+     the tag is built from the full candidate list before the record cap.
    - Supplementary segments are hard-clipped unless `-Y`; `-M` flags them 0x100;
      `-C` appends the FASTQ comment.
 

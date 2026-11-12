@@ -167,7 +167,7 @@ stays at 500, and the default hit cap is 16 rather than bwa's 500.
 - `-v INT` : Verbosity, 1 errors … 3 messages (default) … 4 debug.
 - `-T INT` : Minimum alignment score to output (30).
 - `-a` : Output all found alignments (secondaries included).
-- `-h INT[,INT]` : bwa-mem `-h`: one INT sets both caps, a pair sets the non-ALT (first) and ALT (second) caps (default 5,200). `XA` is suppressed entirely when the candidate count exceeds the ALT cap, or — when no counted candidate sits on an ALT contig — the first cap; otherwise every candidate is listed (never truncated).
+- `-h INT[,INT]` : bwa-mem `-h`: one INT sets both caps, a pair sets the non-ALT (first) and ALT (second) caps (default 5,200). Candidates are first filtered like bwa-mem v0.7.17 (`mem_gen_alt`): only non-primary, non-supplementary hits scoring at least 80% of the primary's score are counted, drive the ALT cap and are listed. `XA` is suppressed entirely when the filtered candidate count exceeds the ALT cap, or — when no filtered candidate sits on an ALT contig — the first cap; otherwise every filtered candidate is listed (never truncated).
 - `-M` : Flag supplementary segments as secondary (0x100) for Picard-era tools.
 - `-Y` : Soft-clip supplementary segments; the default hard-clips them, as bwa-mem does.
 - `-5` : For a split read, the segment with the smallest read coordinate is primary.
