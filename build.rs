@@ -181,17 +181,17 @@ mod cuda_build {
         // 1. Honour the user-set escape hatch.
         if let Ok(p) = std::env::var("CUDAHOSTCXX") {
             let pb = PathBuf::from(&p);
-            if pb.is_file() {
-                if let Some(parent) = pb.parent() {
-                    return Some(parent.to_path_buf());
-                }
+            if pb.is_file()
+                && let Some(parent) = pb.parent()
+            {
+                return Some(parent.to_path_buf());
             }
         }
         // 2. cl.exe on the inherited PATH.
-        if let Ok(p) = which("cl.exe") {
-            if let Some(parent) = p.parent() {
-                return Some(parent.to_path_buf());
-            }
+        if let Ok(p) = which("cl.exe")
+            && let Some(parent) = p.parent()
+        {
+            return Some(parent.to_path_buf());
         }
         // 3. VCINSTALLDIR (set by vcvars*.bat).
         if let Ok(vc) = std::env::var("VCINSTALLDIR") {
@@ -221,21 +221,21 @@ mod cuda_build {
                     "installationPath",
                 ])
                 .output();
-            if let Ok(out) = out {
-                if out.status.success() {
-                    let vs_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !vs_path.is_empty() {
-                        let msvc_root = PathBuf::from(&vs_path).join("VC\\Tools\\MSVC");
-                        // Pick the newest version subdir.
-                        if let Ok(entries) = std::fs::read_dir(&msvc_root) {
-                            let mut versions: Vec<PathBuf> =
-                                entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-                            versions.sort();
-                            for v in versions.iter().rev() {
-                                let candidate = v.join("bin").join("Hostx64").join("x64");
-                                if candidate.join("cl.exe").is_file() {
-                                    return Some(candidate);
-                                }
+            if let Ok(out) = out
+                && out.status.success()
+            {
+                let vs_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !vs_path.is_empty() {
+                    let msvc_root = PathBuf::from(&vs_path).join("VC\\Tools\\MSVC");
+                    // Pick the newest version subdir.
+                    if let Ok(entries) = std::fs::read_dir(&msvc_root) {
+                        let mut versions: Vec<PathBuf> =
+                            entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+                        versions.sort();
+                        for v in versions.iter().rev() {
+                            let candidate = v.join("bin").join("Hostx64").join("x64");
+                            if candidate.join("cl.exe").is_file() {
+                                return Some(candidate);
                             }
                         }
                     }

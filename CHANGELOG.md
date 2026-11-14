@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Use `kira_kv_engine` 0.9.0 with its numeric batch lookup and validation improvements.
+- Assign minimizer bucket slots in bounded SIMD batches in both in-memory and external builds.
+- Stream index saves once through a buffered temporary file and publish atomically, preserving existing Unix permissions.
+- Share immutable MPH tables when cloning an index instead of serializing and loading them again.
+
+### Compatibility
+
+- Continue reading KIRAIDX2/3/4 and engine 0.8.1 payloads; loaded legacy MPH payloads retain their bytes on resave.
+- Newly built MPH payloads require the upgraded reader. Older aligner binaries linked to engine 0.8.1 cannot read their new hash identifier.
+- Atomic saves require write access to the destination directory and space for a temporary second file.
+
 ## [0.6.1] - 2026-11-06
 
 MSRV is now Rust 1.98.

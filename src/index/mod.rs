@@ -1,15 +1,16 @@
+mod kv;
 pub mod lsh;
 mod repeat;
 pub mod tiling;
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use memmap2::{Mmap, MmapMut};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use repeat::RepeatRescueIndex;
 
@@ -39,7 +40,7 @@ pub struct Occ {
 /// difference between the variants is irrelevant.
 #[allow(clippy::large_enum_variant)]
 enum HashLookup {
-    Mph(kira_kv_engine::Index),
+    Mph(Arc<kira_kv_engine::Index>),
     Sorted(Vec<u64>),
 }
 
@@ -126,12 +127,7 @@ impl std::fmt::Debug for MinimizerIndex {
 impl Clone for MinimizerIndex {
     fn clone(&self) -> Self {
         let hash_lookup = self.hash_lookup.as_ref().map(|lk| match lk {
-            HashLookup::Mph(idx) => {
-                let bytes = idx.to_bytes().expect("index serialise");
-                HashLookup::Mph(
-                    kira_kv_engine::Index::from_bytes(&bytes).expect("index deserialise"),
-                )
-            }
+            HashLookup::Mph(idx) => HashLookup::Mph(Arc::clone(idx)),
             HashLookup::Sorted(arr) => HashLookup::Sorted(arr.clone()),
         });
         Self {
@@ -372,28 +368,13 @@ impl MinimizerIndex {
                  ~5× slower per lookup).",
                 unique_hashes.len() as f64 / 1e6,
             );
-            let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
-            let mph = kira_kv_engine::IndexBuilder::new()
-                .with_parallel_build(true)
-                .build_index(keys_bytes)
-                .expect("PtrHash25 build");
+            let (mph, assigned) = kv::build_mph(&unique_hashes);
             crate::kira_info!(
-                "[KIRA_INDEX] (k={k} w={w}) phase D done in {:.1}s (mph), looking up ids...",
+                "[KIRA_INDEX] (k={k} w={w}) phase D done in {:.1}s (mph and batched ids)",
                 t_lookup.elapsed().as_secs_f64(),
             );
-
-            let mut assigned: Vec<u32> = Vec::with_capacity(unique_hashes.len());
-            let mut max_id_u: u32 = 0;
-            for h in &unique_hashes {
-                let id = mph
-                    .lookup_u64(*h)
-                    .expect("PtrHash25 hash present in build set");
-                if id as u32 > max_id_u {
-                    max_id_u = id as u32;
-                }
-                assigned.push(id as u32);
-            }
-            (HashLookup::Mph(mph), max_id_u as usize + 1, Some(assigned))
+            let n_slots = mph.slot_capacity();
+            (HashLookup::Mph(Arc::new(mph)), n_slots, Some(assigned))
         } else {
             crate::kira_info!(
                 "[KIRA_INDEX] (k={k} w={w}) phase D: sorted-array lookup over {:.1}M keys \
@@ -651,23 +632,9 @@ impl MinimizerIndex {
             .map(|v| v.trim() != "0")
             .unwrap_or(true);
         let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph {
-            let keys_bytes: Vec<[u8; 8]> = unique_hashes.iter().map(|h| h.to_le_bytes()).collect();
-            let mph = kira_kv_engine::IndexBuilder::new()
-                .with_parallel_build(true)
-                .build_index(keys_bytes)
-                .expect("PtrHash25 build");
-            let assigned: Vec<u32> = unique_hashes
-                .iter()
-                .map(|h| {
-                    u32::try_from(
-                        mph.lookup_u64(*h)
-                            .expect("PtrHash25 hash present in build set"),
-                    )
-                    .expect("MPH slot exceeds u32")
-                })
-                .collect();
-            let n_slots = assigned.iter().copied().max().unwrap_or(0) as usize + 1;
-            (HashLookup::Mph(mph), n_slots, Some(assigned))
+            let (mph, assigned) = kv::build_mph(&unique_hashes);
+            let n_slots = mph.slot_capacity();
+            (HashLookup::Mph(Arc::new(mph)), n_slots, Some(assigned))
         } else {
             let n = unique_hashes.len();
             (HashLookup::Sorted(unique_hashes), n, None)
@@ -1231,19 +1198,25 @@ impl Index {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let total_size = compute_index_size(self);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path.as_ref())
-            .context("create index file")?;
-        file.set_len(total_size as u64)
-            .context("resize index file")?;
-
-        let mut mmap = unsafe { MmapMut::map_mut(&file).context("mmap index for write")? };
-        let mut cursor = Cursor::new(&mut mmap[..]);
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".kira-index-");
+        #[cfg(unix)]
+        let previous_permissions = {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+            match std::fs::metadata(path) {
+                Ok(metadata) => Some(metadata.permissions()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("read existing index permissions"),
+            }
+        };
+        let mut temporary = builder.tempfile_in(parent).context("create index file")?;
+        let mut cursor = BufWriter::with_capacity(64 * 1024, temporary.as_file_mut());
 
         cursor.write_all(INDEX_MAGIC)?;
         write_u32(&mut cursor, INDEX_VERSION)?;
@@ -1257,7 +1230,20 @@ impl Index {
 
         write_minimizer_index(&mut cursor, &self.short, self.mmap_bytes())?;
         write_minimizer_index(&mut cursor, &self.long, self.mmap_bytes())?;
-        mmap.flush().context("flush index mmap")?;
+        cursor.flush().context("flush index writer")?;
+        drop(cursor);
+        #[cfg(unix)]
+        if let Some(permissions) = previous_permissions {
+            temporary
+                .as_file()
+                .set_permissions(permissions)
+                .context("preserve index permissions")?;
+        }
+        temporary.as_file().sync_all().context("sync index file")?;
+        temporary
+            .persist(path)
+            .map_err(|e| e.error)
+            .context("publish index file")?;
         Ok(())
     }
 
@@ -1340,21 +1326,6 @@ impl Index {
     }
 }
 
-fn compute_index_size(index: &Index) -> usize {
-    let mut size = 0usize;
-    size += INDEX_MAGIC.len();
-    size += 4; // version
-    size += 4; // seq count
-    for seq in &index.reference.sequences {
-        size += 4 + seq.name.len();
-        size += 4 + seq.len(index.mmap.as_deref().map(|m| &m[..]));
-    }
-    let mmap = index.mmap.as_deref().map(|m| &m[..]);
-    size += minimizer_index_size(&index.short, mmap);
-    size += minimizer_index_size(&index.long, mmap);
-    size
-}
-
 /// Build an empty MinimizerIndex used when the caller asks us to skip building a sub-index.
 fn empty_minimizer_index(k: usize, w: usize, max_occ: usize) -> MinimizerIndex {
     MinimizerIndex {
@@ -1375,40 +1346,7 @@ const LOOKUP_KIND_NONE: u32 = 0;
 const LOOKUP_KIND_MPH: u32 = 1;
 const LOOKUP_KIND_SORTED: u32 = 2;
 
-fn minimizer_index_size(idx: &MinimizerIndex, mmap: Option<&[u8]>) -> usize {
-    let mut size = 0usize;
-    size += 4 * 3; // k, w, max_occ
-    size += 4; // lookup_kind
-    if let Some(lookup) = idx.hash_lookup.as_ref() {
-        match lookup {
-            HashLookup::Mph(mph) => {
-                size += 8; // blob len
-                let blob = mph.to_bytes().expect("size: serialize MPH");
-                size += blob.len();
-            }
-            HashLookup::Sorted(arr) => {
-                size += 8; // n_keys
-                size += arr.len() * 8;
-            }
-        }
-    }
-    size += 8; // n_counts
-    size += idx.bucket_counts.len() * 4;
-    size += 8; // n_offsets
-    size += idx.bucket_offsets.len() * 4;
-    let n_occs = idx
-        .bucket_offsets
-        .get(idx.bucket_offsets.len().saturating_sub(1), mmap) as usize;
-    size += 8; // n_occs
-    size += n_occs * OCC_DISK_SIZE;
-    size += 4; // repeat-rescue presence
-    if let Some(rescue) = idx.repeat_rescue.as_ref() {
-        size += rescue.size(mmap);
-    }
-    size
-}
-
-fn write_minimizer_index<W: Write>(
+fn write_minimizer_index<W: Write + Seek>(
     writer: &mut W,
     idx: &MinimizerIndex,
     mmap: Option<&[u8]>,
@@ -1420,11 +1358,14 @@ fn write_minimizer_index<W: Write>(
     match idx.hash_lookup.as_ref() {
         Some(HashLookup::Mph(mph)) => {
             write_u32(writer, LOOKUP_KIND_MPH)?;
-            let blob = mph
-                .to_bytes()
-                .map_err(|e| anyhow::anyhow!("MPH serialize: {e:?}"))?;
-            write_u64(writer, blob.len() as u64)?;
-            writer.write_all(&blob).context("write MPH blob")?;
+            let length_position = writer.stream_position()?;
+            write_u64(writer, 0)?;
+            let payload_start = writer.stream_position()?;
+            mph.write_to(&mut *writer).context("write MPH blob")?;
+            let payload_end = writer.stream_position()?;
+            writer.seek(SeekFrom::Start(length_position))?;
+            write_u64(writer, payload_end - payload_start)?;
+            writer.seek(SeekFrom::Start(payload_end))?;
         }
         Some(HashLookup::Sorted(arr)) => {
             write_u32(writer, LOOKUP_KIND_SORTED)?;
@@ -1491,10 +1432,10 @@ fn read_minimizer_index_mmap<R: Read + Seek>(
             ensure_remaining(reader, blob_len, file_len, "MPH blob")?;
             let mut blob = vec![0u8; blob_len];
             reader.read_exact(&mut blob).context("read MPH blob")?;
-            Some(HashLookup::Mph(
+            Some(HashLookup::Mph(Arc::new(
                 kira_kv_engine::Index::from_bytes(&blob)
                     .map_err(|e| anyhow::anyhow!("MPH deserialize: {e:?}"))?,
-            ))
+            )))
         }
         LOOKUP_KIND_SORTED => {
             let n_keys = read_u64(reader)? as usize;

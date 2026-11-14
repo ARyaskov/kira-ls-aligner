@@ -791,7 +791,7 @@ pub struct OutputConfig {
     /// bwa-mem `-h INT[,INT]`: emit `XA` only when the read's candidate
     /// count is within the caps; more than that is reported through MAPQ
     /// alone. Candidates are counted after the bwa-mem 0.80 score-drop
-    /// filter (see [`xa_candidates`]). `xa_max` is the non-ALT cap,
+    /// filter (see the internal `xa_candidates` helper). `xa_max` is the non-ALT cap,
     /// `xa_max_alt` the ALT cap.
     pub xa_max: u32,
     /// bwa-mem `-h` second cap, applied when a filtered candidate sits on an

@@ -122,16 +122,6 @@ impl RepeatRescueIndex {
         self.flat_occs.get(idx, mmap)
     }
 
-    pub(super) fn size(&self, mmap: Option<&[u8]>) -> usize {
-        let n_occs = self.bucket_offsets.get(self.bucket_offsets.len() - 1, mmap) as usize;
-        4 + 8
-            + self.hashes.len() * 8
-            + 8
-            + self.bucket_offsets.len() * 4
-            + 8
-            + n_occs * OCC_DISK_SIZE
-    }
-
     pub(super) fn write<W: Write>(&self, writer: &mut W, mmap: Option<&[u8]>) -> Result<()> {
         write_u32(writer, EXTENSION as u32)?;
         write_u64(writer, self.hashes.len() as u64)?;

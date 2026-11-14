@@ -57,6 +57,13 @@ Build index:
 kira_ls_aligner index ref.fa -o ref.kiraidx
 ```
 
+The index builder uses `kira_kv_engine` 0.9.0 and assigns minimizer buckets in
+bounded numeric batches. Index saves stream through a temporary file before
+atomic replacement, requiring directory write access and temporary disk space.
+Existing KIRAIDX2/3/4 files remain readable. A newly built MPH index requires
+this upgraded reader; an older binary using engine 0.8.1 cannot read it.
+See [the speed, memory and correctness comparison](docs/kv-engine-upgrade.md).
+
 Use a prebuilt index:
 
 ```bash
@@ -278,7 +285,8 @@ correctly placed reads out of 80 000.
 - `long`: `k=15`, `w=10`, wider chaining and alignment bands.
 - `auto`: default; selects short/long/hybrid per run based on read length distribution, ungapped identity, and chain density.
 
-- `.kiraidx` index files are memory-mapped and used zero-copy at runtime.
+- `.kiraidx` reference bases, occurrence records and offsets are mmap-backed;
+  MPH lookup tables are decoded into owned memory.
 
 ## SIMD / CUDA Notes
 
@@ -443,7 +451,8 @@ Takeaways:
 
 ## Test Data / Provenance
 
-No reference FASTA is shipped in the repository. The E. coli K-12 MG1655
+No biological reference FASTA is shipped in the repository; the small
+synthetic reference under `tests/fixtures/` is only a regression fixture. The E. coli K-12 MG1655
 reference used by the examples above (`ecoli.fa`) is NCBI RefSeq accession
 GCF_000005845.2; download and decompress it into the project root:
 
@@ -476,7 +485,8 @@ See `docs/pipeline.md` for detailed pipeline architecture and algorithmic notes.
 A: No. `-x auto` is default and uses read length + quality stats from the first batch. You can still override with `-x short/long` if needed.
 
 **Q: Are `.kiraidx` indexes zero-copy?**
-A: Yes. `.kiraidx` is mmap-backed and used zero-copy at runtime.
+A: Reference bases, occurrence records and offsets are mmap-backed. MPH lookup
+tables are decoded into owned memory.
 
 **Q: Can I pass multiple FASTQ files?**
 A: Yes. `mem REF READS...` accepts one or more FASTQ/FASTA files.

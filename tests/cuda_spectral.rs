@@ -30,7 +30,7 @@ fn make_corpus(n: usize) -> Vec<(Vec<u8>, Vec<u8>, usize)> {
         let mut text: Vec<u8> = (0..w)
             .map(|_| bases[(xorshift(&mut rng) as usize) % 4])
             .collect();
-        if xorshift(&mut rng) % 2 == 0 && w >= r {
+        if xorshift(&mut rng).is_multiple_of(2) && w >= r {
             let start = (xorshift(&mut rng) as usize) % (w - r + 1);
             text[start..start + r].copy_from_slice(&read);
             // Inject 0-3 mismatches for realism.
