@@ -640,9 +640,9 @@ dependencies = [
 
 [[package]]
 name = "kira-bam"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55c9bb88999785eed5f654d5b12746803d4660599de7d8f6483cde383e266ed6"
+checksum = "763e3bfe58bfc2791cdf7862cf2888076b773b5caf88473065bf072cdbda4715"
 dependencies = [
  "anyhow",
  "bstr",
