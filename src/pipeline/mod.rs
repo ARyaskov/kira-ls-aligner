@@ -33,7 +33,7 @@ use crate::pipeline::pairing::{
     rescue_unmapped_mates_with_ref,
 };
 use crate::pipeline::stage1_sketch::{SketchBatchStats, SketchConfig};
-use crate::pipeline::stage2_seeding::{SeedBatchStats, run_fused as seed_run_fused};
+use crate::pipeline::stage2_seeding::{RepeatCountBlock, SeedBatchStats, run_fused_with_counts};
 use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
     AlignBatch, AlignmentBatchStats, AlignmentStageConfig, run as align_run,
@@ -187,7 +187,23 @@ impl Pipeline {
         input: stage0_input::InputBatch,
         index: &Index,
     ) -> crate::pipeline::stage4_alignment::AlignBatch {
-        self.align_candidates(input, index, self.config.paired).0
+        self.align_candidates(input, index, self.config.paired, None)
+            .0
+    }
+
+    pub(crate) fn process_tile_candidates(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+        index_cfg: crate::index::IndexConfig,
+    ) -> (AlignBatch, Vec<RepeatCountBlock>) {
+        let (aligned, _, _, _, _, counts) = self.align_candidates(
+            input,
+            index,
+            self.config.paired,
+            Some((index_cfg, self.config.seeding.long_read_threshold)),
+        );
+        (aligned, counts)
     }
 
     #[allow(clippy::type_complexity)]
@@ -196,12 +212,14 @@ impl Pipeline {
         input: stage0_input::InputBatch,
         index: &Index,
         paired_cfg: PairedConfig,
+        repeat_cfg: Option<(crate::index::IndexConfig, usize)>,
     ) -> (
         AlignBatch,
         [Duration; 6],
         SketchBatchStats,
         SeedBatchStats,
         ChainingBatchStats,
+        Vec<RepeatCountBlock>,
     ) {
         let mut stages = [Duration::ZERO; 6];
 
@@ -223,13 +241,14 @@ impl Pipeline {
         // Stage 2 combines sketching with memory-bound seed lookups.
         let t1 = Instant::now();
         let skip_mask = ac.resolved_mask();
-        let (seeds, sketch_stats) = self.pool.install_compute(|| {
-            seed_run_fused(
+        let ((seeds, sketch_stats), repeat_counts) = self.pool.install_compute(|| {
+            run_fused_with_counts(
                 input,
                 index,
                 self.config.sketch,
                 self.config.seeding,
                 &skip_mask,
+                repeat_cfg,
             )
         });
         let seed_stats = seeds.stats.clone();
@@ -308,7 +327,14 @@ impl Pipeline {
         }
 
         stages[3] = t_stage4;
-        (align, stages, sketch_stats, seed_stats, chaining_stats)
+        (
+            align,
+            stages,
+            sketch_stats,
+            seed_stats,
+            chaining_stats,
+            repeat_counts,
+        )
     }
 
     /// Run stages 1-6 producing a ready-to-write SAM byte buffer.
@@ -341,8 +367,8 @@ impl Pipeline {
             .map(|e| e.current())
             .unwrap_or(self.config.paired);
 
-        let (mut align, mut stages, sketch_stats, seed_stats, chaining_stats) =
-            self.align_candidates(input, index, paired_cfg);
+        let (mut align, mut stages, sketch_stats, seed_stats, chaining_stats, _) =
+            self.align_candidates(input, index, paired_cfg, None);
         let t_stage4 = stages[3];
         let post_start = Instant::now();
 

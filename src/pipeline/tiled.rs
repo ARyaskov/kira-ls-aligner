@@ -154,13 +154,12 @@ fn run_tiled_inner(
         while let Some(reads) = stream.next_batch()? {
             let n = reads.len();
             let input = stage0_input::run(reads);
-            let mut align = pipeline.process_to_align_batch(input, &index);
-            repeats.record(
-                &align.reads,
-                &index,
-                cfg.index_cfg,
-                cfg.pipeline_cfg.seeding.long_read_threshold,
-            )?;
+            let (mut align, counts) = if tile_plan.n_tiles() == 1 {
+                (pipeline.process_to_align_batch(input, &index), Vec::new())
+            } else {
+                pipeline.process_tile_candidates(input, &index, cfg.index_cfg)
+            };
+            repeats.record(&align.reads, &counts)?;
             remap_alignments_to_global(&mut align.alignments, tile);
 
             for (i, alns) in align.alignments.iter().enumerate() {

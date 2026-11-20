@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::index::Index;
+use crate::index::{Index, IndexConfig};
 use crate::seq::{common_prefix_len, common_suffix_len, reverse_complement_into};
 use crate::types::{Anchor, ReadRecord, Strand};
 
@@ -43,6 +43,37 @@ pub fn run_fused(
     cfg: crate::seeding::SeedingConfig,
     skip_mask: &[bool],
 ) -> (SeedBatch, SketchBatchStats) {
+    run_fused_with_counts(input, index, sketch_cfg, cfg, skip_mask, None).0
+}
+
+/// Consecutive reads' occurrence counts in one worker block.
+#[derive(Default)]
+pub(crate) struct RepeatCountBlock {
+    counts: Vec<u32>,
+    ends: Vec<usize>,
+}
+
+impl RepeatCountBlock {
+    pub(crate) fn reads(&self) -> impl Iterator<Item = &[u32]> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let counts = &self.counts[start..end];
+            start = end;
+            counts
+        })
+    }
+}
+
+/// Tile passes use the same minimizers for seeding and global repeat counts.
+/// Keep only the counts in the batch; minimizers stay in worker scratch.
+pub(crate) fn run_fused_with_counts(
+    input: InputBatch,
+    index: &Index,
+    sketch_cfg: SketchConfig,
+    cfg: crate::seeding::SeedingConfig,
+    skip_mask: &[bool],
+    repeat_cfg: Option<(IndexConfig, usize)>,
+) -> ((SeedBatch, SketchBatchStats), Vec<RepeatCountBlock>) {
     let mut reads = input.reads;
     let blocks: Vec<_> = reads
         .par_chunks(128)
@@ -55,6 +86,10 @@ pub fn run_fused(
                 let before_rescues = ctx.repeat_rescues;
                 let mut total_mins = 0;
                 let mut out = Vec::with_capacity(block.len());
+                let mut counts = RepeatCountBlock::default();
+                if repeat_cfg.is_some() {
+                    counts.ends.reserve_exact(block.len());
+                }
                 for (template_idx, pair) in block.chunks(2).enumerate() {
                     for (mate, read) in pair.iter().enumerate() {
                         let s = &mut sketches[mate];
@@ -77,6 +112,37 @@ pub fn run_fused(
                             .into_iter()
                             .take(pair.len()),
                     );
+                    if let Some((index_cfg, long_threshold)) = repeat_cfg {
+                        for (mate, read) in pair.iter().enumerate() {
+                            let sketch = &mut sketches[mate];
+                            let long = index_cfg.build_long
+                                && (!index_cfg.build_short || read.seq.len() >= long_threshold);
+                            let table = if long { &index.long } else { &index.short };
+                            let idx = block_idx * 128 + template_idx * 2 + mate;
+                            if skip_mask.get(idx).copied().unwrap_or(false)
+                                || (sketch.k, sketch.w) != (table.k, table.w)
+                            {
+                                // An AC hit skips ordinary sketching. Compute
+                                // the repeat sketch after seeding to preserve
+                                // the fast path's candidate behavior.
+                                crate::sketch::minimizers_into(
+                                    &read.seq,
+                                    &crate::sketch::MinimizerConfig {
+                                        k: table.k,
+                                        w: table.w,
+                                    },
+                                    &mut sketch.minimizers,
+                                );
+                            }
+                            counts.counts.extend(
+                                sketch
+                                    .minimizers
+                                    .iter()
+                                    .map(|m| index.bucket_count(table, m.hash).unwrap_or(0)),
+                            );
+                            counts.ends.push(counts.counts.len());
+                        }
+                    }
                 }
                 ctx.sketches = sketches;
                 (
@@ -84,6 +150,7 @@ pub fn run_fused(
                     total_mins,
                     ctx.adaptive_retries - before_retries,
                     ctx.repeat_rescues - before_rescues,
+                    counts,
                 )
             })
         })
@@ -91,7 +158,14 @@ pub fn run_fused(
     let mut anchors = Vec::with_capacity(reads.len());
     let mut stats = SeedBatchStats::default();
     let mut total_mins = 0;
-    for (block, mins, retries, rescues) in blocks {
+    let mut counts = Vec::new();
+    if repeat_cfg.is_some() {
+        counts.reserve_exact(blocks.len());
+    }
+    for (block, mins, retries, rescues, block_counts) in blocks {
+        if repeat_cfg.is_some() {
+            counts.push(block_counts);
+        }
         total_mins += mins;
         stats.adaptive_retries += retries;
         stats.repeat_rescues += rescues;
@@ -104,12 +178,15 @@ pub fn run_fused(
     }
     let sketch_stats = batch_stats(&reads, total_mins);
     (
-        SeedBatch {
-            reads,
-            anchors,
-            stats,
-        },
-        sketch_stats,
+        (
+            SeedBatch {
+                reads,
+                anchors,
+                stats,
+            },
+            sketch_stats,
+        ),
+        counts,
     )
 }
 

@@ -4,20 +4,18 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::index::{Index, IndexConfig};
-use crate::sketch::{MinimizerConfig, minimizers_into};
-use crate::types::{Minimizer, ReadRecord};
+use crate::pipeline::stage2_seeding::RepeatCountBlock;
+use crate::types::ReadRecord;
 
 const SUMMARY: &str = "read-repeat-minimum.bin";
 
 /// Successive tile passes accumulate counts for the same query minimizer.
-/// Only one query sketch and two sequential scratch streams are resident.
+/// Each batch supplies counts in query order; scratch streams stay sequential.
 pub(super) struct RepeatPass {
     previous: Option<BufReader<File>>,
     next: BufWriter<File>,
     single_tile: bool,
     final_tile: bool,
-    minimizers: Vec<Minimizer>,
 }
 
 impl RepeatPass {
@@ -39,34 +37,28 @@ impl RepeatPass {
             next: BufWriter::new(File::create(out)?),
             single_tile: tiles == 1,
             final_tile,
-            minimizers: Vec::new(),
         })
     }
 
     pub(super) fn record(
         &mut self,
         reads: &[ReadRecord],
-        index: &Index,
-        cfg: IndexConfig,
-        long_threshold: usize,
+        counts: &[RepeatCountBlock],
     ) -> Result<()> {
-        for read in reads {
-            if self.single_tile {
-                // Preserve exactly what stage 2 produced, including skipped sketches.
+        if self.single_tile {
+            // Preserve exactly what stage 2 produced, including skipped sketches.
+            for read in reads {
                 self.next.write_all(&read.repeat_min_occ.to_le_bytes())?;
-                continue;
             }
-            let long = cfg.build_long && (!cfg.build_short || read.seq.len() >= long_threshold);
-            let table = if long { &index.long } else { &index.short };
-            minimizers_into(
-                &read.seq,
-                &MinimizerConfig {
-                    k: table.k,
-                    w: table.w,
-                },
-                &mut self.minimizers,
-            );
-            let n = u32::try_from(self.minimizers.len())?;
+            return Ok(());
+        }
+
+        let mut read_counts = counts.iter().flat_map(RepeatCountBlock::reads);
+        for _ in reads {
+            let read_counts = read_counts
+                .next()
+                .context("missing tile occurrence counts")?;
+            let n = u32::try_from(read_counts.len())?;
             if let Some(previous) = &mut self.previous {
                 ensure!(
                     read_count(previous)? == n,
@@ -77,8 +69,7 @@ impl RepeatPass {
                 self.next.write_all(&n.to_le_bytes())?;
             }
             let mut minimum = None;
-            for m in &self.minimizers {
-                let local = index.bucket_count(table, m.hash).unwrap_or(0);
+            for &local in read_counts {
                 let count = match &mut self.previous {
                     Some(previous) => read_count(previous)?.saturating_add(local),
                     None => local,
@@ -95,6 +86,7 @@ impl RepeatPass {
                 self.next.write_all(&minimum.unwrap_or(0).to_le_bytes())?;
             }
         }
+        ensure!(read_counts.next().is_none(), "extra tile occurrence counts");
         Ok(())
     }
 

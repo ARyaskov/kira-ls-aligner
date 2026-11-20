@@ -49,7 +49,28 @@ fn counts_are_summed_by_seed_before_taking_the_minimum() {
         };
         let index = Index::try_build(reference, cfg).unwrap();
         let mut pass = repeat_counts::RepeatPass::open(scratch.path(), tile, 2).unwrap();
-        pass.record(&reads, &index, cfg, 500).unwrap();
+        let ((_, _), counts) = crate::pipeline::stage2_seeding::run_fused_with_counts(
+            stage0_input::run(reads.clone()),
+            &index,
+            crate::pipeline::stage1_sketch::SketchConfig {
+                short_k: 2,
+                short_w: 1,
+                long_k: 2,
+                long_w: 1,
+                long_read_threshold: 500,
+            },
+            crate::seeding::SeedingConfig {
+                min_anchor_len: 2,
+                max_occ: 100,
+                max_hits_per_minimizer: 100,
+                long_read_threshold: 500,
+                mate_window: None,
+            },
+            // Mimic one AC-resolved read; it still needs a sketch for MAPQ.
+            &[tile == 0, false],
+            Some((cfg, 500)),
+        );
+        pass.record(&reads, &counts).unwrap();
         pass.finish().unwrap();
     }
     let mut summary = repeat_counts::RepeatSummary::open(scratch.path()).unwrap();
