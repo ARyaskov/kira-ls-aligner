@@ -435,7 +435,7 @@ impl Pipeline {
             self.config.output,
             self.config.max_alignments,
             sam_buf,
-        );
+        )?;
         stats.times.stages[5] = t5.elapsed();
         Ok(stats)
     }

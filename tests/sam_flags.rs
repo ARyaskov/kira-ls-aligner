@@ -125,7 +125,8 @@ fn unpaired_mapped_emits_no_paired_bits() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, rname, pos, _mapq, _cigar, rnext, pnext, tlen) = parse_sam(&buf);
     // Unpaired, forward, mapped → only 0x0 bits or 0x10 if rev. We set forward.
     assert_eq!(flag & 0x1, 0, "should not be paired");
@@ -160,7 +161,8 @@ fn paired_proper_r1_sets_correct_bits_and_fields() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, rname, pos, _mapq, _cigar, rnext, pnext, tlen) = parse_sam(&buf);
     assert!(flag & 0x1 != 0, "0x1 paired");
     assert!(flag & 0x2 != 0, "0x2 proper pair");
@@ -200,7 +202,8 @@ fn paired_r2_reverse_sets_correct_bits_and_negative_tlen() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, _rname, _pos, _mapq, _cigar, rnext, pnext, tlen) = parse_sam(&buf);
     assert!(flag & 0x1 != 0);
     assert!(flag & 0x2 != 0);
@@ -229,7 +232,8 @@ fn reverse_alignment_emits_reverse_complemented_seq_and_reversed_qual() {
     aln.read_end = 6;
     aln.cigar[0].len = 6;
     let mut buf = Vec::new();
-    fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+    fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full())
+        .unwrap();
     let line = std::str::from_utf8(&buf).unwrap().trim_end();
     let cols: Vec<&str> = line.split('\t').collect();
     assert_eq!(cols[9], "NACGtT");
@@ -259,7 +263,8 @@ fn mate_on_different_ref_emits_full_rname() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, _rname, _pos, _mapq, _cigar, rnext, _pnext, _tlen) = parse_sam(&buf);
     assert!(flag & 0x1 != 0);
     assert_eq!(flag & 0x2, 0, "should NOT be proper pair (different refs)");
@@ -289,7 +294,8 @@ fn mate_unmapped_sets_0x8_and_uses_self_rname() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, _rname, pos, _mapq, _cigar, rnext, pnext, tlen) = parse_sam(&buf);
     assert!(flag & 0x1 != 0);
     assert!(flag & 0x8 != 0, "0x8 mate unmapped");
@@ -374,7 +380,8 @@ fn supplementary_keeps_mapq_and_sets_0x800() {
         None,
         None,
         OutputConfig::full(),
-    );
+    )
+    .unwrap();
     let (flag, _rname, _pos, mapq, _cigar, _rnext, _pnext, _tlen) = parse_sam(&buf);
     assert!(flag & 0x800 != 0, "0x800 supplementary");
     assert_eq!(flag & 0x100, 0, "must not be secondary");

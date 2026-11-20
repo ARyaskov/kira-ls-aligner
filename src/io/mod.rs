@@ -1038,7 +1038,8 @@ impl SamFormatter {
         read_group: Option<&str>,
         extra_tags: Option<&[u8]>,
         cfg: OutputConfig,
-    ) {
+    ) -> Result<()> {
+        checked_cigar(read, aln)?;
         let rname = &self.contigs.names[aln.ref_id as usize];
         let pos = aln.ref_start + 1; // SAM is 1-based
         let flag = sam_flag_with(aln, cfg.split_as_secondary);
@@ -1059,7 +1060,7 @@ impl SamFormatter {
         buf.push(b'\t');
         push_u32(buf, aln.mapq as u32);
         buf.push(b'\t');
-        append_cigar_for_seq(buf, &aln.cigar, read.seq.len() as u32, hard_clip);
+        append_record_cigar(buf, &aln.cigar, hard_clip);
 
         // RNEXT / PNEXT / TLEN — non-trivial only when paired.
         let (mate_position, tlen) = mapped_mate_fields(aln);
@@ -1130,6 +1131,7 @@ impl SamFormatter {
             append_fastq_comment(buf, read);
         }
         buf.push(b'\n');
+        Ok(())
     }
 
     pub fn append_xa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
@@ -1605,9 +1607,9 @@ impl SamWriter {
         read_group: Option<&str>,
         extra_tags: Option<&[u8]>,
         cfg: OutputConfig,
-    ) {
+    ) -> Result<()> {
         self.formatter
-            .append_alignment(buf, read, aln, read_group, extra_tags, cfg);
+            .append_alignment(buf, read, aln, read_group, extra_tags, cfg)
     }
     pub fn append_xa(&self, buf: &mut Vec<u8>, alignments: &[Alignment]) -> bool {
         self.formatter.append_xa(buf, alignments)
@@ -1662,12 +1664,12 @@ pub(crate) fn append_cigar_ops(buf: &mut Vec<u8>, ops: &[CigarOp]) {
 
 /// Bytes of the read consumed by a CIGAR: M, I, S, =, X consume query.
 #[inline]
-fn cigar_query_consumed(ops: &[CigarOp]) -> u32 {
-    let mut n: u32 = 0;
+fn cigar_query_consumed(ops: &[CigarOp]) -> u64 {
+    let mut n = 0u64;
     for op in ops {
         match op.op {
             CigarKind::Match | CigarKind::Ins | CigarKind::SoftClip => {
-                n = n.saturating_add(op.len);
+                n += u64::from(op.len);
             }
             CigarKind::Del | CigarKind::Skipped => {}
         }
@@ -1682,8 +1684,7 @@ fn cigar_query_consumed(ops: &[CigarOp]) -> u32 {
 /// `hard_clip` the terminal soft clips are written as `H` (bwa-mem's
 /// supplementary convention); the consumed-length check still runs against
 /// the soft-clipped form, since that is what the aligner produced.
-fn append_cigar_for_seq(buf: &mut Vec<u8>, ops: &[CigarOp], seq_len: u32, hard_clip: bool) {
-    let ops = checked_cigar(ops, seq_len);
+fn append_record_cigar(buf: &mut Vec<u8>, ops: &[CigarOp], hard_clip: bool) {
     if !hard_clip || ops.is_empty() {
         append_cigar(buf, ops);
         return;
@@ -1701,16 +1702,19 @@ fn append_cigar_for_seq(buf: &mut Vec<u8>, ops: &[CigarOp], seq_len: u32, hard_c
     }
 }
 
-fn checked_cigar(ops: &[CigarOp], seq_len: u32) -> &[CigarOp] {
-    let consumed = cigar_query_consumed(ops);
-    if consumed != seq_len {
-        debug_assert_eq!(
-            consumed, seq_len,
-            "alignment CIGAR consumes {consumed} query bases, expected {seq_len}"
+fn checked_cigar(read: &ReadRecord, aln: &Alignment) -> Result<()> {
+    let consumed = cigar_query_consumed(&aln.cigar);
+    let expected = read.seq.len();
+    if aln.cigar.is_empty() || consumed != expected as u64 {
+        let mut cigar = Vec::new();
+        append_cigar(&mut cigar, &aln.cigar);
+        anyhow::bail!(
+            "read {}: invalid mapped CIGAR {} consumes {consumed} query bases, expected {expected}",
+            read.id,
+            String::from_utf8_lossy(&cigar)
         );
-        return &[];
     }
-    ops
+    Ok(())
 }
 
 fn terminal_cigar_op(i: usize, len: usize) -> bool {
@@ -1878,7 +1882,8 @@ mod format_tests {
         let aln = supp_alignment();
 
         let mut buf = Vec::new();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full())
+            .unwrap();
         let f = fields(&buf);
         assert_eq!(f[1], "2048");
         assert_eq!(f[5], "80H70M");
@@ -1889,7 +1894,8 @@ mod format_tests {
         let mut cfg = OutputConfig::full();
         cfg.soft_clip_supplementary = true;
         buf.clear();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, cfg);
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, cfg)
+            .unwrap();
         let f = fields(&buf);
         assert_eq!(f[5], "80S70M");
         assert_eq!(f[9].len(), 150);
@@ -1897,7 +1903,8 @@ mod format_tests {
         let mut cfg = OutputConfig::full();
         cfg.split_as_secondary = true;
         buf.clear();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, cfg);
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, cfg)
+            .unwrap();
         assert_eq!(
             fields(&buf)[1],
             "256",
@@ -1937,7 +1944,8 @@ mod format_tests {
         aln.xs_strand = Some(crate::types::Strand::Forward);
 
         let mut buf = Vec::new();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full())
+            .unwrap();
         let f = fields(&buf);
         let xs: Vec<&str> = f
             .iter()
@@ -1965,7 +1973,8 @@ mod format_tests {
         // Without a strand the ordinary `XS:i` score path is unchanged.
         aln.xs_strand = None;
         buf.clear();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full())
+            .unwrap();
         let f = fields(&buf);
         let xs: Vec<&str> = f
             .iter()
@@ -1983,7 +1992,8 @@ mod format_tests {
         let mut aln = supp_alignment();
         aln.is_rev = true;
         let mut buf = Vec::new();
-        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full());
+        fmt.append_alignment(&mut buf, &read, &aln, None, None, OutputConfig::full())
+            .unwrap();
         let f = fields(&buf);
         // Oriented (reverse-complemented) read, minus its first 80 bases.
         let mut rc = Vec::new();

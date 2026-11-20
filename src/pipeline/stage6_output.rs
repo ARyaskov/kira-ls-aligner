@@ -32,7 +32,7 @@ pub fn run(
         read_group,
         output_cfg,
         max_alignments,
-    );
+    )?;
     writer.write_batch(&buf)
 }
 
@@ -43,7 +43,7 @@ pub fn serialize(
     read_group: Option<&str>,
     output_cfg: OutputConfig,
     max_alignments: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     serialize_into(
         input,
@@ -52,8 +52,8 @@ pub fn serialize(
         output_cfg,
         max_alignments,
         &mut out,
-    );
-    out
+    )?;
+    Ok(out)
 }
 
 /// [`serialize`] into a caller-owned buffer, cleared first and keeping its
@@ -65,7 +65,7 @@ pub fn serialize_into(
     output_cfg: OutputConfig,
     max_alignments: usize,
     out: &mut Vec<u8>,
-) {
+) -> Result<()> {
     let reads: Vec<ReadRecord> = input.reads;
     let mut alignments = input.alignments;
     let xa_has_alt = input.xa_has_alt;
@@ -129,7 +129,7 @@ pub fn serialize_into(
     let chunk_size: usize = 64;
     let read_group_id = output_cfg.read_group_id(read_group);
 
-    let chunks: Vec<Vec<u8>> = quads
+    let chunks: Result<Vec<Vec<u8>>> = quads
         .par_chunks(chunk_size)
         .map(|chunk| {
             let mut estimate = 0usize;
@@ -191,7 +191,7 @@ pub fn serialize_into(
                                 };
                                 formatter.append_alignment(
                                     &mut buf, read, aln, read_group, tags, output_cfg,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -202,16 +202,18 @@ pub fn serialize_into(
                     }
                 }
             }
-            buf
+            Ok(buf)
         })
         .collect();
 
+    let chunks = chunks?;
     let total: usize = chunks.iter().map(|c| c.len()).sum();
     out.clear();
     out.reserve(total);
     for c in chunks {
         out.extend_from_slice(&c);
     }
+    Ok(())
 }
 
 /// Build writer records in input order without serializing the batch to SAM.
@@ -553,7 +555,7 @@ mod tests {
             // first cap, so XA survives only when the binary path receives
             // `has_alt = true` (no effect on the `write_xa = false` case).
             cfg.xa_max = 1;
-            let sam_text = serialize(input.clone(), &formatter, rg, cfg, max_alignments);
+            let sam_text = serialize(input.clone(), &formatter, rg, cfg, max_alignments)?;
             let mut reader = sam::io::Reader::new(sam_text.as_slice());
             let expected = reader
                 .record_bufs(&header)
@@ -572,6 +574,30 @@ mod tests {
             assert_eq!(actual, expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn invalid_mapped_cigar_is_an_error_for_sam_and_binary_output() {
+        let formatter = SamFormatter::from_catalog(std::sync::Arc::new(crate::io::ContigCatalog {
+            names: vec!["chr1".into()],
+            lens: vec![1000],
+        }));
+        let mut batch = witness_batch(70);
+        batch.alignments[0][0].cigar[0].len = 9;
+        for error in [
+            serialize(batch.clone(), &formatter, None, OutputConfig::full(), 1).unwrap_err(),
+            binary_records(batch, &formatter, None, OutputConfig::full(), 1).unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(
+                message.contains("read w: invalid mapped CIGAR 9M"),
+                "{message}"
+            );
+            assert!(
+                message.contains("consumes 9 query bases, expected 10"),
+                "{message}"
+            );
+        }
     }
 
     /// bwa-mem `-h 2,200` drop-filter witness batch: primary 100, three
@@ -632,12 +658,12 @@ mod tests {
     fn xa_drop_filter_suppresses_text_xa_for_the_bwa_witness() {
         let formatter = witness_formatter();
         let cfg = witness_cfg();
-        let weak = serialize(witness_batch(70), &formatter, None, cfg, 1);
+        let weak = serialize(witness_batch(70), &formatter, None, cfg, 1).unwrap();
         assert!(
             !String::from_utf8_lossy(&weak).contains("\tXA:Z:"),
             "XA must be suppressed when the only ALT candidate falls below the 0.80 drop ratio"
         );
-        let strong = serialize(witness_batch(95), &formatter, None, cfg, 1);
+        let strong = serialize(witness_batch(95), &formatter, None, cfg, 1).unwrap();
         assert!(
             String::from_utf8_lossy(&strong).contains("\tXA:Z:"),
             "XA must survive when the ALT candidate passes the 0.80 drop ratio"

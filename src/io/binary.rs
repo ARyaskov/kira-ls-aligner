@@ -32,6 +32,7 @@ pub(crate) fn mapped(
     read_group: Option<&str>,
     cfg: OutputConfig,
 ) -> Result<RecordBuf> {
+    checked_cigar(read, aln)?;
     let (hard_clip, keep) = alignment_clip(aln, read.seq.len(), cfg);
     let mut record = read_fields(read, keep, aln.is_rev, true)?;
     *record.flags_mut() = Flags::from(sam_flag_with(aln, cfg.split_as_secondary));
@@ -39,7 +40,7 @@ pub(crate) fn mapped(
     *record.alignment_start_mut() = (aln.ref_start as usize + 1).try_into().ok();
     *record.mapping_quality_mut() = MappingQuality::new(aln.mapq);
 
-    let ops = checked_cigar(&aln.cigar, read.seq.len() as u32);
+    let ops = &aln.cigar;
     *record.cigar_mut() = ops
         .iter()
         .enumerate()

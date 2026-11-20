@@ -74,7 +74,8 @@ fn xa_lists_secondaries_pruned_by_the_output_cap() {
     };
     // max_alignments = 1 is the CLI default: only the primary record is written.
     let sam =
-        String::from_utf8(serialize(batch, &formatter, None, OutputConfig::full(), 1)).unwrap();
+        String::from_utf8(serialize(batch, &formatter, None, OutputConfig::full(), 1).unwrap())
+            .unwrap();
     let lines: Vec<&str> = sam.lines().collect();
     assert_eq!(lines.len(), 1, "only the primary record is emitted:\n{sam}");
     assert!(
@@ -189,19 +190,22 @@ fn stage5_has_alt_selects_the_second_cap_in_sam_output() {
         .to_vec();
     let mut cfg = OutputConfig::full();
     cfg.xa_max = 2; // first cap below the candidate count; ALT cap 200
-    let sam = String::from_utf8(serialize(
-        ScoredBatch {
-            reads,
-            alignments: vec![alns.clone(), alns],
-            xa_has_alt: vec![true, false],
-            unmapped_mate_info: vec![None, None],
-            stats: Default::default(),
-        },
-        &fmt,
-        None,
-        cfg,
-        1,
-    ))
+    let sam = String::from_utf8(
+        serialize(
+            ScoredBatch {
+                reads,
+                alignments: vec![alns.clone(), alns],
+                xa_has_alt: vec![true, false],
+                unmapped_mate_info: vec![None, None],
+                stats: Default::default(),
+            },
+            &fmt,
+            None,
+            cfg,
+            1,
+        )
+        .unwrap(),
+    )
     .unwrap();
     let lines: Vec<&str> = sam.lines().filter(|l| !l.starts_with('@')).collect();
     assert!(lines.len() >= 2, "two primary records expected:\n{sam}");

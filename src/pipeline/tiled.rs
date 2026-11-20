@@ -285,7 +285,7 @@ fn run_tiled_inner(
             cfg.read_group.as_deref(),
             cfg.pipeline_cfg.output,
             cfg.pipeline_cfg.max_alignments,
-        );
+        )?;
         writer.write_batch(&sam_buf)?;
     }
 
