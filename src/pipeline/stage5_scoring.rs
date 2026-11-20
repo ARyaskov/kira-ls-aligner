@@ -1,9 +1,7 @@
 use rayon::prelude::*;
 
 use crate::io::xa_candidates;
-use crate::mapq::{
-    MapqConfig, PairMapqContext, assign_mapq_preserving_primary, assign_mapq_with_qual,
-};
+use crate::mapq::{MapqConfig, PairMapqContext, assign_mapq_impl};
 use crate::types::{Alignment, MateInfo, PairRole};
 
 use super::stage4_alignment::{AlignBatch, AlignmentBatchStats};
@@ -45,25 +43,15 @@ pub fn run_with_primary_policy(
         .par_iter_mut()
         .zip(reads.par_iter())
         .for_each(|(alns, read)| {
-            if read.pair_role == PairRole::Unpaired && !preserve_primary {
-                assign_mapq_with_qual(
-                    alns,
-                    read.seq.len(),
-                    read.qual.as_deref(),
-                    cfg,
-                    pair_ctx,
-                    read.repeat_min_occ,
-                );
-            } else {
-                assign_mapq_preserving_primary(
-                    alns,
-                    read.seq.len(),
-                    read.qual.as_deref(),
-                    cfg,
-                    pair_ctx,
-                    read.repeat_min_occ,
-                );
-            }
+            assign_mapq_impl(
+                alns,
+                read.seq.len(),
+                read.qual.as_deref(),
+                &cfg,
+                pair_ctx,
+                read.repeat_min_occ,
+                read.pair_role != PairRole::Unpaired || preserve_primary,
+            );
         });
 
     // `XA` ALT metadata: any qualifying ALT candidate among the
@@ -115,7 +103,7 @@ mod tests {
         }
     }
 
-    fn run_stage5(mask: Option<&'static [bool]>, alns: Vec<Vec<Alignment>>) -> ScoredBatch {
+    fn run_stage5(mask: Option<std::sync::Arc<[bool]>>, alns: Vec<Vec<Alignment>>) -> ScoredBatch {
         let reads: Vec<crate::types::ReadRecord> = (0..alns.len())
             .map(|i| crate::types::ReadRecord {
                 id: format!("r{i}"),
@@ -148,7 +136,7 @@ mod tests {
     /// stay `false`.
     #[test]
     fn xa_has_alt_flags_secondary_alt_candidates_only() {
-        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mask = std::sync::Arc::from([false, true]);
         let scored = run_stage5(
             Some(mask),
             vec![
@@ -175,7 +163,7 @@ mod tests {
     /// Before the filter this returned `true` and stage 6 emitted XA.
     #[test]
     fn xa_has_alt_ignores_candidates_below_the_bwa_drop_ratio() {
-        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mask = std::sync::Arc::from([false, true]);
         let mut primary = aln(0, false);
         primary.score = 100;
         let mut strong = aln(0, true);
@@ -193,7 +181,7 @@ mod tests {
     /// sets `has_alt` and selects the `-h` second cap.
     #[test]
     fn xa_has_alt_keeps_a_candidate_at_the_drop_threshold() {
-        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mask = std::sync::Arc::from([false, true]);
         let mut primary = aln(0, false);
         primary.score = 100;
         let mut alt = aln(1, true);

@@ -146,7 +146,7 @@ fn run_tiled_inner(
                 tile.contig_end - tile.contig_start,
             ))
         });
-        let pipeline = Pipeline::with_pool(cfg.pipeline_cfg, Arc::clone(&pool))
+        let pipeline = Pipeline::with_pool(cfg.pipeline_cfg.clone(), Arc::clone(&pool))
             .with_junctions(junctions, cfg.junc_bed_tolerance);
 
         let mut global_read_idx: u64 = 0;
@@ -275,7 +275,7 @@ fn run_tiled_inner(
                 unmapped_mate_info,
                 stats: AlignmentBatchStats::default(),
             },
-            cfg.pipeline_cfg.mapq,
+            cfg.pipeline_cfg.mapq.clone(),
             pair_ctx,
             preserve_primary,
         );

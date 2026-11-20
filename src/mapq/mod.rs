@@ -1,7 +1,7 @@
 use crate::types::{Alignment, AlignmentKind, CigarKind};
 
 /// MAPQ configuration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MapqConfig {
     pub short_read_len: usize,
     pub mapq_cap_short: u8,
@@ -10,7 +10,7 @@ pub struct MapqConfig {
     /// A primary-assembly placement is not made ambiguous by its ALT-contig
     /// copies: competitors on ALT contigs are left out of the score-gap model
     /// unless the primary itself sits on an ALT contig.
-    pub alt_mask: Option<&'static [bool]>,
+    pub alt_mask: Option<std::sync::Arc<[bool]>>,
 }
 
 impl MapqConfig {
@@ -18,6 +18,7 @@ impl MapqConfig {
     #[inline]
     pub fn is_alt(&self, ref_id: u32) -> bool {
         self.alt_mask
+            .as_deref()
             .is_some_and(|m| m.get(ref_id as usize).copied().unwrap_or(false))
     }
 }
@@ -65,7 +66,7 @@ pub fn assign_mapq_with_qual(
         alignments,
         read_len,
         qual,
-        cfg,
+        &cfg,
         pair_ctx,
         repeat_min_occ,
         false,
@@ -86,18 +87,18 @@ pub fn assign_mapq_preserving_primary(
         alignments,
         read_len,
         qual,
-        cfg,
+        &cfg,
         pair_ctx,
         repeat_min_occ,
         true,
     );
 }
 
-fn assign_mapq_impl(
+pub(crate) fn assign_mapq_impl(
     alignments: &mut [Alignment],
     read_len: usize,
     qual: Option<&[u8]>,
-    cfg: MapqConfig,
+    cfg: &MapqConfig,
     pair_ctx: Option<PairMapqContext>,
     repeat_min_occ: u32,
     preserve_primary: bool,

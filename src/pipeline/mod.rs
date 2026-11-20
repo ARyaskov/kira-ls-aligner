@@ -43,7 +43,7 @@ use crate::seeding::SeedingConfig;
 use crate::types::{Alignment, MateInfo, ReadRecord, Reference};
 
 /// Pipeline configuration aggregated across stages.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PipelineConfig {
     pub sketch: SketchConfig,
     pub seeding: SeedingConfig,
@@ -86,15 +86,15 @@ pub struct PipelineConfig {
     /// a read whose best hit is on an ALT contig but which has an equivalent
     /// primary-assembly hit is reported on the primary assembly, as
     /// `bwa-postalt` does.
-    pub alt_mask: Option<&'static [bool]>,
+    pub alt_mask: Option<Arc<[bool]>>,
 }
 
 impl PipelineConfig {
     /// Install the ALT-contig mask (both the placement policy and the MAPQ
     /// model read it). Re-applied whenever a read-mode profile replaces the
     /// config, since profiles are built before the index is known.
-    pub fn set_alt_mask(&mut self, mask: Option<&'static [bool]>) {
-        self.alt_mask = mask;
+    pub fn set_alt_mask(&mut self, mask: Option<Arc<[bool]>>) {
+        self.alt_mask = mask.clone();
         self.mapq.alt_mask = mask;
     }
 }
@@ -394,7 +394,7 @@ impl Pipeline {
         let scored = self.pool.install_light(|| {
             stage5_scoring::run_with_primary_policy(
                 align,
-                self.config.mapq,
+                self.config.mapq.clone(),
                 pair_ctx,
                 preserve_primary,
             )
@@ -536,7 +536,7 @@ impl PostAlignPolicy<'_> {
         }
         // ALT contigs: prefer an equivalent primary-assembly placement over an
         // ALT one (bwa-postalt), before pairing sees the coordinates.
-        if let Some(mask) = cfg.alt_mask {
+        if let Some(mask) = cfg.alt_mask.as_deref() {
             apply_alt_primary_policy(reads, alignments, mask, acfg.mismatch);
         }
 

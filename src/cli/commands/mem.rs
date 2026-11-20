@@ -566,21 +566,21 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 alignment: short_align,
                 dp_topk: short_dp_topk,
                 short_preset: true,
-                ..pipeline_cfg
+                ..pipeline_cfg.clone()
             },
             long: PipelineConfig {
                 chaining: long_chaining,
                 alignment: long_align,
                 dp_topk: long_dp_topk,
                 short_preset: false,
-                ..pipeline_cfg
+                ..pipeline_cfg.clone()
             },
             hybrid: PipelineConfig {
                 chaining: hybrid_chaining,
                 alignment: hybrid_align,
                 dp_topk: hybrid_dp_topk,
                 short_preset: false,
-                ..pipeline_cfg
+                ..pipeline_cfg.clone()
             },
             decided: None,
         })

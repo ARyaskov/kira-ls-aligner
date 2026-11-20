@@ -62,19 +62,17 @@ impl Aligner {
 
     /// Resolve the configured ALT-contig names against `index` into a
     /// per-ref-id mask (see [`resolve_alt_mask`]).
-    fn alt_mask_for(&self, index: &Index) -> Option<&'static [bool]> {
+    fn alt_mask_for(&self, index: &Index) -> Option<Arc<[bool]>> {
         let names = self.cfg.alt_contigs.as_ref()?;
         resolve_alt_mask(names, &index.reference)
     }
 }
 
-/// Resolve ALT-contig names against a reference into a per-ref-id mask,
-/// leaked to `'static` (a bool per contig, once per run) so the `Copy`
-/// pipeline/MAPQ configs can carry it.
+/// Resolve ALT-contig names into a shared mask owned by the active run.
 pub(crate) fn resolve_alt_mask(
     names: &std::collections::HashSet<String>,
     reference: &crate::types::Reference,
-) -> Option<&'static [bool]> {
+) -> Option<Arc<[bool]>> {
     let mask: Vec<bool> = reference
         .sequences
         .iter()
@@ -92,7 +90,25 @@ pub(crate) fn resolve_alt_mask(
         "[KIRA] ALT-aware: {n_alt} of {} contigs are ALT",
         mask.len()
     );
-    Some(Box::leak(mask.into_boxed_slice()))
+    Some(mask.into())
+}
+
+#[cfg(test)]
+#[test]
+fn alt_mask_is_released_after_the_run() {
+    use crate::types::{RefBases, RefSeq, Reference};
+
+    let reference = Reference {
+        sequences: vec![RefSeq {
+            name: "alt".into(),
+            bases: RefBases::Owned(b"ACGT".to_vec()),
+        }],
+    };
+    let mask = resolve_alt_mask(&["alt".into()].into_iter().collect(), &reference).unwrap();
+    assert_eq!(&*mask, &[true]);
+    let lifetime = Arc::downgrade(&mask);
+    drop(mask);
+    assert!(lifetime.upgrade().is_none());
 }
 
 fn adjust_auto_params(
@@ -177,7 +193,7 @@ fn decide_auto_mode(
     profiles: &mut ReadModeProfiles,
     reads: &[crate::types::ReadRecord],
     pipeline: &mut Pipeline,
-    alt_mask: Option<&'static [bool]>,
+    alt_mask: Option<Arc<[bool]>>,
 ) -> Option<(ReadMode, ModeFeatures)> {
     if profiles.decided.is_some() {
         return None;
@@ -186,7 +202,7 @@ fn decide_auto_mode(
     let mode = classify(features);
     profiles.decided = Some(mode);
     pipeline.config = profiles.select(mode);
-    pipeline.config.set_alt_mask(alt_mask);
+    pipeline.config.set_alt_mask(alt_mask.clone());
     crate::kira_info!(
         "[KIRA_MODE] -x auto selected {:?} from the first batch (reads={} p50={} p90={})",
         mode,
@@ -421,10 +437,10 @@ impl Aligner {
             self.cfg.pipeline.paired.mode,
             self.cfg.keep_comment,
         )?;
-        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline.clone(), Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
         let alt_mask = self.alt_mask_for(&index);
-        pipeline.config.set_alt_mask(alt_mask);
+        pipeline.config.set_alt_mask(alt_mask.clone());
         if stats_enabled {
             crate::kira_info!(
                 "[KIRA_CONFIG] {}",
@@ -510,7 +526,7 @@ impl Aligner {
 
                 if let Some(profiles) = auto_profiles.as_mut()
                     && let Some((mode, features)) =
-                        decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask)
+                        decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask.clone())
                 {
                     mode_selected = Some((mode, features.read_len_p50));
                 }
@@ -714,15 +730,15 @@ impl Aligner {
             self.cfg.pipeline.paired.mode,
             self.cfg.keep_comment,
         )?;
-        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline.clone(), Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
         let alt_mask = self.alt_mask_for(&index);
-        pipeline.config.set_alt_mask(alt_mask);
+        pipeline.config.set_alt_mask(alt_mask.clone());
         let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
             if let Some(profiles) = auto_profiles.as_mut() {
-                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask);
+                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask.clone());
             }
             let input = stage0_input::run(reads);
             let (scored, stats) = pipeline.process_batch_scored(input, &index)?;
@@ -844,15 +860,15 @@ impl Aligner {
             self.cfg.pipeline.paired.mode,
             self.cfg.keep_comment,
         )?;
-        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline, Arc::clone(&pool))
+        let mut pipeline = Pipeline::with_pool(self.cfg.pipeline.clone(), Arc::clone(&pool))
             .with_junctions(self.cfg.junctions.clone(), self.cfg.junc_bed_tolerance);
         let alt_mask = self.alt_mask_for(&index);
-        pipeline.config.set_alt_mask(alt_mask);
+        pipeline.config.set_alt_mask(alt_mask.clone());
         let mut auto_profiles = self.cfg.auto_profiles.clone();
 
         while let Some(reads) = stream.next_batch()? {
             if let Some(profiles) = auto_profiles.as_mut() {
-                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask);
+                decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask.clone());
             }
             let input = stage0_input::run(reads);
             let bo = pipeline.process_batch_serialized(

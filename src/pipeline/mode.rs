@@ -69,9 +69,9 @@ pub struct ReadModeProfiles {
 impl ReadModeProfiles {
     pub fn select(&self, mode: ReadMode) -> PipelineConfig {
         match mode {
-            ReadMode::Short => self.short,
-            ReadMode::Long => self.long,
-            ReadMode::Hybrid => self.hybrid,
+            ReadMode::Short => self.short.clone(),
+            ReadMode::Long => self.long.clone(),
+            ReadMode::Hybrid => self.hybrid.clone(),
         }
     }
 }

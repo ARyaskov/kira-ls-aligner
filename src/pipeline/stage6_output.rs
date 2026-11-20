@@ -579,7 +579,7 @@ mod tests {
     /// `weak_alt_score`, run through stage 5 with an ALT mask so
     /// `xa_has_alt` reflects the 0.80 filter.
     fn witness_batch(weak_alt_score: i32) -> ScoredBatch {
-        let mask: &'static [bool] = Box::leak(vec![false, true].into_boxed_slice());
+        let mask = std::sync::Arc::from([false, true]);
         let witness_alignment = |score: i32, ref_id: u32| {
             let mut a = alignment(score, false);
             a.ref_id = ref_id;
