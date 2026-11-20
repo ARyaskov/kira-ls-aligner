@@ -40,7 +40,7 @@ pub struct Occ {
 /// difference between the variants is irrelevant.
 #[allow(clippy::large_enum_variant)]
 enum HashLookup {
-    Mph(Arc<kira_kv_engine::Index>),
+    Mph(kira_kv_engine::Index),
     Sorted(Vec<u64>),
 }
 
@@ -84,14 +84,19 @@ pub struct HotBucketEntry {
 }
 
 /// A minimizer index table. See the module-level doc for layout details.
+#[derive(Clone)]
 pub struct MinimizerIndex {
     pub k: usize,
     pub w: usize,
     pub max_occ: usize,
+    /// Per-profile cache, populated independently from immutable table data.
+    pub hot_cache: Option<rustc_hash::FxHashMap<u32, HotBucketEntry>>,
+    data: Arc<MinimizerTableData>,
+}
+
+struct MinimizerTableData {
     /// `hash → bucket id`. `None` for empty indices (e.g. `build_short=false`).
     hash_lookup: Option<HashLookup>,
-    /// Optional hot-bucket cache.
-    pub hot_cache: Option<rustc_hash::FxHashMap<u32, HotBucketEntry>>,
     /// True occurrence counts, including occurrences omitted from `flat_occs`.
     bucket_counts: OffsetStorage,
     /// `bucket_offsets[id]` = offset into `flat_occs` (in records).
@@ -110,37 +115,20 @@ impl std::fmt::Debug for MinimizerIndex {
             .field("max_occ", &self.max_occ)
             .field(
                 "hash_lookup_keys",
-                &self.hash_lookup.as_ref().map(|x| x.key_count()),
+                &self.data.hash_lookup.as_ref().map(|x| x.key_count()),
             )
             .field(
                 "hash_lookup_kind",
-                &self.hash_lookup.as_ref().map(|x| match x {
+                &self.data.hash_lookup.as_ref().map(|x| match x {
                     HashLookup::Mph(_) => "mph",
                     HashLookup::Sorted(_) => "sorted",
                 }),
             )
-            .field("n_buckets", &self.bucket_offsets.len().saturating_sub(1))
+            .field(
+                "n_buckets",
+                &self.data.bucket_offsets.len().saturating_sub(1),
+            )
             .finish()
-    }
-}
-
-impl Clone for MinimizerIndex {
-    fn clone(&self) -> Self {
-        let hash_lookup = self.hash_lookup.as_ref().map(|lk| match lk {
-            HashLookup::Mph(idx) => HashLookup::Mph(Arc::clone(idx)),
-            HashLookup::Sorted(arr) => HashLookup::Sorted(arr.clone()),
-        });
-        Self {
-            k: self.k,
-            w: self.w,
-            max_occ: self.max_occ,
-            hash_lookup,
-            hot_cache: self.hot_cache.clone(),
-            bucket_counts: self.bucket_counts.clone(),
-            bucket_offsets: self.bucket_offsets.clone(),
-            flat_occs: self.flat_occs.clone(),
-            repeat_rescue: self.repeat_rescue.clone(),
-        }
     }
 }
 
@@ -400,7 +388,7 @@ impl MinimizerIndex {
                 t_lookup.elapsed().as_secs_f64(),
             );
             let n_slots = mph.slot_capacity();
-            (HashLookup::Mph(Arc::new(mph)), n_slots, Some(assigned))
+            (HashLookup::Mph(mph), n_slots, Some(assigned))
         } else {
             crate::kira_info!(
                 "[KIRA_INDEX] (k={k} w={w}) phase D: sorted-array lookup over {:.1}M keys \
@@ -502,12 +490,14 @@ impl MinimizerIndex {
             k,
             w,
             max_occ,
-            hash_lookup: Some(lookup),
             hot_cache: None,
-            bucket_counts: OffsetStorage::Owned(final_counts),
-            bucket_offsets: OffsetStorage::Owned(final_offsets),
-            flat_occs: OccStorage::Owned(final_flat_occs),
-            repeat_rescue,
+            data: Arc::new(MinimizerTableData {
+                hash_lookup: Some(lookup),
+                bucket_counts: OffsetStorage::Owned(final_counts),
+                bucket_offsets: OffsetStorage::Owned(final_offsets),
+                flat_occs: OccStorage::Owned(final_flat_occs),
+                repeat_rescue,
+            }),
         })
     }
 
@@ -633,7 +623,7 @@ impl MinimizerIndex {
         let (lookup, n_slots, assigned_ids): (HashLookup, usize, Option<Vec<u32>>) = if use_mph {
             let (mph, assigned) = kv::build_mph(&unique_hashes);
             let n_slots = mph.slot_capacity();
-            (HashLookup::Mph(Arc::new(mph)), n_slots, Some(assigned))
+            (HashLookup::Mph(mph), n_slots, Some(assigned))
         } else {
             let n = unique_hashes.len();
             (HashLookup::Sorted(unique_hashes), n, None)
@@ -704,12 +694,14 @@ impl MinimizerIndex {
             k,
             w,
             max_occ,
-            hash_lookup: Some(lookup),
             hot_cache: None,
-            bucket_counts: OffsetStorage::Owned(counts),
-            bucket_offsets: OffsetStorage::Owned(offsets),
-            flat_occs: OccStorage::Owned(occurrences),
-            repeat_rescue,
+            data: Arc::new(MinimizerTableData {
+                hash_lookup: Some(lookup),
+                bucket_counts: OffsetStorage::Owned(counts),
+                bucket_offsets: OffsetStorage::Owned(offsets),
+                flat_occs: OccStorage::Owned(occurrences),
+                repeat_rescue,
+            }),
         })
     }
 
@@ -719,12 +711,12 @@ impl MinimizerIndex {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
-        if self.hash_lookup.is_none() || top_n == 0 {
+        if self.data.hash_lookup.is_none() || top_n == 0 {
             self.hot_cache = None;
             return;
         }
 
-        let n_offsets = self.bucket_offsets.len();
+        let n_offsets = self.data.bucket_offsets.len();
         if n_offsets < 2 {
             self.hot_cache = None;
             return;
@@ -741,8 +733,8 @@ impl MinimizerIndex {
 
         let mut top: BinaryHeap<Reverse<(usize, u32)>> = BinaryHeap::with_capacity(top_n + 1);
         for slot in 0..n_slots {
-            let s = self.bucket_offsets.get(slot, mmap) as usize;
-            let e = self.bucket_offsets.get(slot + 1, mmap) as usize;
+            let s = self.data.bucket_offsets.get(slot, mmap) as usize;
+            let e = self.data.bucket_offsets.get(slot + 1, mmap) as usize;
             let len = e - s;
             if len == 0 || len > self.max_occ {
                 continue;
@@ -766,11 +758,11 @@ impl MinimizerIndex {
             if total_occs + len > max_total_occs {
                 break;
             }
-            let s = self.bucket_offsets.get(slot as usize, mmap) as usize;
-            let e = self.bucket_offsets.get(slot as usize + 1, mmap) as usize;
+            let s = self.data.bucket_offsets.get(slot as usize, mmap) as usize;
+            let e = self.data.bucket_offsets.get(slot as usize + 1, mmap) as usize;
             let mut occs = Vec::with_capacity(e - s);
             for i in s..e {
-                let o = self.flat_occs.get(i, mmap);
+                let o = self.data.flat_occs.get(i, mmap);
                 occs.push((o.ref_id, o.pos, o.strand));
             }
             total_occs += occs.len();
@@ -796,13 +788,13 @@ impl MinimizerIndex {
 
     /// One-shot bucket descriptor.
     pub fn bucket(&self, mmap: Option<&[u8]>, hash: u64) -> Option<(usize, usize)> {
-        let lookup = self.hash_lookup.as_ref()?;
+        let lookup = self.data.hash_lookup.as_ref()?;
         let id = lookup.lookup(hash)?;
-        if id + 1 >= self.bucket_offsets.len() {
+        if id + 1 >= self.data.bucket_offsets.len() {
             return None;
         }
-        let start = self.bucket_offsets.get(id, mmap) as usize;
-        let end = self.bucket_offsets.get(id + 1, mmap) as usize;
+        let start = self.data.bucket_offsets.get(id, mmap) as usize;
+        let end = self.data.bucket_offsets.get(id + 1, mmap) as usize;
         Some((start, end))
     }
 
@@ -816,19 +808,19 @@ impl MinimizerIndex {
         out: &mut [Option<(usize, usize)>],
     ) {
         let n = hashes.len();
-        let Some(lookup) = self.hash_lookup.as_ref() else {
+        let Some(lookup) = self.data.hash_lookup.as_ref() else {
             for slot in &mut out[..n] {
                 *slot = None;
             }
             return;
         };
         lookup.lookup_batch_into(hashes, canon_scratch, ids_scratch);
-        let n_offsets = self.bucket_offsets.len();
+        let n_offsets = self.data.bucket_offsets.len();
         for (i, id_opt) in ids_scratch[..n].iter().enumerate() {
             out[i] = match *id_opt {
                 Some(id) if id + 1 < n_offsets => {
-                    let start = self.bucket_offsets.get(id, mmap) as usize;
-                    let end = self.bucket_offsets.get(id + 1, mmap) as usize;
+                    let start = self.data.bucket_offsets.get(id, mmap) as usize;
+                    let end = self.data.bucket_offsets.get(id + 1, mmap) as usize;
                     Some((start, end))
                 }
                 _ => None,
@@ -842,12 +834,12 @@ impl MinimizerIndex {
     }
 
     fn bucket_count_at(&self, mmap: Option<&[u8]>, slot: usize) -> Option<u32> {
-        (slot < self.bucket_counts.len()).then(|| self.bucket_counts.get(slot, mmap))
+        (slot < self.data.bucket_counts.len()).then(|| self.data.bucket_counts.get(slot, mmap))
     }
 
     /// True occurrence count, including records omitted by the storage cap.
     pub fn bucket_count(&self, mmap: Option<&[u8]>, hash: u64) -> Option<u32> {
-        let slot = self.hash_lookup.as_ref()?.lookup(hash)?;
+        let slot = self.data.hash_lookup.as_ref()?.lookup(hash)?;
         self.bucket_count_at(mmap, slot)
     }
 
@@ -856,7 +848,7 @@ impl MinimizerIndex {
             return;
         };
         for idx in start..end {
-            f(self.flat_occs.get(idx, mmap));
+            f(self.data.flat_occs.get(idx, mmap));
         }
     }
 }
@@ -1070,8 +1062,8 @@ impl Index {
     pub(crate) fn minimizer_table(&self, long: bool) -> &MinimizerIndex {
         match (
             long,
-            self.short.hash_lookup.is_some(),
-            self.long.hash_lookup.is_some(),
+            self.short.data.hash_lookup.is_some(),
+            self.long.data.hash_lookup.is_some(),
         ) {
             (true, true, false) | (false, true, _) | (false, false, false) => &self.short,
             _ => &self.long,
@@ -1121,17 +1113,24 @@ impl Index {
         hash: u64,
     ) -> Option<(usize, usize)> {
         table
+            .data
             .repeat_rescue
             .as_ref()?
             .bucket(self.mmap_bytes(), hash)
     }
 
     pub fn repeat_rescue_occ_at(&self, table: &MinimizerIndex, idx: usize) -> Option<Occ> {
-        Some(table.repeat_rescue.as_ref()?.occ_at(self.mmap_bytes(), idx))
+        Some(
+            table
+                .data
+                .repeat_rescue
+                .as_ref()?
+                .occ_at(self.mmap_bytes(), idx),
+        )
     }
 
     pub fn repeat_rescue_extension(&self, table: &MinimizerIndex) -> Option<usize> {
-        table.repeat_rescue.as_ref().map(|_| repeat::EXTENSION)
+        table.data.repeat_rescue.as_ref().map(|_| repeat::EXTENSION)
     }
 
     /// One-shot bucket descriptor — resolves the MPH lookup once and returns.
@@ -1153,7 +1152,7 @@ impl Index {
 
     /// Fetch a single `Occ` record from a bucket slice.
     pub fn occ_at(&self, table: &MinimizerIndex, idx: usize) -> Occ {
-        table.flat_occs.get(idx, self.mmap_bytes())
+        table.data.flat_occs.get(idx, self.mmap_bytes())
     }
 
     pub fn for_each_occ<F: FnMut(Occ)>(&self, table: &MinimizerIndex, hash: u64, mut f: F) {
@@ -1187,7 +1186,11 @@ impl Index {
             empty_minimizer_index(cfg.short_k, cfg.short_w, cfg.max_occ)
         };
 
-        let long = if cfg.build_long {
+        let same_parameters = (cfg.short_k, cfg.short_w) == (cfg.long_k, cfg.long_w);
+        let long = if cfg.build_short && cfg.build_long && same_parameters {
+            crate::kira_info!("[KIRA_INDEX] reusing short minimizer table for long reads");
+            short.clone()
+        } else if cfg.build_long {
             crate::kira_info!(
                 "[KIRA_INDEX] building long index (k={} w={})",
                 cfg.long_k,
@@ -1457,12 +1460,14 @@ fn empty_minimizer_index(k: usize, w: usize, max_occ: usize) -> MinimizerIndex {
         k,
         w,
         max_occ,
-        hash_lookup: None,
         hot_cache: None,
-        bucket_counts: OffsetStorage::Owned(Vec::new()),
-        bucket_offsets: OffsetStorage::Owned(vec![0u32]),
-        flat_occs: OccStorage::Owned(Vec::new()),
-        repeat_rescue: None,
+        data: Arc::new(MinimizerTableData {
+            hash_lookup: None,
+            bucket_counts: OffsetStorage::Owned(Vec::new()),
+            bucket_offsets: OffsetStorage::Owned(vec![0u32]),
+            flat_occs: OccStorage::Owned(Vec::new()),
+            repeat_rescue: None,
+        }),
     }
 }
 
@@ -1480,7 +1485,7 @@ fn write_minimizer_index<W: Write + Seek>(
     write_u32(writer, idx.w as u32)?;
     write_u32(writer, idx.max_occ as u32)?;
 
-    match idx.hash_lookup.as_ref() {
+    match idx.data.hash_lookup.as_ref() {
         Some(HashLookup::Mph(mph)) => {
             write_u32(writer, LOOKUP_KIND_MPH)?;
             let length_position = writer.stream_position()?;
@@ -1506,32 +1511,32 @@ fn write_minimizer_index<W: Write + Seek>(
         }
     }
 
-    write_u64(writer, idx.bucket_counts.len() as u64)?;
-    for i in 0..idx.bucket_counts.len() {
-        write_u32(writer, idx.bucket_counts.get(i, mmap))?;
+    write_u64(writer, idx.data.bucket_counts.len() as u64)?;
+    for i in 0..idx.data.bucket_counts.len() {
+        write_u32(writer, idx.data.bucket_counts.get(i, mmap))?;
     }
 
-    let n_offsets = idx.bucket_offsets.len();
+    let n_offsets = idx.data.bucket_offsets.len();
     write_u64(writer, n_offsets as u64)?;
     for i in 0..n_offsets {
-        let v = idx.bucket_offsets.get(i, mmap);
+        let v = idx.data.bucket_offsets.get(i, mmap);
         write_u32(writer, v)?;
     }
     let n_occs = if n_offsets == 0 {
         0
     } else {
-        idx.bucket_offsets.get(n_offsets - 1, mmap) as usize
+        idx.data.bucket_offsets.get(n_offsets - 1, mmap) as usize
     };
     write_u64(writer, n_occs as u64)?;
     for i in 0..n_occs {
-        let occ = idx.flat_occs.get(i, mmap);
+        let occ = idx.data.flat_occs.get(i, mmap);
         write_u32(writer, occ.ref_id)?;
         write_u32(writer, occ.pos)?;
         write_u8(writer, strand_to_u8(occ.strand))?;
         writer.write_all(&[0u8, 0u8, 0u8])?;
     }
-    write_u32(writer, u32::from(idx.repeat_rescue.is_some()))?;
-    if let Some(rescue) = idx.repeat_rescue.as_ref() {
+    write_u32(writer, u32::from(idx.data.repeat_rescue.is_some()))?;
+    if let Some(rescue) = idx.data.repeat_rescue.as_ref() {
         rescue.write(writer, mmap)?;
     }
     Ok(())
@@ -1557,10 +1562,10 @@ fn read_minimizer_index_mmap<R: Read + Seek>(
             ensure_remaining(reader, blob_len, file_len, "MPH blob")?;
             let mut blob = vec![0u8; blob_len];
             reader.read_exact(&mut blob).context("read MPH blob")?;
-            Some(HashLookup::Mph(Arc::new(
+            Some(HashLookup::Mph(
                 kira_kv_engine::Index::from_bytes(&blob)
                     .map_err(|e| anyhow::anyhow!("MPH deserialize: {e:?}"))?,
-            )))
+            ))
         }
         LOOKUP_KIND_SORTED => {
             let n_keys = read_u64(reader)? as usize;
@@ -1660,12 +1665,14 @@ fn read_minimizer_index_mmap<R: Read + Seek>(
         k,
         w,
         max_occ,
-        hash_lookup,
         hot_cache: None,
-        bucket_counts,
-        bucket_offsets,
-        flat_occs,
-        repeat_rescue,
+        data: Arc::new(MinimizerTableData {
+            hash_lookup,
+            bucket_counts,
+            bucket_offsets,
+            flat_occs,
+            repeat_rescue,
+        }),
     })
 }
 
@@ -1823,6 +1830,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn equal_index_profiles_share_data_and_keep_both_serialized_tables() {
+        let bases = b"ACTCTGCTAGCAGATCGATCGAAATCCGTCAGGGTCATG";
+        let cfg = IndexConfig {
+            short_k: 5,
+            long_k: 5,
+            short_w: 2,
+            long_w: 2,
+            ..IndexConfig::default()
+        };
+        let mut index = Index::try_build(reference(bases), cfg).unwrap();
+        assert!(Arc::ptr_eq(&index.short.data, &index.long.data));
+        index.short.build_hot_cache(None, 2, 128);
+        assert!(index.short.hot_cache.is_some());
+        assert!(index.long.hot_cache.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both.kiraidx");
+        index.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        for m in minimizers(bases, &MinimizerConfig { k: 5, w: 2 }) {
+            let expected = occurrences(&index.short, m.hash);
+            assert!(!expected.is_empty());
+            for table in [&loaded.short, &loaded.long] {
+                let mut actual = Vec::new();
+                loaded.for_each_occ(table, m.hash, |o| {
+                    actual.push((o.ref_id, o.pos, strand_to_u8(o.strand)))
+                });
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+            }
+        }
+        let different =
+            Index::try_build(reference(bases), IndexConfig { long_w: 3, ..cfg }).unwrap();
+        assert!(!Arc::ptr_eq(&different.short.data, &different.long.data));
+    }
+
     fn occurrences(index: &MinimizerIndex, hash: u64) -> Vec<(u32, u32, u8)> {
         let mut out = Vec::new();
         index.for_each_occ(None, hash, &mut |occ| {
@@ -1840,7 +1884,7 @@ mod tests {
         write_u32(writer, idx.k as u32).unwrap();
         write_u32(writer, idx.w as u32).unwrap();
         write_u32(writer, idx.max_occ as u32).unwrap();
-        match idx.hash_lookup.as_ref() {
+        match idx.data.hash_lookup.as_ref() {
             Some(HashLookup::Mph(mph)) => {
                 write_u32(writer, LOOKUP_KIND_MPH).unwrap();
                 let blob = mph.to_bytes().unwrap();
@@ -1856,14 +1900,17 @@ mod tests {
             }
             None => write_u32(writer, LOOKUP_KIND_NONE).unwrap(),
         }
-        write_u64(writer, idx.bucket_offsets.len() as u64).unwrap();
-        for i in 0..idx.bucket_offsets.len() {
-            write_u32(writer, idx.bucket_offsets.get(i, None)).unwrap();
+        write_u64(writer, idx.data.bucket_offsets.len() as u64).unwrap();
+        for i in 0..idx.data.bucket_offsets.len() {
+            write_u32(writer, idx.data.bucket_offsets.get(i, None)).unwrap();
         }
-        let n_occs = idx.bucket_offsets.get(idx.bucket_offsets.len() - 1, None) as usize;
+        let n_occs = idx
+            .data
+            .bucket_offsets
+            .get(idx.data.bucket_offsets.len() - 1, None) as usize;
         write_u64(writer, n_occs as u64).unwrap();
         for i in 0..n_occs {
-            let occ = idx.flat_occs.get(i, None);
+            let occ = idx.data.flat_occs.get(i, None);
             write_u32(writer, occ.ref_id).unwrap();
             write_u32(writer, occ.pos).unwrap();
             write_u8(writer, strand_to_u8(occ.strand)).unwrap();
