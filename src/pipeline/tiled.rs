@@ -108,6 +108,7 @@ fn run_tiled_inner(
         cfg.split_prefix.display()
     );
 
+    let scratch = scratch_directory(&cfg.split_prefix)?;
     let mut chunk_paths: Vec<PathBuf> = Vec::with_capacity(tile_plan.n_tiles());
     for (tile_idx, tile) in tile_plan.tiles.iter().enumerate() {
         let t0 = Instant::now();
@@ -123,7 +124,7 @@ fn run_tiled_inner(
         let sub_ref = tile.build_sub_reference(&reference);
         let index = Index::try_build(sub_ref, cfg.index_cfg)?;
 
-        let chunk_path = chunk_path_for(&cfg.split_prefix, tile_idx);
+        let chunk_path = scratch.path().join(format!("tile-{tile_idx}.kchunk"));
         chunk_paths.push(chunk_path.clone());
         let mut writer = ChunkWriter::create(&chunk_path)
             .with_context(|| format!("create chunk file {}", chunk_path.display()))?;
@@ -287,25 +288,21 @@ fn run_tiled_inner(
         chunk_paths.len()
     );
 
-    for path in &chunk_paths {
-        if let Err(e) = std::fs::remove_file(path) {
-            crate::kira_warn!(
-                "[KIRA_TILE] warning: could not remove {}: {}",
-                path.display(),
-                e
-            );
-        }
-    }
-    drop(formatter);
-
     Ok(())
 }
 
-/// Construct the chunk file path for a given tile index.
-fn chunk_path_for(prefix: &Path, tile_idx: usize) -> PathBuf {
-    let mut s = prefix.as_os_str().to_owned();
-    s.push(format!(".tile-{:03}.kchunk", tile_idx));
-    PathBuf::from(s)
+fn scratch_directory(prefix: &Path) -> Result<tempfile::TempDir> {
+    let parent = prefix
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = prefix
+        .file_name()
+        .context("split prefix requires a filename")?;
+    tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(parent)
+        .with_context(|| format!("create tile directory for {}", prefix.display()))
 }
 
 /// Translate every `ref_id` (and `mate.mate_ref_id`) in the batch from tile-local to global.

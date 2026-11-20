@@ -1,11 +1,21 @@
 use super::*;
 
 #[test]
-fn chunk_path_appends_tile_index() {
-    let p = chunk_path_for(Path::new("/tmp/run"), 0);
-    assert_eq!(p, PathBuf::from("/tmp/run.tile-000.kchunk"));
-    let p = chunk_path_for(Path::new("/tmp/run.partial"), 17);
-    assert_eq!(p, PathBuf::from("/tmp/run.partial.tile-017.kchunk"));
+fn overlapping_runs_own_and_clean_their_chunks_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let prefix = root.path().join("sample");
+    let first = scratch_directory(&prefix).unwrap();
+    let second = scratch_directory(&prefix).unwrap();
+    let a = first.path().join("tile-0.kchunk");
+    let b = second.path().join("tile-0.kchunk");
+    std::fs::write(&a, b"first").unwrap();
+    std::fs::write(&b, b"second").unwrap();
+    assert_eq!(std::fs::read(&a).unwrap(), b"first");
+    drop(first);
+    assert!(!a.exists());
+    assert_eq!(std::fs::read(&b).unwrap(), b"second");
+    drop(second);
+    assert_eq!(root.path().read_dir().unwrap().count(), 0);
 }
 
 #[test]
