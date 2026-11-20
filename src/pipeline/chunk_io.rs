@@ -1,8 +1,10 @@
 //! Per-tile alignment temp file format for `--split-prefix`.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Result, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, Strand};
 
@@ -67,7 +69,7 @@ pub struct ChunkReader {
 impl ChunkReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
-        let mut r = BufReader::with_capacity(1 << 20, file);
+        let mut r = BufReader::with_capacity(64 * 1024, file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != MAGIC {
@@ -130,41 +132,94 @@ impl ChunkReader {
     }
 }
 
-/// Multi-way merge over N tile chunk files.
+/// Multi-way merge over tile chunks. Equal read IDs retain input tile order.
 pub struct MergeIter {
     readers: Vec<ChunkReader>,
+    heads: BinaryHeap<Reverse<(u64, usize)>>,
+    initialized: bool,
+    // Drop readers before unlinking any merged intermediates.
+    intermediates: Vec<tempfile::TempPath>,
 }
 
 impl MergeIter {
     pub fn new(readers: Vec<ChunkReader>) -> Self {
-        Self { readers }
+        Self {
+            readers,
+            heads: BinaryHeap::new(),
+            initialized: false,
+            intermediates: Vec::new(),
+        }
+    }
+
+    /// Open at most 64 input streams at once. Large tile plans merge adjacent
+    /// groups in passes; the original chunks remain owned by their caller.
+    pub fn from_paths(paths: &[PathBuf], scratch: &Path) -> Result<Self> {
+        Self::from_paths_with_limit(paths, scratch, 64)
+    }
+
+    fn open_group(paths: &[PathBuf]) -> Result<Self> {
+        let readers = paths.iter().map(ChunkReader::open).collect::<Result<_>>()?;
+        Ok(Self::new(readers))
+    }
+
+    fn from_paths_with_limit(paths: &[PathBuf], scratch: &Path, fan_in: usize) -> Result<Self> {
+        if paths.len() <= fan_in {
+            return Self::open_group(paths);
+        }
+        let mut current = paths.to_vec();
+        let mut intermediates = Vec::new();
+        while current.len() > fan_in {
+            let mut next = Vec::new();
+            for group in current.chunks(fan_in) {
+                let path = tempfile::NamedTempFile::new_in(scratch)?.into_temp_path();
+                let mut writer = ChunkWriter::create(&path)?;
+                let mut merge = Self::open_group(group)?;
+                while let Some((id, alignments)) = merge.next_merged()? {
+                    writer.write_record(id, &alignments)?;
+                }
+                writer.finish()?;
+                next.push(path);
+            }
+            current = next.iter().map(|p| p.to_path_buf()).collect();
+            intermediates = next;
+        }
+        let mut merge = Self::open_group(&current)?;
+        merge.intermediates = intermediates;
+        Ok(merge)
     }
 
     pub fn next_merged(&mut self) -> Result<Option<(u64, Vec<Alignment>)>> {
-        // Find the minimum next index across all readers.
-        let mut min_idx: Option<u64> = None;
-        for r in self.readers.iter_mut() {
-            if let Some(idx) = r.peek_idx()? {
-                min_idx = Some(match min_idx {
-                    Some(m) if m <= idx => m,
-                    _ => idx,
-                });
+        if !self.initialized {
+            for (tile, reader) in self.readers.iter_mut().enumerate() {
+                if let Some(id) = reader.peek_idx()? {
+                    self.heads.push(Reverse((id, tile)));
+                }
             }
+            self.initialized = true;
         }
-        let min_idx = match min_idx {
-            Some(i) => i,
-            None => return Ok(None),
+        let Some(&Reverse((id, _))) = self.heads.peek() else {
+            return Ok(None);
         };
-        // Pull from every reader whose peek matches `min_idx`.
-        let mut combined: Vec<Alignment> = Vec::new();
-        for r in self.readers.iter_mut() {
-            if r.peek_idx()? == Some(min_idx)
-                && let Some((_, alns)) = r.next_record()?
-            {
-                combined.extend(alns);
+        let mut combined = Vec::new();
+        while let Some(&Reverse((next_id, tile))) = self.heads.peek() {
+            if next_id != id {
+                break;
+            }
+            self.heads.pop();
+            let reader = &mut self.readers[tile];
+            let (_, alignments) = reader
+                .next_record()?
+                .expect("heap entry has a peeked record");
+            if combined.is_empty() {
+                combined = alignments;
+            } else {
+                combined.extend(alignments);
+            }
+            if let Some(next_id) = reader.peek_idx()? {
+                self.heads.push(Reverse((next_id, tile)));
             }
         }
-        Ok(Some((min_idx, combined)))
+        Ok(Some((id, combined)))
     }
 }
 

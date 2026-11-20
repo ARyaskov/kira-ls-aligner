@@ -11,7 +11,7 @@ use crate::index::tiling::TilePlan;
 use crate::index::{Index, IndexConfig};
 use crate::io::staged_sam::SamOutput;
 use crate::io::{HeaderConfig, ReadStream};
-use crate::pipeline::chunk_io::{ChunkReader, ChunkWriter, MergeIter};
+use crate::pipeline::chunk_io::{ChunkWriter, MergeIter};
 use std::sync::Arc;
 
 use crate::alignment::junc_bed::JunctionIndex;
@@ -177,14 +177,8 @@ fn run_tiled_inner(
         chunk_paths.len()
     );
 
-    let mut readers: Vec<ChunkReader> = Vec::with_capacity(chunk_paths.len());
-    for path in &chunk_paths {
-        readers.push(
-            ChunkReader::open(path)
-                .with_context(|| format!("open chunk file {}", path.display()))?,
-        );
-    }
-    let mut merge = MergeIter::new(readers);
+    let mut merge =
+        MergeIter::from_paths(&chunk_paths, scratch.path()).context("open tile merge")?;
 
     let (mut writer, publication) = SamOutput::open(output_path.as_deref(), &reference)?;
     if cfg.pipeline_cfg.output.format != crate::io::EmitFormat::Paf {

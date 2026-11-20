@@ -142,6 +142,43 @@ fn merge_iter_unions_records_at_same_idx() {
 }
 
 #[test]
+fn multipass_merge_preserves_sparse_records_and_tile_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for tile in 0..11u32 {
+        let path = dir.path().join(format!("{tile}.bin"));
+        let mut writer = ChunkWriter::create(&path).unwrap();
+        if tile != 2 {
+            writer
+                .write_record(1, &[sample_aln(tile, 20, false)])
+                .unwrap();
+            writer
+                .write_record(3 + u64::from(tile), &[sample_aln(tile, 25, true)])
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        paths.push(path);
+    }
+    let mut merge = MergeIter::from_paths_with_limit(&paths, scratch.path(), 2).unwrap();
+    assert!(merge.readers.len() <= 2);
+    let (id, ties) = merge.next_merged().unwrap().unwrap();
+    assert_eq!(id, 1);
+    let expected: Vec<u32> = (0..11).filter(|&i| i != 2).collect();
+    assert_eq!(ties.iter().map(|a| a.ref_id).collect::<Vec<_>>(), expected);
+    for tile in expected {
+        let (id, hits) = merge.next_merged().unwrap().unwrap();
+        assert_eq!(id, 3 + u64::from(tile));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, tile);
+    }
+    assert!(merge.next_merged().unwrap().is_none());
+    drop(merge);
+    assert_eq!(scratch.path().read_dir().unwrap().count(), 0);
+    assert!(paths.iter().all(|p| p.is_file()));
+}
+
+#[test]
 fn bad_magic_errors() {
     let f = NamedTempFile::new().unwrap();
     let path = f.path().to_path_buf();
