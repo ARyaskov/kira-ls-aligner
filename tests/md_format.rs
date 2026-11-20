@@ -146,3 +146,15 @@ fn md_matches_canonical_leading_mismatch() {
     assert_eq!(nm, expected_nm);
     assert_eq!(nm, 1);
 }
+
+#[test]
+fn public_md_builder_emits_ascii_letters_for_arbitrary_reference_bytes() {
+    use kira_ls_aligner::alignment::MdBuilder;
+
+    let mut md = MdBuilder::new();
+    md.mismatch(0xff);
+    md.deletion(&[b'r', 0, b'^', 0xc3, 0xa9]);
+    md.deletion(&[]);
+    md.matched();
+    assert_eq!(md.finish(), (6, "0N0^RNNNN1".into()));
+}

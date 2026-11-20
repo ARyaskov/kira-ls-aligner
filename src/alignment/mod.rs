@@ -654,22 +654,7 @@ pub(crate) fn build_certified_spectral_alignment(
         op: CigarKind::Match,
     }];
 
-    let mut nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
-    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
-        if qb == rb {
-            match_run += 1;
-        } else {
-            nm += 1;
-            push_u32_decimal(&mut md_bytes, match_run);
-            md_bytes.push(*rb);
-            match_run = 0;
-        }
-    }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: only ASCII digits and ACGTN bases were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+    let (nm, md) = md::ungapped_tags(read_seq, ref_aligned);
 
     let matches = hit.matches as i32;
     let mismatches = hit.mismatches as i32;
@@ -1091,22 +1076,7 @@ fn build_spectral_alignment(
     }
 
     let ref_aligned = &ref_window[hit.shift..hit.shift + read_len];
-    let mut nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
-    for (qb, rb) in read_seq.iter().zip(ref_aligned.iter()) {
-        if qb == rb {
-            match_run += 1;
-        } else {
-            nm += 1;
-            push_u32_decimal(&mut md_bytes, match_run);
-            md_bytes.push(*rb);
-            match_run = 0;
-        }
-    }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: only ASCII digits and ACGTN bases were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
+    let (nm, md) = md::ungapped_tags(read_seq, ref_aligned);
 
     let cigar = vec![CigarOp {
         len: read_len as u32,

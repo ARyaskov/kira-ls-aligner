@@ -22,7 +22,7 @@ use core::fmt::NumBuffer;
 
 #[derive(Clone, Debug, Default)]
 pub struct MdBuilder {
-    bytes: Vec<u8>,
+    text: String,
     run: u32,
     nm: u32,
 }
@@ -34,9 +34,25 @@ impl MdBuilder {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(capacity),
+            text: String::with_capacity(capacity),
             run: 0,
             nm: 0,
+        }
+    }
+
+    fn flush_run(&mut self) {
+        self.text
+            .push_str(self.run.format_into(&mut NumBuffer::new()));
+        self.run = 0;
+    }
+
+    /// Encode the MD reference alphabet. Preserve letters, including IUPAC
+    /// ambiguity codes, and represent other input bytes as unknown bases.
+    fn reference_letter(base: u8) -> char {
+        if base.is_ascii_alphabetic() {
+            char::from(base.to_ascii_uppercase())
+        } else {
+            'N'
         }
     }
 
@@ -49,9 +65,8 @@ impl MdBuilder {
     /// One mismatching column; `ref_base` is what MD records.
     #[inline]
     pub fn mismatch(&mut self, ref_base: u8) {
-        push_u32_decimal(&mut self.bytes, self.run);
-        self.bytes.push(ref_base);
-        self.run = 0;
+        self.flush_run();
+        self.text.push(Self::reference_letter(ref_base));
         self.nm += 1;
     }
 
@@ -86,10 +101,13 @@ impl MdBuilder {
 
     /// The deleted reference bases.
     pub fn deletion(&mut self, ref_bases: &[u8]) {
-        push_u32_decimal(&mut self.bytes, self.run);
-        self.bytes.push(b'^');
-        self.bytes.extend_from_slice(ref_bases);
-        self.run = 0;
+        if ref_bases.is_empty() {
+            return;
+        }
+        self.flush_run();
+        self.text.push('^');
+        self.text
+            .extend(ref_bases.iter().copied().map(Self::reference_letter));
         self.nm += ref_bases.len() as u32;
     }
 
@@ -106,13 +124,15 @@ impl MdBuilder {
 
     /// Close the trailing run and return `(NM, MD)`.
     pub fn finish(mut self) -> (u32, String) {
-        push_u32_decimal(&mut self.bytes, self.run);
-        debug_assert!(self.bytes.is_ascii());
-        // SAFETY: only ASCII digits, '^' and reference bases (ASCII by
-        // construction: FASTA bytes) were pushed.
-        let md = unsafe { String::from_utf8_unchecked(self.bytes) };
-        (self.nm, md)
+        self.flush_run();
+        (self.nm, self.text)
     }
+}
+
+pub(crate) fn ungapped_tags(read: &[u8], reference: &[u8]) -> (u32, String) {
+    let mut md = MdBuilder::new();
+    md.columns(read, reference);
+    md.finish()
 }
 
 /// Append the decimal digits of `v` without allocating.
