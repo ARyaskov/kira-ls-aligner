@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::Path;
@@ -29,6 +30,7 @@ pub(crate) fn visit_reference(
     mut visit: impl FnMut(RefSeq) -> Result<()>,
 ) -> Result<()> {
     let mut reader = open_fastx_reader(path)?.reader;
+    let mut names = HashSet::new();
     while let Some(record) = reader.next() {
         let record = record.context("read reference record")?;
         let raw = record.id();
@@ -37,7 +39,8 @@ pub(crate) fn visit_reference(
             .split(|b: &u8| b.is_ascii_whitespace())
             .next()
             .unwrap_or(raw);
-        let name = String::from_utf8_lossy(trimmed).to_string();
+        let name = std::str::from_utf8(trimmed).context("decode FASTA contig name")?;
+        check_contig_name(name, &mut names)?;
         let mut seq = record.seq().to_vec();
         for base in &mut seq {
             *base = match base.to_ascii_uppercase() {
@@ -47,11 +50,25 @@ pub(crate) fn visit_reference(
             };
         }
         visit(RefSeq {
-            name,
+            name: name.to_owned(),
             bases: RefBases::Owned(seq),
         })?;
     }
     Ok(())
+}
+
+pub(crate) fn check_contig_name(name: &str, seen: &mut HashSet<String>) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "empty reference contig name");
+    anyhow::ensure!(
+        seen.insert(name.to_owned()),
+        "duplicate reference contig name {name:?}"
+    );
+    Ok(())
+}
+
+pub(crate) fn canonical_contig_name(name: &str) -> &str {
+    name.split_once(|c: char| c.is_ascii_whitespace())
+        .map_or(name, |(canonical, _)| canonical)
 }
 
 /// Pairing strategy for `ReadStream`.

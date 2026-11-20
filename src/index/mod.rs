@@ -1162,8 +1162,14 @@ impl Index {
         Self::try_build(reference, cfg).expect("build index")
     }
 
-    pub fn try_build(reference: Reference, cfg: IndexConfig) -> Result<Self> {
+    pub fn try_build(mut reference: Reference, cfg: IndexConfig) -> Result<Self> {
         cfg.validate()?;
+        let mut names = std::collections::HashSet::with_capacity(reference.sequences.len());
+        for seq in &mut reference.sequences {
+            let name = crate::io::canonical_contig_name(&seq.name);
+            crate::io::check_contig_name(name, &mut names)?;
+            seq.name.truncate(name.len());
+        }
         let budget = ram_half_budget_bytes();
         let t0 = Instant::now();
         let short = if cfg.build_short {
@@ -1420,10 +1426,14 @@ impl Index {
             anyhow::bail!("invalid index: sequence count {seq_count} exceeds file bounds");
         }
         let mut sequences = Vec::with_capacity(seq_count);
+        let mut names = std::collections::HashSet::with_capacity(seq_count);
         for _ in 0..seq_count {
-            let name =
+            let mut name =
                 String::from_utf8(read_bytes_bounded(&mut cursor, file_len, "sequence name")?)
                     .context("decode seq name")?;
+            let canonical_name = crate::io::canonical_contig_name(&name);
+            crate::io::check_contig_name(canonical_name, &mut names)?;
+            name.truncate(canonical_name.len());
             let bases_len = read_u32(&mut cursor)? as usize;
             let bases_offset = cursor.position() as usize;
             checked_advance(&mut cursor, bases_len, file_len, "reference bases")?;
