@@ -60,6 +60,8 @@ pub enum PairRole {
 pub struct ReadRecord {
     pub id: String,
     pub seq: Vec<u8>,
+    /// Original IUPAC bases for emission when the search sequence was normalized.
+    pub original_seq: Option<Vec<u8>>,
     pub qual: Option<Vec<u8>>,
     /// Pair role (`Unpaired` for single-end).
     pub pair_role: PairRole,
@@ -76,11 +78,16 @@ pub struct ReadRecord {
 }
 
 impl ReadRecord {
+    pub fn sequence_for_output(&self) -> &[u8] {
+        self.original_seq.as_deref().unwrap_or(&self.seq)
+    }
+
     /// Construct a single-end read.
     pub fn new_unpaired(id: String, seq: Vec<u8>, qual: Option<Vec<u8>>) -> Self {
         Self {
             id,
             seq,
+            original_seq: None,
             qual,
             pair_role: PairRole::Unpaired,
             repeat_min_occ: 1,

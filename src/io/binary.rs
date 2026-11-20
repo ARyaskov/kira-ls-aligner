@@ -116,9 +116,9 @@ fn read_fields(
     let seq = record.sequence_mut().as_mut();
     seq.reserve(keep.len());
     if reverse {
-        append_reverse_complement_range(seq, &read.seq, keep.start, keep.end);
+        append_reverse_complement_range(seq, read.sequence_for_output(), keep.start, keep.end);
     } else {
-        seq.extend_from_slice(&read.seq[keep.clone()]);
+        seq.extend_from_slice(&read.sequence_for_output()[keep.clone()]);
     }
     let Some(qual) = read.qual.as_deref().filter(|q| !q.is_empty() || mapped) else {
         return Ok(record);

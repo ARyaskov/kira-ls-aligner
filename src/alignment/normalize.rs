@@ -201,34 +201,50 @@ pub fn normalize_alignments<'a, F>(
 ) where
     F: Fn(u32) -> &'a [u8] + Sync,
 {
-    if !normalize_enabled() {
-        return;
-    }
+    let normalize = normalize_enabled();
     alignments
         .par_iter_mut()
         .zip(reads.par_iter())
         .for_each(|(alns, read)| {
-            let mut rc_scratch: Vec<u8> = Vec::new();
+            if alns.is_empty() || (!normalize && read.original_seq.is_none()) {
+                return;
+            }
+            let mut rc_scratch = Vec::new();
+            let mut original_rc = Vec::new();
+            if let Some(original) = &read.original_seq
+                && alns.iter().any(|aln| aln.is_rev)
+            {
+                crate::io::append_reverse_complement(&mut original_rc, original);
+            }
             for aln in alns.iter_mut() {
                 let ref_seq = ref_bases(aln.ref_id);
-                let oriented: &[u8] = if aln.is_rev {
-                    crate::seq::reverse_complement_into(&read.seq, &mut rc_scratch)
-                } else {
-                    read.seq.as_slice()
-                };
-                if let Some(cigar) =
-                    left_normalize_indels(&aln.cigar, ref_seq, aln.ref_start, oriented)
-                {
-                    aln.cigar = cigar;
-                    let (nm, md) = crate::alignment::compute_nm_md(
+                let mut changed = false;
+                if normalize {
+                    let oriented = if aln.is_rev {
+                        crate::seq::reverse_complement_into(&read.seq, &mut rc_scratch)
+                    } else {
+                        &read.seq
+                    };
+                    if let Some(cigar) =
+                        left_normalize_indels(&aln.cigar, ref_seq, aln.ref_start, oriented)
+                    {
+                        aln.cigar = cigar;
+                        changed = true;
+                    }
+                }
+                if changed || read.original_seq.is_some() {
+                    let oriented = match (read.original_seq.as_deref(), aln.is_rev) {
+                        (Some(_), true) => original_rc.as_slice(),
+                        (None, true) => rc_scratch.as_slice(),
+                        (_, false) => read.sequence_for_output(),
+                    };
+                    (aln.nm, aln.md) = crate::alignment::compute_nm_md(
                         oriented,
                         ref_seq,
                         0,
                         aln.ref_start as usize,
                         &aln.cigar,
                     );
-                    aln.nm = nm;
-                    aln.md = md;
                 }
             }
         });

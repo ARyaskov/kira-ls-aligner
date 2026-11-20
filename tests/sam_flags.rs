@@ -60,6 +60,7 @@ fn r1_record() -> ReadRecord {
         seq: vec![b'A'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R1,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     }
@@ -71,6 +72,7 @@ fn r2_record() -> ReadRecord {
         seq: vec![b'T'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::R2,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     }
@@ -82,6 +84,7 @@ fn unpaired_record() -> ReadRecord {
         seq: vec![b'A'; 150],
         qual: Some(vec![b'I'; 150]),
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     }
@@ -218,6 +221,7 @@ fn reverse_alignment_emits_reverse_complemented_seq_and_reversed_qual() {
         seq: b"AaCGTN".to_vec(),
         qual: Some(b"ABCDEF".to_vec()),
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -387,6 +391,7 @@ fn zero_length_read_emits_star_seq_and_qual() {
         seq: Vec::new(),
         qual: Some(Vec::new()),
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };

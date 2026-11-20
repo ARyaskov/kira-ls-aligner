@@ -31,6 +31,7 @@ fn read(id: &str, seq: &[u8]) -> ReadRecord {
         seq: seq.to_vec(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     }

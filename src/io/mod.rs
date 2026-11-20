@@ -164,16 +164,9 @@ impl ReadStream {
         while self.current < self.readers.len() {
             let idx = self.current;
             let record = self.readers[idx].next_extracted(keep_comment)?;
-            if let Some((id, seq, qual, comment)) = record {
-                bases += seq.len();
-                reads.push(ReadRecord {
-                    id,
-                    seq,
-                    qual,
-                    pair_role: PairRole::Unpaired,
-                    repeat_min_occ: 1,
-                    comment,
-                });
+            if let Some(read) = record {
+                bases += read.seq.len();
+                reads.push(read);
 
                 let consumed = self.readers[idx].consumed();
                 self.progress.read_bytes = self.completed_bytes.saturating_add(consumed);
@@ -198,7 +191,7 @@ impl ReadStream {
 
     /// Read one record from `readers[which]` and extract.
     #[allow(clippy::type_complexity)]
-    fn read_one(&mut self, which: usize) -> Result<Option<ExtractedRead>> {
+    fn read_one(&mut self, which: usize) -> Result<Option<ReadRecord>> {
         let keep_comment = self.keep_comment;
         self.readers[which]
             .next_extracted(keep_comment)
@@ -213,26 +206,13 @@ impl ReadStream {
             let rec1 = self.read_one(0)?;
             let rec2 = self.read_one(1)?;
             match (rec1, rec2) {
-                (Some((id1, seq1, qual1, c1)), Some((id2, seq2, qual2, c2))) => {
-                    assert_paired_ids(&id1, &id2)?;
-                    bases += seq1.len() + seq2.len();
+                (Some(mut r1), Some(mut r2)) => {
+                    assert_paired_ids(&r1.id, &r2.id)?;
+                    bases += r1.seq.len() + r2.seq.len();
                     self.pair_counter += 1;
-                    reads.push(ReadRecord {
-                        id: id1,
-                        seq: seq1,
-                        qual: qual1,
-                        pair_role: PairRole::R1,
-                        repeat_min_occ: 1,
-                        comment: c1,
-                    });
-                    reads.push(ReadRecord {
-                        id: id2,
-                        seq: seq2,
-                        qual: qual2,
-                        pair_role: PairRole::R2,
-                        repeat_min_occ: 1,
-                        comment: c2,
-                    });
+                    r1.pair_role = PairRole::R1;
+                    r2.pair_role = PairRole::R2;
+                    reads.extend([r1, r2]);
 
                     let consumed1 = self.readers[0].consumed();
                     let consumed2 = self.readers[1].consumed();
@@ -265,26 +245,13 @@ impl ReadStream {
             let rec1 = self.read_one(0)?;
             let rec2 = self.read_one(0)?;
             match (rec1, rec2) {
-                (Some((id1, seq1, qual1, c1)), Some((id2, seq2, qual2, c2))) => {
-                    assert_paired_ids(&id1, &id2)?;
-                    bases += seq1.len() + seq2.len();
+                (Some(mut r1), Some(mut r2)) => {
+                    assert_paired_ids(&r1.id, &r2.id)?;
+                    bases += r1.seq.len() + r2.seq.len();
                     self.pair_counter += 1;
-                    reads.push(ReadRecord {
-                        id: id1,
-                        seq: seq1,
-                        qual: qual1,
-                        pair_role: PairRole::R1,
-                        repeat_min_occ: 1,
-                        comment: c1,
-                    });
-                    reads.push(ReadRecord {
-                        id: id2,
-                        seq: seq2,
-                        qual: qual2,
-                        pair_role: PairRole::R2,
-                        repeat_min_occ: 1,
-                        comment: c2,
-                    });
+                    r1.pair_role = PairRole::R1;
+                    r2.pair_role = PairRole::R2;
+                    reads.extend([r1, r2]);
 
                     self.progress.read_bytes = self.readers[0].consumed();
 
@@ -387,7 +354,7 @@ impl FastqReaderWithProgress {
     /// Next record as `(id, seq, qual, comment)`, with the mate suffix
     /// stripped from the id and the bases normalised to ACGTN. FASTA reads
     /// carry `qual: None`.
-    fn next_extracted(&mut self, keep_comment: bool) -> Result<Option<ExtractedRead>> {
+    fn next_extracted(&mut self, keep_comment: bool) -> Result<Option<ReadRecord>> {
         match &mut self.backend {
             ReadBackend::Fastq(reader) => {
                 let rec = reader
@@ -400,9 +367,7 @@ impl FastqReaderWithProgress {
                     } else {
                         None
                     };
-                    let mut seq = r.seq().to_vec();
-                    normalize_bases(&mut seq);
-                    (id, seq, Some(r.qual().to_vec()), comment)
+                    ingest_read(id, r.seq().to_vec(), Some(r.qual().to_vec()), comment)
                 }))
             }
             ReadBackend::Fasta { reader, consumed } => {
@@ -417,10 +382,9 @@ impl FastqReaderWithProgress {
                 } else {
                     None
                 };
-                let mut seq = rec.seq().into_owned();
-                normalize_bases(&mut seq);
+                let seq = rec.seq().into_owned();
                 let qual = rec.qual().map(|q| q.to_vec());
-                Ok(Some((id, seq, qual, comment)))
+                Ok(Some(ingest_read(id, seq, qual, comment)))
             }
         }
     }
@@ -503,9 +467,6 @@ fn bgzf_decode_threads() -> usize {
         }
     })
 }
-
-/// `(id, seq, qual, comment)` as pulled off one FASTQ record.
-type ExtractedRead = (String, Vec<u8>, Option<Vec<u8>>, Option<String>);
 
 fn open_fastq_reader<P: AsRef<Path>>(path: P) -> Result<FastqReaderWithProgress> {
     let path = path.as_ref();
@@ -748,6 +709,34 @@ fn assert_paired_ids(r1: &str, r2: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn ingest_read(
+    id: String,
+    mut seq: Vec<u8>,
+    qual: Option<Vec<u8>>,
+    comment: Option<String>,
+) -> ReadRecord {
+    seq.make_ascii_uppercase();
+    let mut has_ambiguity = false;
+    for base in &mut seq {
+        match *base {
+            b'A' | b'C' | b'G' | b'T' | b'N' => {}
+            b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B' | b'D' | b'H' | b'V' => {
+                has_ambiguity = true;
+            }
+            _ => *base = b'N',
+        }
+    }
+    let original_seq = has_ambiguity.then(|| {
+        let original = seq.clone();
+        normalize_bases(&mut seq);
+        original
+    });
+    let mut read = ReadRecord::new_unpaired(id, seq, qual);
+    read.original_seq = original_seq;
+    read.comment = comment;
+    read
 }
 
 fn normalize_bases(seq: &mut [u8]) {
@@ -1006,7 +995,7 @@ impl SamFormatter {
             }
         }
 
-        append_seq_or_star(buf, &read.seq);
+        append_seq_or_star(buf, read.sequence_for_output());
         buf.push(b'\t');
         append_qual_or_star(buf, read.qual.as_deref());
         if let Some(extra) = extra_tags {
@@ -1074,9 +1063,9 @@ impl SamFormatter {
         if keep_start == keep_end {
             buf.push(b'*');
         } else if aln.is_rev {
-            append_reverse_complement_range(buf, &read.seq, keep_start, keep_end);
+            append_reverse_complement_range(buf, read.sequence_for_output(), keep_start, keep_end);
         } else {
-            buf.extend_from_slice(&read.seq[keep_start..keep_end]);
+            buf.extend_from_slice(&read.sequence_for_output()[keep_start..keep_end]);
         }
         buf.push(b'\t');
         match read.qual.as_deref() {
@@ -1471,7 +1460,7 @@ fn append_reverse_complement_range(
     append_reverse_complement(buf, &seq[n - keep_end..n - keep_start]);
 }
 
-fn append_reverse_complement(buf: &mut Vec<u8>, seq: &[u8]) {
+pub(crate) fn append_reverse_complement(buf: &mut Vec<u8>, seq: &[u8]) {
     buf.extend(seq.iter().rev().map(|&b| match b {
         b'A' => b'T',
         b'a' => b't',
@@ -1481,6 +1470,16 @@ fn append_reverse_complement(buf: &mut Vec<u8>, seq: &[u8]) {
         b'g' => b'c',
         b'T' | b'U' => b'A',
         b't' | b'u' => b'a',
+        b'R' => b'Y',
+        b'Y' => b'R',
+        b'S' => b'S',
+        b'W' => b'W',
+        b'K' => b'M',
+        b'M' => b'K',
+        b'B' => b'V',
+        b'D' => b'H',
+        b'H' => b'D',
+        b'V' => b'B',
         _ => b'N',
     }));
 }

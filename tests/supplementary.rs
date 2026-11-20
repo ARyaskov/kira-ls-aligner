@@ -153,6 +153,7 @@ fn chimeric_read_emits_supplementary() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -216,6 +217,7 @@ fn no_supplementary_when_only_one_chain() {
         seq: ref_bytes(&reference, 0)[300..400].to_vec(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -250,6 +252,7 @@ fn no_supplementary_for_overlapping_chains() {
         seq: a[300..400].to_vec(),
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };

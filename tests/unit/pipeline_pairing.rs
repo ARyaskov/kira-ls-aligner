@@ -32,6 +32,7 @@ fn dummy_read(id: &str, role: PairRole) -> ReadRecord {
         seq: vec![b'A'; 150],
         qual: None,
         pair_role: role,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     }

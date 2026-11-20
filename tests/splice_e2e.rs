@@ -79,6 +79,7 @@ fn two_exon_alignment_emits_n_op_and_forward_xs_strand() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -186,6 +187,7 @@ fn small_gap_below_min_intron_stays_as_d_op() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -263,6 +265,7 @@ fn non_canonical_signal_with_require_emits_d_not_n() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -371,6 +374,7 @@ fn snp_between_same_diagonal_anchors_is_a_mismatch_not_an_indel() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -419,6 +423,7 @@ fn unanchored_exon_remainder_before_intron_is_aligned_across_the_junction() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };
@@ -463,6 +468,7 @@ fn mixed_short_gap_emits_one_indel_with_gap_penalty() {
         seq: read_seq,
         qual: None,
         pair_role: PairRole::Unpaired,
+        original_seq: None,
         repeat_min_occ: 1,
         comment: None,
     };

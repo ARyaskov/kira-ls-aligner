@@ -110,6 +110,7 @@ mod tests {
                 seq: vec![b'A'; 50],
                 qual: None,
                 pair_role: PairRole::Unpaired,
+                original_seq: None,
                 repeat_min_occ: 1,
                 comment: None,
             })

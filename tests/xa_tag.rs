@@ -59,6 +59,7 @@ fn xa_lists_secondaries_pruned_by_the_output_cap() {
             seq: vec![b'A'; 50],
             qual: Some(vec![b'I'; 50]),
             pair_role: PairRole::Unpaired,
+            original_seq: None,
             repeat_min_occ: 1,
             comment: None,
         }],
@@ -181,6 +182,7 @@ fn stage5_has_alt_selects_the_second_cap_in_sam_output() {
             seq: vec![b'A'; 50],
             qual: Some(vec![b'I'; 50]),
             pair_role: PairRole::Unpaired,
+            original_seq: None,
             repeat_min_occ: 1,
             comment: None,
         })
