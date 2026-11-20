@@ -192,3 +192,63 @@ fn bad_magic_errors() {
         ),
     }
 }
+
+#[test]
+fn legacy_clean_eof_is_accepted_but_partial_record_id_fails() {
+    let file = NamedTempFile::new().unwrap();
+    let mut bytes = Vec::from(*MAGIC);
+    bytes.extend(LEGACY_VERSION.to_le_bytes());
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert!(
+        ChunkReader::open(file.path())
+            .unwrap()
+            .next_record()
+            .unwrap()
+            .is_none()
+    );
+    for partial_id_len in 1..8 {
+        let mut truncated = bytes.clone();
+        truncated.extend(&1u64.to_le_bytes()[..partial_id_len]);
+        std::fs::write(file.path(), truncated).unwrap();
+        let error = ChunkReader::open(file.path())
+            .unwrap()
+            .next_record()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("record ID"));
+    }
+}
+
+#[test]
+fn missing_whole_trailing_record_and_footer_fail() {
+    let file = NamedTempFile::new().unwrap();
+    let align = sample_aln(0, 150, false);
+    let mut writer = ChunkWriter::create(file.path()).unwrap();
+    writer
+        .write_record(11, std::slice::from_ref(&align))
+        .unwrap();
+    writer
+        .write_record(22, std::slice::from_ref(&align))
+        .unwrap();
+    writer.finish().unwrap();
+
+    let bytes = std::fs::read(file.path()).unwrap();
+    let first_record_end = 12 + (bytes.len() - 24) / 2;
+    std::fs::write(file.path(), &bytes[..first_record_end]).unwrap();
+    let mut reader = ChunkReader::open(file.path()).unwrap();
+    assert_eq!(reader.next_record().unwrap().unwrap().0, 11);
+    let error = reader.next_record().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    assert!(error.to_string().contains("missing tile chunk footer"));
+    drop(reader);
+
+    let mut skipped_record = bytes[..first_record_end].to_vec();
+    skipped_record.extend_from_slice(&bytes[bytes.len() - 12..]);
+    std::fs::write(file.path(), skipped_record).unwrap();
+    let mut reader = ChunkReader::open(file.path()).unwrap();
+    assert_eq!(reader.next_record().unwrap().unwrap().0, 11);
+    assert_eq!(
+        reader.next_record().unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+}

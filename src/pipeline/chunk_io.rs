@@ -3,19 +3,21 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Result, Write};
+use std::io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
 
 use crate::types::{Alignment, AlignmentKind, CigarKind, CigarOp, MateInfo, Strand};
 
 const MAGIC: &[u8; 8] = b"KIRACHNK";
 /// Wire format version.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+const LEGACY_VERSION: u32 = 2;
 
 /// Streaming writer for one tile's alignments.
 pub struct ChunkWriter {
     inner: BufWriter<File>,
     last_idx: Option<u64>,
+    records: u64,
 }
 
 impl ChunkWriter {
@@ -27,6 +29,7 @@ impl ChunkWriter {
         Ok(Self {
             inner: w,
             last_idx: None,
+            records: 0,
         })
     }
 
@@ -50,10 +53,15 @@ impl ChunkWriter {
         for aln in alignments {
             write_alignment(&mut self.inner, aln)?;
         }
+        self.records += 1;
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<()> {
+        // A zero alignment count marks the footer; its ID field carries the
+        // number of records so losing even a whole final record is detectable.
+        self.inner.write_all(&self.records.to_le_bytes())?;
+        self.inner.write_all(&0u32.to_le_bytes())?;
         self.inner.flush()
     }
 }
@@ -64,6 +72,8 @@ pub struct ChunkReader {
     /// Peeked next record, if any.
     peeked: Option<(u64, Vec<Alignment>)>,
     done: bool,
+    records: u64,
+    version: u32,
 }
 
 impl ChunkReader {
@@ -81,16 +91,18 @@ impl ChunkReader {
         let mut ver_buf = [0u8; 4];
         r.read_exact(&mut ver_buf)?;
         let ver = u32::from_le_bytes(ver_buf);
-        if ver != VERSION {
+        if !matches!(ver, LEGACY_VERSION | VERSION) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("unsupported chunk version {ver} (expected {VERSION})"),
+                format!("unsupported chunk version {ver} (supported: {LEGACY_VERSION}, {VERSION})"),
             ));
         }
         Ok(Self {
             inner: r,
             peeked: None,
             done: false,
+            records: 0,
+            version: ver,
         })
     }
 
@@ -110,23 +122,49 @@ impl ChunkReader {
         if self.peeked.is_some() || self.done {
             return Ok(());
         }
-        let mut idx_buf = [0u8; 8];
-        match self.inner.read_exact(&mut idx_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        if self.inner.fill_buf()?.is_empty() {
+            if self.version == LEGACY_VERSION {
                 self.done = true;
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "missing tile chunk footer",
+            ));
         }
+        let mut idx_buf = [0u8; 8];
+        self.inner.read_exact(&mut idx_buf).map_err(|error| {
+            if error.kind() == ErrorKind::UnexpectedEof {
+                Error::new(ErrorKind::UnexpectedEof, "truncated tile chunk record ID")
+            } else {
+                error
+            }
+        })?;
         let idx = u64::from_le_bytes(idx_buf);
         let mut n_buf = [0u8; 4];
         self.inner.read_exact(&mut n_buf)?;
         let n = u32::from_le_bytes(n_buf) as usize;
+        if n == 0 {
+            if self.version != VERSION || idx != self.records {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid tile chunk footer",
+                ));
+            }
+            if !self.inner.fill_buf()?.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "data after tile chunk footer",
+                ));
+            }
+            self.done = true;
+            return Ok(());
+        }
         let mut alns = Vec::with_capacity(n);
         for _ in 0..n {
             alns.push(read_alignment(&mut self.inner)?);
         }
+        self.records += 1;
         self.peeked = Some((idx, alns));
         Ok(())
     }
