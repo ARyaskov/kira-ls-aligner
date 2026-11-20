@@ -30,8 +30,7 @@
 use std::arch::x86_64::*;
 
 use crate::alignment::{
-    AlignmentConfig, BatchInput, SwResult, TRACE_E_EXTEND, TRACE_F_EXTEND, banded_sw_internal,
-    traceback_interleaved,
+    AlignmentConfig, BatchInput, SwResult, TRACE_E_EXTEND, TRACE_F_EXTEND, traceback_interleaved,
 };
 
 /// Maximum H value the i8 kernel is willing to commit to without falling back.
@@ -342,13 +341,7 @@ unsafe fn sw_batch_int8_inner(
         // Saturated → fall back to scalar SW for this lane so we never return
         // a wrong score under heavy positive scoring drift.
         if sat_arr[k] != 0 {
-            results.push(banded_sw_internal(
-                inputs[k].read_seq,
-                inputs[k].ref_window,
-                0,
-                cfg,
-                inputs[k].abort_score,
-            ));
+            results.push(inputs[k].scalar_sw(cfg));
             continue;
         }
 

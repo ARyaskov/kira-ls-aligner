@@ -169,3 +169,56 @@ fn public_simd_api_preserves_batch_cardinality_and_order() {
         }
     }
 }
+
+#[test]
+fn scalar_and_mixed_batches_follow_the_seed_diagonal() {
+    use kira_ls_aligner::alignment::{BatchInput, align_batch_simd};
+    use kira_ls_aligner::simd::SimdMode;
+    let read = b"GATTACAGCTTGAGTCCACG";
+    let mut window = vec![b'C'; 100];
+    window.extend_from_slice(read);
+    let input = BatchInput {
+        read_seq: read,
+        ref_window: &window,
+        win_start: 200,
+        chain: AnchorSpan {
+            ref_id: 0,
+            ref_start: 303,
+            ref_end: 320,
+            read_start: 3,
+            read_end: 20,
+            strand: Strand::Forward,
+        },
+        is_rev: false,
+        abort_score: i32::MIN / 4,
+    };
+    let shorter = BatchInput {
+        read_seq: &read[..19],
+        ..input.clone()
+    };
+    let cfg = AlignmentConfig {
+        match_score: 2,
+        mismatch: 4,
+        gap_open: 6,
+        gap_extend: 1,
+        bandwidth: 8,
+        xdrop: 40,
+        clip_penalty: 5,
+    };
+    for batch in [vec![input.clone()], vec![input, shorter]] {
+        for mode in [SimdMode::Scalar, SimdMode::Avx2, SimdMode::Neon] {
+            let (aln, _) = &align_batch_simd(&batch, cfg, mode)[0];
+            assert_eq!(
+                (aln.ref_start, aln.ref_end, aln.score, aln.nm),
+                (300, 320, 40, 0)
+            );
+            assert_eq!(
+                aln.cigar
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<String>(),
+                "20M"
+            );
+        }
+    }
+}

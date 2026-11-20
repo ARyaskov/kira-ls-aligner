@@ -56,6 +56,22 @@ pub struct BatchInput<'a> {
     pub abort_score: i32,
 }
 
+impl BatchInput<'_> {
+    fn scalar_sw(&self, cfg: AlignmentConfig) -> SwResult {
+        let offset = i64::from(self.chain.ref_start)
+            - i64::from(self.win_start)
+            - i64::from(self.chain.read_start);
+        let offset = offset.clamp(-(self.read_seq.len() as i64), self.ref_window.len() as i64);
+        banded_sw(
+            self.read_seq,
+            self.ref_window,
+            offset as i32,
+            cfg,
+            self.abort_score,
+        )
+    }
+}
+
 /// Zero-copy read orientation adapter.
 #[derive(Clone, Copy, Debug)]
 pub struct OrientedRead<'a> {
@@ -1159,10 +1175,7 @@ pub fn align_batch_simd(
             .chunks(4)
             .flat_map(|chunk| unsafe { sw_batch_neon(chunk, cfg) })
             .collect(),
-        _ => inputs
-            .iter()
-            .map(|i| banded_sw(i.read_seq, i.ref_window, 0, cfg, i.abort_score))
-            .collect(),
+        _ => inputs.iter().map(|i| i.scalar_sw(cfg)).collect(),
     };
 
     sw_results
@@ -1189,7 +1202,7 @@ fn align_chain_from_window_with_meta(
     input: &BatchInput<'_>,
     cfg: AlignmentConfig,
 ) -> (Alignment, bool) {
-    let sw = banded_sw(input.read_seq, input.ref_window, 0, cfg, input.abort_score);
+    let sw = input.scalar_sw(cfg);
     let early = sw.early_abort;
     (
         build_alignment(
@@ -1268,20 +1281,6 @@ fn build_alignment(
         xs_strand: None,
         mate: MateInfo::default(),
     }
-}
-
-/// Scalar banded Smith-Waterman — also the fallback for INT8 lanes that saturate.
-/// Only the x86-64 INT8/VNNI kernel falls back through it; other targets never
-/// saturate a lane and have no caller.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-pub(crate) fn banded_sw_internal(
-    read: &[u8],
-    reference: &[u8],
-    offset: i32,
-    cfg: AlignmentConfig,
-    abort_score: i32,
-) -> SwResult {
-    banded_sw(read, reference, offset, cfg, abort_score)
 }
 
 /// Whether the banded DP re-centers its band on the running-max column of the
