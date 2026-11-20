@@ -48,10 +48,10 @@ pub fn int8_path_viable(read_len: usize, cfg: AlignmentConfig) -> bool {
     let ms = cfg.match_score.max(1) as i64;
     let upper = (read_len as i64).saturating_mul(ms);
     upper < INT8_SAFE_MAX_H as i64
-        && cfg.match_score.unsigned_abs() <= 32
-        && cfg.mismatch.unsigned_abs() <= 32
-        && cfg.gap_open.unsigned_abs() <= 32
-        && cfg.gap_extend.unsigned_abs() <= 32
+        && (0..=32).contains(&cfg.match_score)
+        && (0..=32).contains(&cfg.mismatch)
+        && (0..=32).contains(&cfg.gap_open)
+        && (0..=32).contains(&cfg.gap_extend)
 }
 
 pub const LANES: usize = 32;
@@ -334,8 +334,6 @@ unsafe fn sw_batch_int8_inner(
         _mm256_storeu_si256(sat_arr.as_mut_ptr() as *mut __m256i, sat_v);
     }
 
-    let clip_pen_i8 = cfg.clip_penalty.clamp(0, i8::MAX as i32) as i8;
-
     let mut results = Vec::with_capacity(lanes);
     for k in 0..lanes {
         // Saturated → fall back to scalar SW for this lane so we never return
@@ -347,12 +345,13 @@ unsafe fn sw_batch_int8_inner(
 
         let local_score = best_score_arr[k];
         let qlen_score = best_qlen_score_arr[k];
-        let (start_i, start_j, bs) =
-            if qlen_score > 0 && qlen_score.saturating_add(clip_pen_i8) > local_score {
-                (q_len as i32, best_qlen_j[k], qlen_score as i32)
-            } else {
-                (best_i[k], best_j[k], local_score as i32)
-            };
+        let (start_i, start_j, bs) = if qlen_score > 0
+            && i32::from(qlen_score).saturating_add(cfg.clip_penalty) > i32::from(local_score)
+        {
+            (q_len as i32, best_qlen_j[k], qlen_score as i32)
+        } else {
+            (best_i[k], best_j[k], local_score as i32)
+        };
 
         let read_end = start_i;
         let ref_end = start_j as u32;

@@ -222,3 +222,53 @@ fn scalar_and_mixed_batches_follow_the_seed_diagonal() {
         }
     }
 }
+
+#[test]
+fn avx2_scores_and_positions_survive_the_i16_boundary() {
+    use kira_ls_aligner::alignment::{BatchInput, align_batch_simd};
+    use kira_ls_aligner::simd::SimdMode;
+
+    for (len, reward, offset) in [(7, 4681, 0), (8, 4096, 0), (150, 300, 0), (8, 1, 32768)] {
+        let read = vec![b'G'; len];
+        let mut reference = vec![b'C'; offset];
+        reference.extend_from_slice(&read);
+        let cfg = AlignmentConfig {
+            match_score: reward,
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 1,
+            bandwidth: 8,
+            xdrop: 40,
+            clip_penalty: 5,
+        };
+        let input = BatchInput {
+            read_seq: &read,
+            ref_window: &reference,
+            win_start: 0,
+            chain: AnchorSpan {
+                ref_id: 0,
+                ref_start: offset as u32,
+                ref_end: (offset + len) as u32,
+                read_start: 0,
+                read_end: len as u32,
+                strand: Strand::Forward,
+            },
+            is_rev: false,
+            abort_score: i32::MIN / 4,
+        };
+        for mode in [SimdMode::Avx2, SimdMode::AvxVnni] {
+            let (aln, _) = &align_batch_simd(std::slice::from_ref(&input), cfg, mode)[0];
+            assert_eq!(
+                (aln.score, aln.as_score),
+                (reward * len as i32, reward * len as i32)
+            );
+            assert_eq!(
+                (aln.ref_start, aln.ref_end),
+                (offset as u32, (offset + len) as u32)
+            );
+            assert_eq!(aln.cigar.len(), 1);
+            assert_eq!(aln.cigar[0].op, CigarKind::Match);
+            assert_eq!(aln.cigar[0].len, len as u32);
+        }
+    }
+}

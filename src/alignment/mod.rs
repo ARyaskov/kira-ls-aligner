@@ -1881,6 +1881,22 @@ unsafe fn sw_batch_avx2(inputs: &[BatchInput<'_>], cfg: AlignmentConfig) -> Vec<
     let q_len = inputs[0].read_seq.len();
     let r_len = inputs[0].ref_window.len();
 
+    // Both best-cell coordinates and affine DP cells are stored in i16 lanes.
+    // Nonnegative costs bound H by the number of aligned pairs times the match reward.
+    let max_lane = i32::from(i16::MAX);
+    let costs_fit = (0..=max_lane).contains(&cfg.match_score)
+        && (0..=max_lane).contains(&cfg.mismatch)
+        && cfg.gap_open >= 0
+        && cfg.gap_extend >= 0
+        && cfg.gap_open.saturating_add(cfg.gap_extend) <= max_lane;
+    if !costs_fit
+        || q_len > max_lane as usize
+        || r_len > max_lane as usize
+        || (q_len.min(r_len) as i32) * cfg.match_score > max_lane
+    {
+        return inputs.iter().map(|input| input.scalar_sw(cfg)).collect();
+    }
+
     let v_zero = _mm256_setzero_si256();
     let v_neg = _mm256_set1_epi16(-16384);
 
@@ -2115,22 +2131,21 @@ unsafe fn sw_batch_avx2_inner(
         _mm256_storeu_si256(best_qlen_j_arr.as_mut_ptr() as *mut __m256i, best_qlen_j_v);
     }
 
-    let clip_pen_i16 = cfg.clip_penalty.clamp(0, i16::MAX as i32) as i16;
-
     let mut results = Vec::with_capacity(lanes);
     for k in 0..lanes {
         let local_score = best_score_arr[k];
         let qlen_score = best_qlen_score_arr[k];
-        let (start_i, start_j, bs) =
-            if qlen_score > 0 && qlen_score.saturating_add(clip_pen_i16) > local_score {
-                (q_len as i32, best_qlen_j_arr[k] as i32, qlen_score as i32)
-            } else {
-                (
-                    best_i_arr[k] as i32,
-                    best_j_arr[k] as i32,
-                    local_score as i32,
-                )
-            };
+        let (start_i, start_j, bs) = if qlen_score > 0
+            && i32::from(qlen_score).saturating_add(cfg.clip_penalty) > i32::from(local_score)
+        {
+            (q_len as i32, best_qlen_j_arr[k] as i32, qlen_score as i32)
+        } else {
+            (
+                best_i_arr[k] as i32,
+                best_j_arr[k] as i32,
+                local_score as i32,
+            )
+        };
 
         let read_end = start_i;
         let ref_end = start_j as u32;
