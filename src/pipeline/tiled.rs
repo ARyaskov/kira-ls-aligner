@@ -9,7 +9,8 @@ use crate::exec::DualPool;
 use crate::exec::pool::DualPoolConfig;
 use crate::index::tiling::TilePlan;
 use crate::index::{Index, IndexConfig};
-use crate::io::{HeaderConfig, ReadStream, SamWriter};
+use crate::io::staged_sam::SamOutput;
+use crate::io::{HeaderConfig, ReadStream};
 use crate::pipeline::chunk_io::{ChunkReader, ChunkWriter, MergeIter};
 use std::sync::Arc;
 
@@ -185,7 +186,7 @@ fn run_tiled_inner(
     }
     let mut merge = MergeIter::new(readers);
 
-    let mut writer = SamWriter::new(output_path.clone(), &reference)?;
+    let (mut writer, publication) = SamOutput::open(output_path.as_deref(), &reference)?;
     if cfg.pipeline_cfg.output.format != crate::io::EmitFormat::Paf {
         match &cfg.header {
             Some(hdr) => writer.write_header_with_ctx(hdr)?,
@@ -282,6 +283,8 @@ fn run_tiled_inner(
     }
 
     writer.flush()?;
+    drop(writer);
+    publication.publish()?;
     crate::kira_info!(
         "[KIRA_TILE] merge done in {:.1}s; cleaning up {} chunk file(s)",
         t_merge.elapsed().as_secs_f64(),

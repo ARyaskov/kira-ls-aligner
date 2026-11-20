@@ -358,14 +358,16 @@ impl Aligner {
         let overall_start = Instant::now();
         let mut mode_selected: Option<(ReadMode, usize)> = None;
 
-        let output_path_buf = output_path.as_ref().map(|p| p.as_ref().to_path_buf());
         let simd_mode = if stats_enabled {
             Some(detect_cached())
         } else {
             None
         };
 
-        let mut writer = SamWriter::new(output_path, &index.reference)?;
+        let (mut writer, publication) = crate::io::staged_sam::SamOutput::open(
+            output_path.as_ref().map(AsRef::as_ref),
+            &index.reference,
+        )?;
         let is_paf = matches!(self.cfg.pipeline.output.format, crate::io::EmitFormat::Paf);
         if !is_paf {
             match &self.cfg.header {
@@ -490,7 +492,9 @@ impl Aligner {
                         Ok(Ok(Some(pair))) => pair,
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => break,
+                        Err(_) => {
+                            anyhow::bail!("input prefetch thread stopped before end of stream")
+                        }
                     }
                 } else {
                     let s = stream_local.as_mut().expect("serial stream present");
@@ -589,7 +593,7 @@ impl Aligner {
                         &mut sys,
                         read_bytes_now,
                         self.cfg.threads,
-                        output_path_buf.as_deref(),
+                        publication.progress_path(),
                         simd_mode,
                     );
                 }
@@ -600,9 +604,7 @@ impl Aligner {
         })();
         // Close the receiver so a blocked producer unblocks, then join it.
         drop(batch_rx);
-        if let Some(handle) = producer_handle {
-            let _ = handle.join();
-        }
+        let producer_result = producer_handle.map(|handle| handle.join());
         // Signal end-of-stream to the writer, then drain it. The writer's own
         // error is reported first when both sides failed, since a write failure
         // is what makes the driver's send fail.
@@ -611,7 +613,11 @@ impl Aligner {
             .join()
             .map_err(|_| anyhow::anyhow!("SAM writer thread panicked"))?;
         write_result?;
+        if let Some(Err(_)) = producer_result {
+            anyhow::bail!("input prefetch thread panicked");
+        }
         drive_result?;
+        publication.publish()?;
 
         if stats_enabled {
             if let Some(pb) = progress.as_ref() {

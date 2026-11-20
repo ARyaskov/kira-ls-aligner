@@ -12,6 +12,7 @@ use crate::types::{
 };
 
 pub(crate) mod binary;
+pub(crate) mod staged_sam;
 
 /// Load reference sequences from FASTA using mmap.
 pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {

@@ -514,6 +514,41 @@ fn index_and_mem_through_the_binary() {
 }
 
 #[test]
+fn failed_text_input_preserves_named_output() -> anyhow::Result<()> {
+    let dir = TempDir::new("text_publication");
+    let reference = dir.join("ref.fa");
+    std::fs::write(&reference, b">chr1\nACGTACGTACGTACGTACGTACGTACGTACGT\n")?;
+    let missing = dir.join("missing.fq");
+    let r1 = dir.join("r1.fa");
+    let r2 = dir.join("r2.fa");
+    std::fs::write(
+        &r1,
+        b">first\nACGTACGTACGTACGTACGTACGTACGTACGT\n>extra\nACGT\n",
+    )?;
+    std::fs::write(&r2, b">first\nACGTACGTACGTACGTACGTACGTACGTACGT\n")?;
+    let missing_reads = [missing.as_path()];
+    let unequal_reads = [r1.as_path(), r2.as_path()];
+    for (format, reads) in [("sam", &missing_reads[..]), ("paf", &unequal_reads[..])] {
+        let destination = dir.join(&format!("out.{format}"));
+        std::fs::write(&destination, b"previous result")?;
+        let result = Command::new(BIN)
+            .args(mem_args(
+                &reference,
+                reads,
+                &destination,
+                &["--emit", format, "-t", "1", "-K", "1"],
+            ))
+            .output()?;
+        assert!(!result.status.success());
+        if format == "paf" {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("unequal record counts"));
+        }
+        assert_eq!(std::fs::read(&destination)?, b"previous result");
+    }
+    Ok(())
+}
+
+#[test]
 fn binary_emit_keeps_previous_output_on_rejected_record() {
     let ds = build_dataset("reject_long_name", &SimParams::default());
     let reads = ds.dir.join("long-name.fq");
