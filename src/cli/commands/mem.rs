@@ -434,7 +434,16 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
     let hybrid_dp_topk = args.dp_topk;
 
     let emit_lower = args.emit.to_ascii_lowercase();
-    let mut output_cfg = match emit_lower.as_str() {
+    let emit = emit_lower.as_str();
+    let fused_kind = super::emit::EmitKind::parse(emit);
+    if fused_kind.is_none() && !matches!(emit, "" | "sam" | "paf") {
+        return Err(anyhow::anyhow!(
+            "unknown --emit value {:?} (accepted: sam, paf, bam, sorted-bam, cram, sorted-cram)",
+            args.emit
+        ));
+    }
+
+    let mut output_cfg = match emit {
         "paf" => OutputConfig::paf(),
         _ if args.fast_output => OutputConfig::fast(),
         _ => OutputConfig::full(),
@@ -656,7 +665,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
                 args.tile_bytes
             ));
         }
-        if super::emit::EmitKind::parse(&emit_lower).is_some() {
+        if fused_kind.is_some() {
             return Err(anyhow::anyhow!(
                 "--split-prefix with --emit {} is not yet supported; emit SAM and convert externally",
                 emit_lower
@@ -691,15 +700,6 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
             }
         })
     };
-
-    let emit = emit_lower.as_str();
-    let fused_kind = super::emit::EmitKind::parse(emit);
-    if fused_kind.is_none() && !matches!(emit, "" | "sam" | "paf") {
-        return Err(anyhow::anyhow!(
-            "unknown --emit value {:?} (accepted: sam, paf, bam, sorted-bam, cram, sorted-cram)",
-            args.emit
-        ));
-    }
 
     let Some(kind) = fused_kind else {
         return if let Some(index_path) = resolved_index.as_ref() {

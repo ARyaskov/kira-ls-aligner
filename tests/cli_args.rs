@@ -148,3 +148,22 @@ fn xa_max_takes_one_or_two_values() {
         "a pair sets first/second caps"
     );
 }
+
+#[test]
+fn tiled_mode_rejects_unknown_output_format_before_opening_files() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+        .args([
+            "mem",
+            "--split-prefix",
+            "chunks",
+            "--emit",
+            "pfa",
+            "missing.fa",
+            "missing.fq",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown --emit value"), "{stderr}");
+}
