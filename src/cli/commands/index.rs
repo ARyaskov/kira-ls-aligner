@@ -11,6 +11,7 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     let (mut short_k, mut short_w, mut long_k, mut long_w) = match preset.as_str() {
         "short" => (19, 10, 19, 10),
         "long" => (15, 10, 15, 10),
+        "splice" | "splice:hq" => (15, 5, 15, 5),
         _ => (19, 10, 15, 10),
     };
     if let Some(k) = args.seed_len {

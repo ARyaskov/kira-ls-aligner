@@ -1059,6 +1059,10 @@ impl Default for IndexConfig {
 }
 
 impl Index {
+    pub(crate) fn has_minimizers(&self) -> bool {
+        self.short.data.hash_lookup.is_some() || self.long.data.hash_lookup.is_some()
+    }
+
     pub(crate) fn minimizer_table(&self, long: bool) -> &MinimizerIndex {
         match (
             long,

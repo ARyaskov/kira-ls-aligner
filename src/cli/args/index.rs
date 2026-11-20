@@ -13,7 +13,7 @@ pub struct IndexArgs {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
-    /// Preset: short, long, or auto.
+    /// Preset: short, long, splice, splice:hq, or auto.
     #[arg(short = 'x', long = "preset", default_value = "auto")]
     pub preset: String,
 

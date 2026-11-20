@@ -676,39 +676,43 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     let aligner = Aligner::new(cfg);
 
-    let resolved_index: Option<std::path::PathBuf> = if splice_preset {
-        if args.index.is_some() {
-            crate::kira_warn!(
-                "[KIRA] warning: --index is being ignored in splice mode \
-                 (k/w mismatch would produce zero alignments). Building \
-                 a fresh splice-tuned index in memory."
+    // An ordinary automatic sidecar may use a different minimizer window.
+    // A splice-specific index can be selected explicitly with --index.
+    let resolved_index = args.index.clone().or_else(|| {
+        if splice_preset {
+            return None;
+        }
+        let candidate = args.reference.with_extension("kiraidx");
+        if candidate.is_file() {
+            crate::kira_info!(
+                "[KIRA] auto-detected sidecar index {} for {}",
+                candidate.display(),
+                args.reference.display()
+            );
+            Some(candidate)
+        } else {
+            None
+        }
+    });
+    let load_index = |path: &std::path::Path, verify: bool| -> Result<Index> {
+        let index = Index::load(path).with_context(|| format!("load index {}", path.display()))?;
+        if splice_preset {
+            anyhow::ensure!(
+                index.has_minimizers(),
+                "splice index contains no minimizer table"
             );
         }
-        None
-    } else {
-        args.index.clone().or_else(|| {
-            let candidate = args.reference.with_extension("kiraidx");
-            if candidate.is_file() {
-                crate::kira_info!(
-                    "[KIRA] auto-detected sidecar index {} for {}",
-                    candidate.display(),
-                    args.reference.display()
-                );
-                Some(candidate)
-            } else {
-                None
-            }
-        })
+        if verify || splice_preset {
+            index
+                .verify_reference(&args.reference)
+                .context("verify indexed reference")?;
+        }
+        Ok(index)
     };
 
     let Some(kind) = fused_kind else {
         return if let Some(index_path) = resolved_index.as_ref() {
-            let index = Index::load(index_path).context("load index")?;
-            if args.index.is_none() {
-                index
-                    .verify_reference(&args.reference)
-                    .context("verify auto-detected index")?;
-            }
+            let index = load_index(index_path, args.index.is_none())?;
             aligner.run_loaded_index(index, &args.reads, args.output.as_ref())
         } else {
             aligner.run(&args.reference, &args.reads, args.output.as_ref())
@@ -738,15 +742,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     // The fused path drives the pipeline itself, so it needs the index in hand.
     let index = match resolved_index.as_ref() {
-        Some(p) => {
-            let index = Index::load(p).with_context(|| format!("load index {}", p.display()))?;
-            if args.index.is_none() || kind.is_cram() {
-                index
-                    .verify_reference(&args.reference)
-                    .context("verify indexed reference")?;
-            }
-            index
-        }
+        Some(p) => load_index(p, args.index.is_none() || kind.is_cram())?,
         None => {
             let reference = read_reference(&args.reference).context("load reference")?;
             Index::try_build(reference, index_cfg)?
