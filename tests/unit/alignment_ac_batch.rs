@@ -195,3 +195,18 @@ fn ambiguous_exact_match_retains_competitors_when_requested() {
     assert_eq!(out.alignments[0].len(), 2);
     assert_eq!(out.alignments[0][0].score, out.alignments[0][1].score);
 }
+
+#[test]
+fn exact_iupac_pattern_charges_ambiguity_in_nm() {
+    let mut pattern = asymmetric_pattern();
+    pattern[15] = b'R';
+    let index = make_index(make_ref(vec![("ref", &pattern)]));
+    let mut reads = vec![read("ambiguous-base", &pattern)];
+    pad_with_decoys(&mut reads);
+    let out = run(&reads, &index, aln_cfg(), 1);
+    let [hit] = out.alignments[0].as_slice() else {
+        panic!("expected one exact hit");
+    };
+    assert_eq!(hit.nm, 1);
+    assert_eq!(hit.md, pattern.len().to_string());
+}

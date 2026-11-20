@@ -485,13 +485,12 @@ pub(crate) fn build_ungapped_alignment(
     }
 
     let mut md = crate::alignment::MdBuilder::new();
-    md.columns(
+    let mism = md.columns(
         &read_seq[read_start..read_start + span],
         &ref_seq[ref_start..ref_start + span],
-    );
+    ) as i32;
     let (nm, md) = md.finish();
 
-    let mism = nm as i32;
     let matches = span as i32 - mism;
     let score = matches * cfg.match_score - mism * cfg.mismatch;
 

@@ -268,9 +268,8 @@ pub fn run(
                     continue;
                 }
                 let read_idx = fwd_to_read[mat.pattern().as_usize()];
-                let read_len = reads[read_idx].seq.len();
                 let ref_start = (c0 + mat.start()) as u32;
-                let aln = make_perfect_match(ref_id, ref_start, read_len, false, cfg);
+                let aln = make_perfect_match(ref_id, ref_start, &slice[mat.range()], false, cfg);
                 local.push(((ref_id, 0, ref_start), read_idx, aln));
                 fwd_local += 1;
             }
@@ -280,9 +279,8 @@ pub fn run(
                     continue;
                 }
                 let read_idx = rc_to_read[mat.pattern().as_usize()];
-                let read_len = reads[read_idx].seq.len();
                 let ref_start = (c0 + mat.start()) as u32;
-                let aln = make_perfect_match(ref_id, ref_start, read_len, true, cfg);
+                let aln = make_perfect_match(ref_id, ref_start, &slice[mat.range()], true, cfg);
                 local.push(((ref_id, 1, ref_start), read_idx, aln));
                 rev_local += 1;
             }
@@ -345,10 +343,11 @@ fn build_ac(patterns: &[&[u8]]) -> Option<AhoCorasick> {
 fn make_perfect_match(
     ref_id: u32,
     ref_start: u32,
-    read_len: usize,
+    matched: &[u8],
     is_rev: bool,
     cfg: AlignmentConfig,
 ) -> Alignment {
+    let read_len = matched.len();
     let cigar = vec![CigarOp {
         len: read_len as u32,
         op: CigarKind::Match,
@@ -367,7 +366,7 @@ fn make_perfect_match(
         is_rev,
         is_secondary: false,
         is_supplementary: false,
-        nm: 0,
+        nm: super::md::identical_nm(matched),
         md: read_len.to_string(),
         as_score: score,
         xs_score: None,

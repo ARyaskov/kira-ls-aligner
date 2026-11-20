@@ -179,7 +179,7 @@ fn build_ungapped_alignment(
     ref_start: u32,
     cfg: AlignmentConfig,
     is_rev: bool,
-    nm: u32,
+    hamming: u32,
 ) -> Alignment {
     let read_len = read.len();
     let cigar = vec![CigarOp {
@@ -188,10 +188,13 @@ fn build_ungapped_alignment(
     }];
     let mut md = crate::alignment::MdBuilder::new();
     let counted = md.columns(read, &ref_slice[..read_len]);
-    debug_assert_eq!(counted, nm, "caller's mismatch count must match the replay");
-    let (_, md) = md.finish();
-    let matches = (read_len as u32 - nm) as i32;
-    let mism = nm as i32;
+    debug_assert_eq!(
+        counted, hamming,
+        "caller's mismatch count must match the replay"
+    );
+    let (nm, md) = md.finish();
+    let matches = (read_len as u32 - hamming) as i32;
+    let mism = hamming as i32;
     let score = matches * cfg.match_score - mism * cfg.mismatch;
 
     Alignment {

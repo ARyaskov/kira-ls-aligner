@@ -1363,10 +1363,9 @@ fn build_forced_accept(
         });
     }
 
-    let (nm, md) =
-        crate::alignment::md::ungapped_tags(&read_seq[..span], &ref_seq[ref_start..ref_end]);
-
-    let mism = nm as i32;
+    let mut tags = crate::alignment::MdBuilder::new();
+    let mism = tags.columns(&read_seq[..span], &ref_seq[ref_start..ref_end]) as i32;
+    let (nm, md) = tags.finish();
     let matches = span as i32 - mism;
     let score = matches * cfg.match_score - mism * cfg.mismatch;
 

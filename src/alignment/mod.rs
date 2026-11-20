@@ -805,7 +805,7 @@ pub fn exact_match_alignment(
         is_rev,
         is_secondary: false,
         is_supplementary: false,
-        nm: 0,
+        nm: md::identical_nm(read_seq),
         md: read_len.to_string(),
         as_score: score,
         xs_score: None,

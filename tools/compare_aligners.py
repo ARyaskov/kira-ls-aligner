@@ -167,7 +167,10 @@ def evaluate(path, truth, reference):
                     recovered = True
                 if op in "M=X":
                     assert ri + n <= len(ref) and qi + n <= len(sequence)
-                    nm += sum(a != b for a, b in zip(sequence[qi:qi+n], ref[ri:ri+n]))
+                    query_bases = sequence[qi:qi+n].upper()
+                    ref_bases = ref[ri:ri+n].upper()
+                    nm += sum(q != ord("=") and (q != r or q not in b"ACGT")
+                              for q, r in zip(query_bases, ref_bases))
                     qi += n
                     ri += n
                 elif op == "I":

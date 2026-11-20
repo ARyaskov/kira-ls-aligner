@@ -158,6 +158,15 @@ fn two_exon_alignment_emits_n_op_and_forward_xs_strand() {
     // MD does not represent the N op: a perfect 400 bp spliced read has a
     // single 400 run, not the two exon runs glued together ("200200").
     assert_eq!(aln.md, "400", "MD must continue across the intron");
+
+    let mut read = read;
+    read.seq[42] = b'N';
+    ref_seq[2042] = b'N';
+    let ambiguous = align_spliced_chain(&chain, &read, &ref_seq, align_cfg(), splice_cfg, None, 2)
+        .expect("spliced read with a single ambiguous base");
+    assert_eq!(ambiguous.cigar, aln.cigar);
+    assert_eq!(ambiguous.score, aln.score);
+    assert_eq!((ambiguous.nm, ambiguous.md.as_str()), (1, "400"));
 }
 
 #[test]

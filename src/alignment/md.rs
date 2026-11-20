@@ -15,7 +15,8 @@
 //! * the string always ends with a count, `0` when needed, so `MD:Z:0A0`
 //!   style output parses everywhere.
 //!
-//! `NM` is the edit distance: mismatches plus inserted plus deleted bases.
+//! NM matches only equal A/C/G/T (case-insensitive) or a query `=`. Equal
+//! ambiguity codes extend the MD run but count as an edit in NM.
 
 use crate::types::{CigarKind, CigarOp};
 use core::fmt::NumBuffer;
@@ -70,27 +71,28 @@ impl MdBuilder {
         self.nm += 1;
     }
 
-    /// One aligned column. Returns `true` when the bases match.
+    /// Record SAM tags for one aligned column. The return value is byte
+    /// equality for callers accumulating the aligner's substitution score.
     #[inline]
     pub fn column(&mut self, read_base: u8, ref_base: u8) -> bool {
-        if read_base == ref_base {
+        if read_base == b'=' || read_base.eq_ignore_ascii_case(&ref_base) {
             self.matched();
-            true
+            self.nm += u32::from(identical_base_is_edit(read_base));
         } else {
             self.mismatch(ref_base);
-            false
         }
+        read_base == ref_base
     }
 
     /// `read.len()` aligned columns (the ungapped case). Returns the number
-    /// of mismatches among them.
+    /// of byte mismatches for substitution scoring; `nm()` gives SAM edit distance.
     pub fn columns(&mut self, read: &[u8], reference: &[u8]) -> u32 {
         debug_assert_eq!(read.len(), reference.len());
-        let before = self.nm;
+        let mut hamming = 0;
         for (&qb, &rb) in read.iter().zip(reference) {
-            self.column(qb, rb);
+            hamming += u32::from(!self.column(qb, rb));
         }
-        self.nm - before
+        hamming
     }
 
     /// `len` inserted read bases: NM only.
@@ -127,6 +129,19 @@ impl MdBuilder {
         self.flush_run();
         (self.nm, self.text)
     }
+}
+
+#[inline]
+fn identical_base_is_edit(base: u8) -> bool {
+    !matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'=')
+}
+
+/// An exact byte match needs only the number of ambiguity codes for its NM.
+pub(crate) fn identical_nm(bases: &[u8]) -> u32 {
+    bases
+        .iter()
+        .map(|&base| u32::from(identical_base_is_edit(base)))
+        .sum()
 }
 
 pub(crate) fn ungapped_tags(read: &[u8], reference: &[u8]) -> (u32, String) {

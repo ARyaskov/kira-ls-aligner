@@ -158,3 +158,29 @@ fn public_md_builder_emits_ascii_letters_for_arbitrary_reference_bytes() {
     md.matched();
     assert_eq!(md.finish(), (6, "0N0^RNNNN1".into()));
 }
+
+#[test]
+fn ambiguity_and_case_have_independent_nm_md_and_score_rules() {
+    use kira_ls_aligner::alignment::{MdBuilder, exact_match_alignment};
+    let mut md = MdBuilder::new();
+    md.columns(b"aNr=A", b"ANRNC");
+    assert_eq!(md.finish(), (3, "4C0".into()));
+
+    let bases = b"ACGTNRYACGT";
+    let span = AnchorSpan {
+        ref_id: 0,
+        ref_start: 0,
+        ref_end: bases.len() as u32,
+        read_start: 0,
+        read_end: bases.len() as u32,
+        strand: Strand::Forward,
+    };
+    let aln = exact_match_alignment(bases.len(), bases, bases, &span, cfg(), false).unwrap();
+    assert_eq!(aln.nm, 3);
+    assert_eq!(aln.md, "11");
+    assert_eq!(aln.score, bases.len() as i32 * cfg().match_score);
+
+    let mut longer = b"ACGT".repeat(38);
+    longer[70] = b'N';
+    assert_eq!(accept_with(&longer, &longer), ("152".into(), 1));
+}
