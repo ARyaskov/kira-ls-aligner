@@ -293,13 +293,8 @@ pub const KNOBS: &[Knob] = &[
     ),
     knob(
         "KIRA_AC_DISABLE",
-        "unset",
-        "Aho-Corasick exact-match fast path: unset = auto, 0 = force on, 1 = force off.",
-    ),
-    knob(
-        "KIRA_AC_MAX_REF_MB",
-        "50",
-        "Largest reference, in Mbp, for which the Aho-Corasick fast path is built.",
+        "1",
+        "Aho-Corasick exact-match fast path. Set to 0 to enable.",
     ),
     knob(
         "KIRA_CGK_ENABLE",

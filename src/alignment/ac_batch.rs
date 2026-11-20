@@ -1,12 +1,7 @@
 //! Batch-level Aho-Corasick exact-match fast path.
 //!
-//! ~80% of typical short reads have a bit-exact match somewhere in the
-//! reference. Building a single Aho-Corasick automaton from all reads in a
-//! batch and scanning the reference once is far cheaper than per-read minimizer
-//! lookups + chaining + DP for the exact-match subset.
-//!
-//! Auto-disabled on large references (the per-batch rescan outweighs the seeding
-//! it saves). `KIRA_AC_DISABLE` (unset=auto, 0=on, 1=off), `KIRA_AC_MAX_REF_MB`=50.
+//! Building two automata per batch cost more than indexed seeding on the
+//! measured short-read workloads. Set `KIRA_AC_DISABLE=0` to opt in.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,7 +46,10 @@ impl AcBatchOutput {
     pub fn empty(n_reads: usize) -> Self {
         Self {
             alignments: vec![Vec::new(); n_reads],
-            stats: AcBatchStats::default(),
+            stats: AcBatchStats {
+                n_reads,
+                ..AcBatchStats::default()
+            },
         }
     }
 
@@ -74,124 +72,35 @@ pub struct AcBatchStats {
     pub scan_ms: f32,
 }
 
-/// AC auto-disables above this total reference size (bp); override: KIRA_AC_MAX_REF_MB.
-/// A hard ceiling only; the binding condition is [`AC_MAX_SCAN_TO_BATCH_RATIO`].
-const AC_MAX_REF_BP_DEFAULT: u64 = 50_000_000;
-
-/// Maximum ratio of AC scan work to batch read bases for the auto gate.
-///
-/// Each batch scans the whole reference twice (forward + reverse-complement
-/// automaton), so the cost is `2 * ref_bp` per batch while the saving is per
-/// read. AC only wins when the reference is much smaller than the batch — small
-/// viral/plasmid/amplicon references. Gating on reference size alone enabled it
-/// for every bacterial genome, where it cost 12x the runtime for +0.008% of
-/// reads placed.
-const AC_MAX_SCAN_TO_BATCH_RATIO: f64 = 0.5;
-
-/// Cap automatic automaton construction at one million eligible bases in
-/// each orientation. Build work follows the pattern bytes even when scanning
-/// the reference is cheap. Explicit force-on can exceed the automatic budget.
-const AC_AUTO_PATTERN_BASES: usize = 1_000_000;
+fn ac_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let setting = std::env::var("KIRA_AC_DISABLE")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        match setting {
+            Some(0) => {
+                crate::kira_info!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0)");
+                true
+            }
+            Some(_) => {
+                crate::kira_info!("[KIRA_AC] forced OFF (KIRA_AC_DISABLE)");
+                false
+            }
+            None => {
+                crate::kira_info!("[KIRA_AC] disabled by default; set KIRA_AC_DISABLE=0 to enable");
+                false
+            }
+        }
+    })
+}
 
 fn eligible_pattern(read: &ReadRecord) -> bool {
     (MIN_PATTERN_LEN..=MAX_PATTERN_LEN).contains(&read.seq.len()) && !read.seq.contains(&b'N')
 }
 
-fn exceeds_auto_pattern_budget(reads: &[ReadRecord]) -> bool {
-    let mut bases = 0;
-    for read in reads.iter().filter(|read| eligible_pattern(read)) {
-        bases += read.seq.len();
-        if bases > AC_AUTO_PATTERN_BASES {
-            return true;
-        }
-    }
-    false
-}
-
-/// AC policy from `KIRA_AC_DISABLE`: unset = Auto, `0` = ForceOn, else ForceOff.
-#[derive(Clone, Copy, PartialEq)]
-enum AcMode {
-    Auto,
-    ForceOn,
-    ForceOff,
-}
-
-fn ac_mode() -> AcMode {
-    static CELL: OnceLock<AcMode> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        match std::env::var("KIRA_AC_DISABLE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-        {
-            None => AcMode::Auto,
-            Some(0) => AcMode::ForceOn,
-            Some(_) => AcMode::ForceOff,
-        }
-    })
-}
-
-fn ac_max_ref_bp() -> u64 {
-    static CELL: OnceLock<u64> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("KIRA_AC_MAX_REF_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1_000_000))
-            .unwrap_or(AC_MAX_REF_BP_DEFAULT)
-    })
-}
-
-fn ac_should_run(total_ref_bp: u64, batch_bases: u64, reads: &[ReadRecord]) -> bool {
-    let mode = ac_mode();
-    // Scan work per batch: both automata traverse the full reference.
-    let scan_bp = total_ref_bp.saturating_mul(2);
-    let amortises =
-        batch_bases > 0 && (scan_bp as f64) <= (batch_bases as f64) * AC_MAX_SCAN_TO_BATCH_RATIO;
-    let over_budget = mode == AcMode::Auto
-        && total_ref_bp <= ac_max_ref_bp()
-        && amortises
-        && exceeds_auto_pattern_budget(reads);
-    let run = match mode {
-        AcMode::ForceOff => false,
-        AcMode::ForceOn => true,
-        AcMode::Auto => total_ref_bp <= ac_max_ref_bp() && amortises && !over_budget,
-    };
-    static LOGGED: OnceLock<()> = OnceLock::new();
-    LOGGED.get_or_init(|| {
-        let mb = total_ref_bp as f64 / 1e6;
-        let thr = ac_max_ref_bp() / 1_000_000;
-        let batch_mb = batch_bases as f64 / 1e6;
-        match mode {
-            AcMode::Auto if run => crate::kira_info!(
-                "[KIRA_AC] auto: ENABLED (reference {mb:.1} Mbp ≤ {thr} Mbp; per-batch scan \
-                 {:.1} Mbp ≤ {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp)",
-                scan_bp as f64 / 1e6,
-            ),
-            AcMode::Auto if total_ref_bp > ac_max_ref_bp() => crate::kira_info!(
-                "[KIRA_AC] auto: DISABLED (reference {mb:.1} Mbp > {thr} Mbp) — using indexed \
-                 path. Force on: KIRA_AC_DISABLE=0; raise gate: KIRA_AC_MAX_REF_MB."
-            ),
-            AcMode::Auto if over_budget => crate::kira_info!(
-                "[KIRA_AC] auto: DISABLED (eligible pattern bases exceed {AC_AUTO_PATTERN_BASES}) — using indexed path"
-            ),
-            AcMode::Auto => crate::kira_info!(
-                "[KIRA_AC] auto: DISABLED (per-batch scan {:.1} Mbp exceeds \
-                 {AC_MAX_SCAN_TO_BATCH_RATIO} x batch {batch_mb:.1} Mbp — the rescan would cost \
-                 more than the seeding it saves) — using indexed path. Force on: \
-                 KIRA_AC_DISABLE=0; or raise -K to enlarge batches.",
-                scan_bp as f64 / 1e6,
-            ),
-            AcMode::ForceOn => {
-                crate::kira_info!("[KIRA_AC] forced ON (KIRA_AC_DISABLE=0), reference {mb:.1} Mbp")
-            }
-            AcMode::ForceOff => crate::kira_info!("[KIRA_AC] forced OFF (KIRA_AC_DISABLE=1)"),
-        }
-    });
-    run
-}
-
-/// Build forward + reverse-complement AC automata, scan every contig once,
-/// emit perfect-match alignments for reads with hits.
+/// When AC is enabled, scan contigs with forward and reverse-complement
+/// automata and emit perfect-match alignments.
 ///
 /// `max_alignments` caps the alignments retained per read (the rest are dropped).
 pub fn run(
@@ -200,21 +109,19 @@ pub fn run(
     cfg: AlignmentConfig,
     max_alignments: usize,
 ) -> AcBatchOutput {
+    if reads.is_empty() || !ac_enabled() {
+        return AcBatchOutput::empty(reads.len());
+    }
+    run_enabled(reads, index, cfg, max_alignments)
+}
+
+fn run_enabled(
+    reads: &[ReadRecord],
+    index: &Index,
+    cfg: AlignmentConfig,
+    max_alignments: usize,
+) -> AcBatchOutput {
     let mut out = AcBatchOutput::empty(reads.len());
-    out.stats.n_reads = reads.len();
-
-    if reads.is_empty() {
-        return out;
-    }
-
-    let total_ref_bp: u64 = (0..index.reference.sequences.len())
-        .map(|r| index.ref_bases(r).len() as u64)
-        .sum();
-    let batch_bases: u64 = reads.iter().map(|r| r.seq.len() as u64).sum();
-    if !ac_should_run(total_ref_bp, batch_bases, reads) {
-        return out;
-    }
-
     let t_build = std::time::Instant::now();
 
     let mut fwd_patterns: Vec<&[u8]> = Vec::with_capacity(reads.len());

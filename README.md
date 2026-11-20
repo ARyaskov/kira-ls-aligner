@@ -250,7 +250,7 @@ below covers the ones worth knowing about.
 | `KIRA_ANCHOR_CAP_K` | on | Never require an anchor to be longer than the seed length `k`. `0` restores the old `min_anchor_len` behaviour. |
 | `KIRA_TWOTIER` | on | Verify uncertain candidate loci with the final affine scorer, reuse verified alignments, and adapt the traceback budget to 1–3 candidates (at least 2 for paired decisions). |
 | `KIRA_PREFETCH` | on | Parse the next batch on a producer thread while the current one aligns. `0` restores the serial loop. |
-| `KIRA_AC_DISABLE` | auto | Aho-Corasick exact-match fast path. `0` forces on, `1` forces off. See below. |
+| `KIRA_AC_DISABLE` | 1 (off) | Set to `0` to enable the Aho-Corasick exact-match path. |
 | `KIRA_RESCUE_WIDE` | off | After a banded mate-rescue attempt misses its score bar, also run a full-window SW. `1` restores it. |
 | `KIRA_MATE_SEED` | on | Bias seed-occurrence sampling toward copies that have the mate nearby. `0` disables. |
 | `KIRA_ALGO` | `packed` | Fast-path aligner: `packed`, `spectral`, `wfa`, `sw`. `wfa` is the gapped path used for the INDEL figures below. |
@@ -272,12 +272,11 @@ reads, which is exactly the off-diagonal case it exists for. The wide search
 still runs when the packed scan cannot (ambiguous bases in the window), since
 there is then no best diagonal to band around.
 
-The Aho-Corasick path rescans the whole reference **once per batch**, so it only
-pays when the reference is much smaller than the batch. It auto-enables only when
-the per-batch scan is at most half the batch's own base count. Forcing it on
-outside that regime is expensive: on E. coli (4.6 Mbp) with the default 4 Mbp
-batch, an 800k-read run took 35.2 s with AC versus 2.9 s without, for 6 more
-correctly placed reads out of 80 000.
+Aho-Corasick is opt-in. The two automata are rebuilt for each batch. A
+short-read comparison across references from 250 bp to 1 Mbp and batches of
+64 to 5,000 reads found no reproducible throughput advantage and identical
+placement accuracy. Set `KIRA_AC_DISABLE=0` to evaluate the path explicitly.
+The former automatic reference-size setting `KIRA_AC_MAX_REF_MB` has been removed.
 
 ## Presets
 

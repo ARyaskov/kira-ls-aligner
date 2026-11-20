@@ -3,7 +3,12 @@ use std::process::Command;
 
 const READ_LEN: usize = 150;
 
-fn run_with_auto_ac(dir: &Path, exact_reads: usize, add_unmappable: bool) -> (String, String) {
+fn run_mem(
+    dir: &Path,
+    exact_reads: usize,
+    add_unmappable: bool,
+    ac_override: Option<&str>,
+) -> (String, String) {
     let fasta = dir.join("ref.fa");
     let fastq = dir.join("reads.fq");
     let mut state = 9u64;
@@ -29,14 +34,16 @@ fn run_with_auto_ac(dir: &Path, exact_reads: usize, add_unmappable: bool) -> (St
     }
     std::fs::write(&fastq, reads).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"));
+    command
         .args(["mem", "-x", "short", "-t", "2", "-K", "10000000"])
         .args([fasta, fastq])
         .env_remove("KIRA_AC_DISABLE")
-        .env_remove("KIRA_AC_MAX_REF_MB")
-        .env("KIRA_STATS", "1")
-        .output()
-        .unwrap();
+        .env("KIRA_STATS", "1");
+    if let Some(value) = ac_override {
+        command.env("KIRA_AC_DISABLE", value);
+    }
+    let output = command.output().unwrap();
     let log = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{log}");
     (String::from_utf8(output.stdout).unwrap(), log)
@@ -70,7 +77,7 @@ fn algo_summary(log: &str) -> &str {
 #[test]
 fn ac_matches_count_as_exact_and_not_unmapped() {
     let dir = tempfile::tempdir().unwrap();
-    let (sam, log) = run_with_auto_ac(dir.path(), 128, true);
+    let (sam, log) = run_mem(dir.path(), 128, true, Some("0"));
     check_sam(&sam, 128, true);
     assert!(log.contains("eligible=128 resolved=128"), "{log}");
     let summary = algo_summary(&log);
@@ -79,14 +86,19 @@ fn ac_matches_count_as_exact_and_not_unmapped() {
 }
 
 #[test]
-fn automatic_ac_skips_oversized_automata_and_keeps_alignments() {
+fn mem_defaults_to_indexed_seeding_on_an_ac_eligible_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let (sam, log) = run_with_auto_ac(dir.path(), 7000, false);
-    check_sam(&sam, 7000, false);
+    let (sam, log) = run_mem(dir.path(), 128, false, None);
+    let (off_sam, off_log) = run_mem(dir.path(), 128, false, Some("1"));
+    check_sam(&sam, 128, false);
+    assert!(log.contains("[KIRA_AC] disabled by default"), "{log}");
+    for log in [log, off_log] {
+        assert!(log.contains("eligible=0 resolved=0"), "{log}");
+        assert!(algo_summary(&log).contains("unmapped=0 "));
+    }
     assert!(
-        log.contains("auto: DISABLED (eligible pattern bases exceed"),
-        "{log}"
+        sam.lines()
+            .filter(|line| !line.starts_with('@'))
+            .eq(off_sam.lines().filter(|line| !line.starts_with('@')))
     );
-    assert!(log.contains("eligible=0 resolved=0"), "{log}");
-    assert!(algo_summary(&log).contains("unmapped=0 "));
 }

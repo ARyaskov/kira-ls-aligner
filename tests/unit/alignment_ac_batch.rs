@@ -1,3 +1,4 @@
+use super::run_enabled as run;
 use super::*;
 use crate::types::{PairRole, RefBases, RefSeq, Reference};
 
