@@ -309,7 +309,10 @@ impl Pipeline {
                 )
             }
         });
-        merge_ac_alignments(&mut align.alignments, ac);
+        if ac_stats.reads_resolved > 0 {
+            align.stats.unmapped = merge_ac_alignments(&mut align.alignments, ac);
+            align.stats.exact_matches += ac_stats.reads_resolved;
+        }
         let t_stage4 = ts4.elapsed();
 
         if std::env::var_os("KIRA_STATS").is_some() {
@@ -741,13 +744,16 @@ fn apply_alt_primary_policy(
 /// Move AC-stage alignments into the cascade output. Reads resolved by AC had
 /// their minimizers suppressed in stage 1, so their cascade slot is empty —
 /// we overwrite it with the perfect-match alignment(s) produced by AC.
-fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], mut ac: AcBatchOutput) {
+fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], ac: AcBatchOutput) -> usize {
     debug_assert_eq!(cascade.len(), ac.alignments.len());
-    for (dst, src) in cascade.iter_mut().zip(ac.alignments.iter_mut()) {
+    let mut unmapped = 0;
+    for (dst, src) in cascade.iter_mut().zip(ac.alignments) {
         if !src.is_empty() {
-            *dst = std::mem::take(src);
+            *dst = src;
         }
+        unmapped += usize::from(dst.is_empty());
     }
+    unmapped
 }
 
 #[cfg(test)]

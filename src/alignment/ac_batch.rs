@@ -88,6 +88,26 @@ const AC_MAX_REF_BP_DEFAULT: u64 = 50_000_000;
 /// reads placed.
 const AC_MAX_SCAN_TO_BATCH_RATIO: f64 = 0.5;
 
+/// Cap automatic automaton construction at one million eligible bases in
+/// each orientation. Build work follows the pattern bytes even when scanning
+/// the reference is cheap. Explicit force-on can exceed the automatic budget.
+const AC_AUTO_PATTERN_BASES: usize = 1_000_000;
+
+fn eligible_pattern(read: &ReadRecord) -> bool {
+    (MIN_PATTERN_LEN..=MAX_PATTERN_LEN).contains(&read.seq.len()) && !read.seq.contains(&b'N')
+}
+
+fn exceeds_auto_pattern_budget(reads: &[ReadRecord]) -> bool {
+    let mut bases = 0;
+    for read in reads.iter().filter(|read| eligible_pattern(read)) {
+        bases += read.seq.len();
+        if bases > AC_AUTO_PATTERN_BASES {
+            return true;
+        }
+    }
+    false
+}
+
 /// AC policy from `KIRA_AC_DISABLE`: unset = Auto, `0` = ForceOn, else ForceOff.
 #[derive(Clone, Copy, PartialEq)]
 enum AcMode {
@@ -121,16 +141,20 @@ fn ac_max_ref_bp() -> u64 {
     })
 }
 
-fn ac_should_run(total_ref_bp: u64, batch_bases: u64) -> bool {
+fn ac_should_run(total_ref_bp: u64, batch_bases: u64, reads: &[ReadRecord]) -> bool {
     let mode = ac_mode();
     // Scan work per batch: both automata traverse the full reference.
     let scan_bp = total_ref_bp.saturating_mul(2);
     let amortises =
         batch_bases > 0 && (scan_bp as f64) <= (batch_bases as f64) * AC_MAX_SCAN_TO_BATCH_RATIO;
+    let over_budget = mode == AcMode::Auto
+        && total_ref_bp <= ac_max_ref_bp()
+        && amortises
+        && exceeds_auto_pattern_budget(reads);
     let run = match mode {
         AcMode::ForceOff => false,
         AcMode::ForceOn => true,
-        AcMode::Auto => total_ref_bp <= ac_max_ref_bp() && amortises,
+        AcMode::Auto => total_ref_bp <= ac_max_ref_bp() && amortises && !over_budget,
     };
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
@@ -146,6 +170,9 @@ fn ac_should_run(total_ref_bp: u64, batch_bases: u64) -> bool {
             AcMode::Auto if total_ref_bp > ac_max_ref_bp() => crate::kira_info!(
                 "[KIRA_AC] auto: DISABLED (reference {mb:.1} Mbp > {thr} Mbp) — using indexed \
                  path. Force on: KIRA_AC_DISABLE=0; raise gate: KIRA_AC_MAX_REF_MB."
+            ),
+            AcMode::Auto if over_budget => crate::kira_info!(
+                "[KIRA_AC] auto: DISABLED (eligible pattern bases exceed {AC_AUTO_PATTERN_BASES}) — using indexed path"
             ),
             AcMode::Auto => crate::kira_info!(
                 "[KIRA_AC] auto: DISABLED (per-batch scan {:.1} Mbp exceeds \
@@ -184,7 +211,7 @@ pub fn run(
         .map(|r| index.ref_bases(r).len() as u64)
         .sum();
     let batch_bases: u64 = reads.iter().map(|r| r.seq.len() as u64).sum();
-    if !ac_should_run(total_ref_bp, batch_bases) {
+    if !ac_should_run(total_ref_bp, batch_bases, reads) {
         return out;
     }
 
@@ -197,11 +224,7 @@ pub fn run(
 
     for (idx, read) in reads.iter().enumerate() {
         let len = read.seq.len();
-        if !(MIN_PATTERN_LEN..=MAX_PATTERN_LEN).contains(&len) {
-            continue;
-        }
-        // Reads with N cannot match the reference byte-exactly.
-        if read.seq.contains(&b'N') {
+        if !eligible_pattern(read) {
             continue;
         }
         fwd_patterns.push(read.seq.as_slice());
