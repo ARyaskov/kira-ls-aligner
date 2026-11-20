@@ -115,11 +115,66 @@ pub fn run(
     run_enabled(reads, index, cfg, max_alignments)
 }
 
+/// Search only reads that have no indexed placement. An explicit AC rescue
+/// request still applies to a single eligible read left after indexed alignment.
+pub(crate) fn rescue_missing(
+    reads: &[ReadRecord],
+    alignments: &mut [Vec<Alignment>],
+    index: &Index,
+    cfg: AlignmentConfig,
+    max_alignments: usize,
+) -> AcBatchStats {
+    debug_assert_eq!(reads.len(), alignments.len());
+    let empty_stats = AcBatchStats {
+        n_reads: reads.len(),
+        ..AcBatchStats::default()
+    };
+    if reads.is_empty() || !ac_enabled() {
+        return empty_stats;
+    }
+    let missing: Vec<_> = alignments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, placements)| placements.is_empty().then_some(i))
+        .collect();
+    if missing.is_empty() {
+        return empty_stats;
+    }
+
+    let out = scan(
+        missing.iter().map(|&i| &reads[i]),
+        index,
+        cfg,
+        max_alignments,
+        1,
+    );
+    for (read_idx, mut hits) in missing.into_iter().zip(out.alignments) {
+        for hit in &mut hits {
+            hit.kind = AlignmentKind::Rescued;
+        }
+        alignments[read_idx] = hits;
+    }
+    AcBatchStats {
+        n_reads: reads.len(),
+        ..out.stats
+    }
+}
+
 fn run_enabled(
     reads: &[ReadRecord],
     index: &Index,
     cfg: AlignmentConfig,
     max_alignments: usize,
+) -> AcBatchOutput {
+    scan(reads.iter(), index, cfg, max_alignments, MIN_ELIGIBLE_READS)
+}
+
+fn scan<'a>(
+    reads: impl ExactSizeIterator<Item = &'a ReadRecord>,
+    index: &Index,
+    cfg: AlignmentConfig,
+    max_alignments: usize,
+    min_patterns: usize,
 ) -> AcBatchOutput {
     let mut out = AcBatchOutput::empty(reads.len());
     let t_build = std::time::Instant::now();
@@ -129,7 +184,7 @@ fn run_enabled(
     let mut rc_buffers: Vec<Vec<u8>> = Vec::with_capacity(reads.len());
     let mut rc_to_read: Vec<usize> = Vec::with_capacity(reads.len());
 
-    for (idx, read) in reads.iter().enumerate() {
+    for (idx, read) in reads.enumerate() {
         let len = read.seq.len();
         if !eligible_pattern(read) {
             continue;
@@ -143,7 +198,7 @@ fn run_enabled(
     }
     out.stats.reads_eligible = fwd_patterns.len();
 
-    if fwd_patterns.len() < MIN_ELIGIBLE_READS {
+    if fwd_patterns.len() < min_patterns {
         return out;
     }
 

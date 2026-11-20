@@ -89,11 +89,12 @@ fn algo_summary(log: &str) -> &str {
 }
 
 #[test]
-fn ac_matches_count_as_exact_and_not_unmapped() {
+fn ac_skips_build_when_unplaced_reads_are_ineligible() {
     let dir = tempfile::tempdir().unwrap();
     let (sam, log) = run_mem(dir.path(), 128, true, Some("0"), false);
     check_sam(&sam, 128, true);
-    assert!(log.contains("eligible=128 resolved=128"), "{log}");
+    assert!(log.contains("eligible=0 resolved=0"), "{log}");
+    assert!(log.contains("build=0.00ms scan=0.00ms rescued=0"), "{log}");
     let summary = algo_summary(&log);
     assert!(summary.contains("exact=128 "), "{summary}");
     assert!(summary.contains("unmapped=1 "), "{summary}");
@@ -122,7 +123,7 @@ fn ac_keeps_indexed_competitor_evidence_for_an_exact_hit() {
     let dir = tempfile::tempdir().unwrap();
     let (indexed, _) = run_mem(dir.path(), 128, false, Some("1"), true);
     let (ac, log) = run_mem(dir.path(), 128, false, Some("0"), true);
-    assert!(log.contains("eligible=128 resolved=128"), "{log}");
+    assert!(log.contains("eligible=0 resolved=0"), "{log}");
     fn first_record(sam: &str) -> Vec<&str> {
         sam.lines()
             .find(|line| line.starts_with("r0\t"))
@@ -186,4 +187,74 @@ fn ac_only_placements_use_the_rescue_mapq_cap() {
     }
     assert_eq!(n, 64);
     assert!(log.contains("rescued=64"), "{log}");
+}
+
+#[test]
+fn ac_builds_patterns_for_unplaced_reads_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("ref.fa");
+    let reads = dir.path().join("reads.fq");
+
+    let short_read = "AGAGTACAACGATCGTGACATGTCCGATTA";
+    let mut state = 23u64;
+    let full_reference: String = (0..400)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            char::from(b"ACGT"[(state >> 62) as usize])
+        })
+        .collect();
+    let indexed = &full_reference[150..300];
+    std::fs::write(
+        &reference,
+        format!(">ref\n{full_reference}\n>short\n{short_read}\n"),
+    )
+    .unwrap();
+
+    let mut input = String::new();
+    use std::fmt::Write as _;
+    for i in 0..65 {
+        let seq = if i == 11 { short_read } else { indexed };
+        writeln!(input, "@r{i}\n{seq}\n+\n{}", "I".repeat(seq.len())).unwrap();
+    }
+    std::fs::write(&reads, input).unwrap();
+
+    let run = |disable| {
+        let output = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+            .args(["mem", "-x", "short", "-k", "31", "-T", "0", "-t", "1"])
+            .args([&reference, &reads])
+            .env("KIRA_AC_DISABLE", disable)
+            .env("KIRA_RESCUE_MAPQ_CAP", "17")
+            .env("KIRA_STATS", "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{log}");
+        let sam = String::from_utf8(output.stdout).unwrap();
+        let rows: Vec<_> = sam
+            .lines()
+            .filter(|line| !line.starts_with('@'))
+            .map(str::to_owned)
+            .collect();
+        (rows, log)
+    };
+
+    let (without_ac, _) = run("1");
+    let (with_ac, log) = run("0");
+    assert_eq!(with_ac.len(), 65);
+    assert_eq!(without_ac.len(), 65);
+    assert!(log.contains("reads=65 eligible=1 resolved=1"), "{log}");
+    assert!(log.contains("rescued=1"), "{log}");
+    for (i, (before, after)) in without_ac.iter().zip(&with_ac).enumerate() {
+        if i == 11 {
+            let old: Vec<_> = before.split('\t').collect();
+            assert_ne!(old[1].parse::<u16>().unwrap() & 4, 0);
+            let fields: Vec<_> = after.split('\t').collect();
+            assert_eq!(fields[0], "r11");
+            assert_eq!(&fields[2..6], &["short", "1", "17", "30M"]);
+        } else {
+            assert_eq!(before, after);
+            let fields: Vec<_> = after.split('\t').collect();
+            assert_eq!(&fields[2..4], &["ref", "151"]);
+        }
+    }
 }

@@ -19,7 +19,7 @@ use anyhow::Result;
 use std::sync::{Arc, RwLock};
 
 use crate::alignment::AlignmentConfig;
-use crate::alignment::ac_batch::{self, AcBatchOutput};
+use crate::alignment::ac_batch;
 use crate::alignment::junc_bed::JunctionIndex;
 use crate::alignment::splice::SpliceConfig;
 use crate::chaining::ChainingConfig;
@@ -223,21 +223,6 @@ impl Pipeline {
     ) {
         let mut stages = [Duration::ZERO; 6];
 
-        let t0 = Instant::now();
-        // Stage 1 now measures AC only. Sketching is fused into stage 2 so
-        // minimizer buffers stay on the worker and never become a batch-sized
-        // intermediate. Compare the sum of stages 1+2 with older profiles.
-        let ac = self.pool.install_compute(|| {
-            ac_batch::run(
-                &input.reads,
-                index,
-                self.config.alignment,
-                self.config.max_alignments,
-            )
-        });
-        let ac_stats = ac.stats;
-        stages[0] = t0.elapsed();
-
         // Stage 2 combines sketching with memory-bound seed lookups.
         let t1 = Instant::now();
         let ((seeds, sketch_stats), repeat_counts) = self.pool.install_compute(|| {
@@ -308,15 +293,30 @@ impl Pipeline {
                 )
             }
         });
-        let ac_rescued = if ac_stats.reads_resolved > 0 {
-            let (rescued, unmapped) = rescue_from_ac(&mut align.alignments, ac);
-            align.stats.unmapped = unmapped;
-            align.stats.exact_matches += rescued;
-            rescued
-        } else {
-            0
-        };
-        let t_stage4 = ts4.elapsed();
+        stages[3] = ts4.elapsed();
+
+        // AC has a separate timing slot. Its exact-match rescue only runs
+        // after indexed alignment, with the unresolved reads as patterns.
+        let t_ac = Instant::now();
+        let ac_stats = self.pool.install_compute(|| {
+            ac_batch::rescue_missing(
+                &align.reads,
+                &mut align.alignments,
+                index,
+                self.config.alignment,
+                self.config.max_alignments,
+            )
+        });
+        stages[0] = t_ac.elapsed();
+        let ac_rescued = ac_stats.reads_resolved;
+        if ac_rescued > 0 {
+            align.stats.unmapped = align
+                .alignments
+                .iter()
+                .filter(|hits| hits.is_empty())
+                .count();
+            align.stats.exact_matches += ac_rescued;
+        }
 
         if std::env::var_os("KIRA_STATS").is_some() {
             crate::kira_info!(
@@ -333,7 +333,6 @@ impl Pipeline {
             );
         }
 
-        stages[3] = t_stage4;
         (
             align,
             stages,
@@ -743,25 +742,6 @@ fn apply_alt_primary_policy(
             alns[0].is_supplementary = false;
         }
     }
-}
-
-/// Use an exact AC hit when indexed alignment found no placement. An exact
-/// hit establishes neither the score nor the absence of near-exact competitors.
-fn rescue_from_ac(cascade: &mut [Vec<Alignment>], ac: AcBatchOutput) -> (usize, usize) {
-    debug_assert_eq!(cascade.len(), ac.alignments.len());
-    let mut rescued = 0;
-    let mut unmapped = 0;
-    for (dst, mut src) in cascade.iter_mut().zip(ac.alignments) {
-        if dst.is_empty() && !src.is_empty() {
-            for hit in &mut src {
-                hit.kind = crate::types::AlignmentKind::Rescued;
-            }
-            *dst = src;
-            rescued += 1;
-        }
-        unmapped += usize::from(dst.is_empty());
-    }
-    (rescued, unmapped)
 }
 
 #[cfg(test)]

@@ -272,11 +272,12 @@ reads, which is exactly the off-diagonal case it exists for. The wide search
 still runs when the packed scan cannot (ambiguous bases in the window), since
 there is then no best diagonal to band around.
 
-Aho-Corasick is opt-in. The two automata are rebuilt for each batch. A
-short-read comparison across references from 250 bp to 1 Mbp and batches of
+Aho-Corasick is opt-in. A short-read comparison across references from 250 bp to 1 Mbp and batches of
 64 to 5,000 reads found no reproducible throughput advantage and identical
-placement accuracy. Set `KIRA_AC_DISABLE=0` to enable exact-match rescue for
-reads without an indexed placement. Those alignments use the rescue MAPQ cap.
+placement accuracy. Set `KIRA_AC_DISABLE=0` to enable exact-match rescue.
+After indexed alignment, AC builds its automata from eligible reads without a
+placement, including batches with a single eligible rescue candidate. Those
+alignments use the rescue MAPQ cap.
 The former automatic reference-size setting `KIRA_AC_MAX_REF_MB` has been removed.
 
 ## Presets
