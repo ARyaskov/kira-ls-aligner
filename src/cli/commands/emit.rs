@@ -31,6 +31,8 @@ use crate::index::Index;
 use crate::io::{ContigCatalog, OutputConfig, SamFormatter, binary::estimated_record_bytes};
 use crate::pipeline::{stage5_scoring::ScoredBatch, stage6_output};
 
+mod publication;
+
 /// Which fused output was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmitKind {
@@ -93,6 +95,7 @@ pub fn run_fused(
     mut opts: EmitOptions,
 ) -> Result<()> {
     let destination = opts.output.clone();
+    let is_bam = !opts.kind.is_cram();
     let directory = destination
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -196,13 +199,12 @@ pub fn run_fused(
     } else {
         None
     };
-    output
-        .persist(&destination)
-        .context("publish alignment output")?;
-    if let Some(index) = index_output {
-        index
-            .persist(kira_bam::io::default_index_path(&destination, false))
-            .context("publish BAI")?;
+    if is_bam {
+        publication::publish_bam(output, index_output, &destination)?;
+    } else {
+        output
+            .persist(&destination)
+            .context("publish CRAM output")?;
     }
     crate::kira_info!(
         "[KIRA] {} pipeline complete → {}",

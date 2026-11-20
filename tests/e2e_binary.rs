@@ -670,5 +670,21 @@ fn sorted_bam_markdup_keeps_pair_with_best_combined_quality() -> anyhow::Result<
         n += 1;
     }
     assert_eq!(n, 4);
+    // A replacement without --bai must retire the standard index, whose
+    // offsets point into the preceding BAM.
+    drop(reader);
+    let replacement = ds.dir.join("replacement.fa");
+    std::fs::write(&replacement, b">replacement\nNNNNNNNNNN\n")?;
+    run_bin(&mem_args(
+        &ds.reference,
+        &[&replacement],
+        &output,
+        &["-x", "short", "-t", "1", "--emit", "sorted-bam"],
+    ));
+    assert!(!kira_bam::io::default_index_path(&output, false).exists());
+    let mut reader = BamReader::open_with_reference(&output, Some(&ds.reference))?;
+    assert!(reader.read_record_buf(&mut record)?);
+    assert_eq!(record.name().unwrap().as_ref() as &[u8], b"replacement");
+    assert!(!reader.read_record_buf(&mut record)?);
     Ok(())
 }
