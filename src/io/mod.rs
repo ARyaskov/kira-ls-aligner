@@ -1242,13 +1242,9 @@ impl SamFormatter {
         buf.push(b'\t');
         push_u32(buf, aln.mapq as u32);
 
-        let tp_char = if aln.is_supplementary {
-            b'I'
-        } else if aln.is_secondary {
-            b'S'
-        } else {
-            b'P'
-        };
+        // A split segment can be primary in PAF. Minimap2 reserves I/i for
+        // explicitly detected inversions, which Alignment does not classify.
+        let tp_char = if aln.is_secondary { b'S' } else { b'P' };
         buf.extend_from_slice(b"\ttp:A:");
         buf.push(tp_char);
 

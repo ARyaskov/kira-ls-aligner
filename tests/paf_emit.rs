@@ -163,16 +163,28 @@ fn secondary_alignment_tags_tp_a_s() {
 }
 
 #[test]
-fn supplementary_alignment_tags_tp_a_i() {
-    let fmt = SamFormatter::new(Arc::new(make_reference()));
+fn same_strand_split_across_contigs_has_two_primary_paf_segments() {
+    let mut reference = make_reference();
+    reference.sequences.push(RefSeq {
+        name: "chr2".into(),
+        bases: RefBases::Owned(vec![b'A'; 2000]),
+    });
+    let fmt = SamFormatter::new(Arc::new(reference));
     let read = mk_read("r1", 1500);
-    let mut aln = mk_aln(1000, 2500, 0, 1500, false, 0);
-    aln.is_supplementary = true;
-    let mut buf = Vec::new();
-    fmt.append_paf(&mut buf, &read, &aln, OutputConfig::paf());
-    let cols = parse_paf(&buf);
-    let tags: Vec<&String> = cols.iter().skip(12).collect();
-    assert!(tags.iter().any(|t| t.as_str() == "tp:A:I"));
+    let primary = mk_aln(1000, 1750, 0, 750, false, 0);
+    let mut split = mk_aln(250, 1000, 750, 1500, false, 0);
+    split.ref_id = 1;
+    split.is_supplementary = true;
+    for (aln, target) in [(&primary, "chr1"), (&split, "chr2")] {
+        let mut buf = Vec::new();
+        fmt.append_paf(&mut buf, &read, aln, OutputConfig::paf());
+        let cols = parse_paf(&buf);
+        assert_eq!(cols[5], target);
+        assert_eq!(
+            cols.iter().find(|c| c.starts_with("tp:A:")).unwrap(),
+            "tp:A:P"
+        );
+    }
 }
 
 #[test]
