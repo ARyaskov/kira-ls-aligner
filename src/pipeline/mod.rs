@@ -240,14 +240,13 @@ impl Pipeline {
 
         // Stage 2 combines sketching with memory-bound seed lookups.
         let t1 = Instant::now();
-        let skip_mask = ac.resolved_mask();
         let ((seeds, sketch_stats), repeat_counts) = self.pool.install_compute(|| {
             run_fused_with_counts(
                 input,
                 index,
                 self.config.sketch,
                 self.config.seeding,
-                &skip_mask,
+                &[],
                 repeat_cfg,
             )
         });
@@ -309,15 +308,19 @@ impl Pipeline {
                 )
             }
         });
-        if ac_stats.reads_resolved > 0 {
-            align.stats.unmapped = merge_ac_alignments(&mut align.alignments, ac);
-            align.stats.exact_matches += ac_stats.reads_resolved;
-        }
+        let ac_rescued = if ac_stats.reads_resolved > 0 {
+            let (rescued, unmapped) = rescue_from_ac(&mut align.alignments, ac);
+            align.stats.unmapped = unmapped;
+            align.stats.exact_matches += rescued;
+            rescued
+        } else {
+            0
+        };
         let t_stage4 = ts4.elapsed();
 
         if std::env::var_os("KIRA_STATS").is_some() {
             crate::kira_info!(
-                "[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms",
+                "[KIRA_AC] reads={} eligible={} resolved={} ambiguous={} fwd_hits={} rev_hits={} build={:.2}ms scan={:.2}ms rescued={}",
                 ac_stats.n_reads,
                 ac_stats.reads_eligible,
                 ac_stats.reads_resolved,
@@ -326,6 +329,7 @@ impl Pipeline {
                 ac_stats.rev_hits,
                 ac_stats.build_ms,
                 ac_stats.scan_ms,
+                ac_rescued,
             );
         }
 
@@ -741,19 +745,23 @@ fn apply_alt_primary_policy(
     }
 }
 
-/// Move AC-stage alignments into the cascade output. Reads resolved by AC had
-/// their minimizers suppressed in stage 1, so their cascade slot is empty —
-/// we overwrite it with the perfect-match alignment(s) produced by AC.
-fn merge_ac_alignments(cascade: &mut [Vec<crate::types::Alignment>], ac: AcBatchOutput) -> usize {
+/// Use an exact AC hit when indexed alignment found no placement. An exact
+/// hit establishes neither the score nor the absence of near-exact competitors.
+fn rescue_from_ac(cascade: &mut [Vec<Alignment>], ac: AcBatchOutput) -> (usize, usize) {
     debug_assert_eq!(cascade.len(), ac.alignments.len());
+    let mut rescued = 0;
     let mut unmapped = 0;
-    for (dst, src) in cascade.iter_mut().zip(ac.alignments) {
-        if !src.is_empty() {
+    for (dst, mut src) in cascade.iter_mut().zip(ac.alignments) {
+        if dst.is_empty() && !src.is_empty() {
+            for hit in &mut src {
+                hit.kind = crate::types::AlignmentKind::Rescued;
+            }
             *dst = src;
+            rescued += 1;
         }
         unmapped += usize::from(dst.is_empty());
     }
-    unmapped
+    (rescued, unmapped)
 }
 
 #[cfg(test)]

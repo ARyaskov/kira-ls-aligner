@@ -175,9 +175,8 @@ impl fmt::Display for CigarOp {
 pub enum AlignmentKind {
     AcceptedUngapped,
     DpAligned,
-    /// Placed by mate rescue: a single forced windowed DP with no genome-wide
-    /// seeding/chaining or competitor search. Inherently lower confidence than a
-    /// `DpAligned` hit, so MAPQ is ceiling-capped (see `mapq::rescue_mapq_cap`).
+    /// Placed by mate rescue or an AC exact hit without an indexed placement.
+    /// Incomplete competitor evidence limits MAPQ (see `mapq::rescue_mapq_cap`).
     Rescued,
 }
 /// Alignment result for a single read against one reference region.

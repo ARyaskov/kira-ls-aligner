@@ -8,6 +8,7 @@ fn run_mem(
     exact_reads: usize,
     add_unmappable: bool,
     ac_override: Option<&str>,
+    near_paralog: bool,
 ) -> (String, String) {
     let fasta = dir.join("ref.fa");
     let fastq = dir.join("reads.fq");
@@ -19,7 +20,20 @@ fn run_mem(
         })
         .collect();
     let reference = String::from_utf8(reference).unwrap();
-    std::fs::write(&fasta, format!(">ref\n{reference}\n")).unwrap();
+    let mut fasta_text = format!(">ref\n{reference}\n");
+    if near_paralog {
+        let mut paralog = reference.as_bytes()[..READ_LEN].to_vec();
+        for pos in [56, 91] {
+            paralog[pos] = if paralog[pos] == b'A' { b'C' } else { b'A' };
+        }
+        fasta_text.push_str(&format!(
+            ">paralog\n{}{}{}\n",
+            &reference[2700..2800],
+            String::from_utf8(paralog).unwrap(),
+            &reference[3100..3200]
+        ));
+    }
+    std::fs::write(&fasta, fasta_text).unwrap();
 
     let quality = "I".repeat(READ_LEN);
     let mut reads = String::new();
@@ -77,7 +91,7 @@ fn algo_summary(log: &str) -> &str {
 #[test]
 fn ac_matches_count_as_exact_and_not_unmapped() {
     let dir = tempfile::tempdir().unwrap();
-    let (sam, log) = run_mem(dir.path(), 128, true, Some("0"));
+    let (sam, log) = run_mem(dir.path(), 128, true, Some("0"), false);
     check_sam(&sam, 128, true);
     assert!(log.contains("eligible=128 resolved=128"), "{log}");
     let summary = algo_summary(&log);
@@ -88,8 +102,8 @@ fn ac_matches_count_as_exact_and_not_unmapped() {
 #[test]
 fn mem_defaults_to_indexed_seeding_on_an_ac_eligible_batch() {
     let dir = tempfile::tempdir().unwrap();
-    let (sam, log) = run_mem(dir.path(), 128, false, None);
-    let (off_sam, off_log) = run_mem(dir.path(), 128, false, Some("1"));
+    let (sam, log) = run_mem(dir.path(), 128, false, None, false);
+    let (off_sam, off_log) = run_mem(dir.path(), 128, false, Some("1"), false);
     check_sam(&sam, 128, false);
     assert!(log.contains("[KIRA_AC] disabled by default"), "{log}");
     for log in [log, off_log] {
@@ -101,4 +115,75 @@ fn mem_defaults_to_indexed_seeding_on_an_ac_eligible_batch() {
             .filter(|line| !line.starts_with('@'))
             .eq(off_sam.lines().filter(|line| !line.starts_with('@')))
     );
+}
+
+#[test]
+fn ac_keeps_indexed_competitor_evidence_for_an_exact_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (indexed, _) = run_mem(dir.path(), 128, false, Some("1"), true);
+    let (ac, log) = run_mem(dir.path(), 128, false, Some("0"), true);
+    assert!(log.contains("eligible=128 resolved=128"), "{log}");
+    fn first_record(sam: &str) -> Vec<&str> {
+        sam.lines()
+            .find(|line| line.starts_with("r0\t"))
+            .unwrap()
+            .split('\t')
+            .collect()
+    }
+    let baseline = first_record(&indexed);
+    assert_eq!(&baseline[2..4], &["ref", "1"]);
+    assert!(baseline[4].parse::<u8>().unwrap() < 60, "{baseline:?}");
+    assert!(
+        baseline.iter().any(|tag| tag.starts_with("XS:i:")),
+        "{baseline:?}"
+    );
+    assert_eq!(first_record(&ac), baseline);
+}
+
+#[test]
+fn ac_only_placements_use_the_rescue_mapq_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("ref.fa");
+    let reads = dir.path().join("reads.fq");
+    let sequence = "AGAGTACAACGATCGTGACATGTCCGATTA";
+    std::fs::write(&reference, format!(">ref\n{sequence}\n")).unwrap();
+    let mut input = String::new();
+    use std::fmt::Write as _;
+    for i in 0..64 {
+        writeln!(
+            input,
+            "@r{i}\n{sequence}\n+\n{}",
+            "I".repeat(sequence.len())
+        )
+        .unwrap();
+    }
+    std::fs::write(&reads, input).unwrap();
+    let run = |disable| {
+        let output = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+            .args(["mem", "-x", "short", "-k", "31", "-T", "0", "-t", "1"])
+            .args([&reference, &reads])
+            .env("KIRA_AC_DISABLE", disable)
+            .env("KIRA_RESCUE_MAPQ_CAP", "17")
+            .env("KIRA_STATS", "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{log}");
+        (String::from_utf8(output.stdout).unwrap(), log)
+    };
+    let (indexed, _) = run("1");
+    for line in indexed.lines().filter(|line| !line.starts_with('@')) {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_ne!(fields[1].parse::<u16>().unwrap() & 4, 0);
+    }
+    let (ac, log) = run("0");
+    let mut n = 0;
+    for line in ac.lines().filter(|line| !line.starts_with('@')) {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields[1].parse::<u16>().unwrap() & 4, 0);
+        assert_eq!(&fields[2..6], &["ref", "1", "17", "30M"]);
+        n += 1;
+    }
+    assert_eq!(n, 64);
+    assert!(log.contains("rescued=64"), "{log}");
 }

@@ -149,9 +149,8 @@ pub(crate) fn assign_mapq_impl(
     let occ_cap = repeat_occ_cap(repeat_min_occ) as i32;
     let id_cap = identity_mapq_cap(&alignments[0], read_len) as i32;
     let qual_cap = quality_mapq_cap(qual) as i32;
-    // Mate-rescue placements (single forced window, no genome-wide competitor
-    // search) must not claim full confidence. The score model would emit `cap`
-    // here (sub=0 for the sole window hit), so apply the rescue ceiling.
+    // Mate-rescue and AC-only placements have incomplete competitor evidence.
+    // Apply the rescue ceiling even when the score-gap model sees no competitor.
     let rescue_cap = if alignments[0].kind == AlignmentKind::Rescued {
         rescue_mapq_cap() as i32
     } else {
@@ -335,7 +334,7 @@ fn identity_mapq_cap(aln: &Alignment, _read_len: usize) -> u8 {
     }
 }
 
-/// MAPQ ceiling for mate-rescue placements (`AlignmentKind::Rescued`). Default 30 —
+/// MAPQ ceiling for rescued placements (`AlignmentKind::Rescued`). Default 30 —
 /// the historical intent of the dead `aln.mapq = 30` store in pairing.rs. Tunable via
 /// `KIRA_RESCUE_MAPQ_CAP`; set to 60 to effectively disable the cap.
 fn rescue_mapq_cap() -> u8 {
