@@ -98,6 +98,8 @@ pub struct EvalCounts {
     pub correct: u64,
     /// Primary placement discordant with the truth locus.
     pub wrong_locus: u64,
+    /// Mapped primary records with truth and unavailable mapping quality.
+    pub unknown_mapq: u64,
     /// Correct placements whose CIGAR carries an insertion or deletion.
     pub indel_correct: u64,
     /// Wrong-locus placements whose CIGAR carries an insertion or deletion.
@@ -170,31 +172,35 @@ pub fn evaluate<W: Write + ?Sized>(
     }
 
     let mut line = String::new();
+    let mut line_number = 0;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
         }
-        let text = line.trim_end();
+        line_number += 1;
+        let text = line.trim_end_matches(['\r', '\n']);
         if text.is_empty() || text.starts_with('@') {
             continue;
         }
         counts.total += 1;
 
         let mut fields = text.split('\t');
-        let qname = fields.next().unwrap_or("*");
-        let flag: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0x4);
+        let qname = sam_field(&mut fields, line_number, "QNAME")?;
+        let flag: u16 = sam_number(&mut fields, line_number, "FLAG")?;
+        let rname = sam_field(&mut fields, line_number, "RNAME")?;
+        let pos: u32 = sam_number(&mut fields, line_number, "POS")?;
+        let mapq: u8 = sam_number(&mut fields, line_number, "MAPQ")?;
+        let cigar = sam_field(&mut fields, line_number, "CIGAR")?;
+        let mapped = flag & 0x4 == 0;
+        if pos > i32::MAX as u32 || mapped && (pos == 0 || rname == "*") {
+            return Err(invalid_sam_field(line_number, "POS/RNAME"));
+        }
         if flag & 0x900 != 0 {
             continue;
         }
         counts.primary += 1;
-        let rname = fields.next().unwrap_or("*");
-        let pos: i64 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
-        let mapq: u8 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
-        let cigar = fields.next().unwrap_or("*");
-
         let truth = parse_truth(qname);
-        let mapped = flag & 0x4 == 0;
         let has_indel = cigar.bytes().any(|b| b == b'I' || b == b'D');
 
         let (category, truth_ref) = match &truth {
@@ -205,17 +211,20 @@ pub fn evaluate<W: Write + ?Sized>(
                     counts.unmapped += 1;
                     (Category::Unmapped, Some(t))
                 } else {
-                    let pos0 = pos - 1;
+                    if mapq == 255 {
+                        counts.unknown_mapq += 1;
+                    }
+                    let pos0 = i64::from(pos) - 1;
                     let concordant = contig_eq(rname, &t.contig)
-                        && pos0 >= t.start - cfg.tolerance
-                        && pos0 <= t.end + cfg.tolerance;
+                        && pos0 >= t.start.saturating_sub(cfg.tolerance)
+                        && pos0 <= t.end.saturating_add(cfg.tolerance);
                     if concordant {
                         counts.correct += 1;
                         if has_indel {
                             counts.indel_correct += 1;
                         }
                         for (t_thresh, c) in counts.thresholds.iter_mut() {
-                            if mapq >= *t_thresh {
+                            if mapq != 255 && mapq >= *t_thresh {
                                 c.correct_ge += 1;
                             }
                         }
@@ -226,7 +235,7 @@ pub fn evaluate<W: Write + ?Sized>(
                             counts.indel_wrong += 1;
                         }
                         for (t_thresh, c) in counts.thresholds.iter_mut() {
-                            if mapq >= *t_thresh {
+                            if mapq != 255 && mapq >= *t_thresh {
                                 c.wrong_ge += 1;
                             }
                         }
@@ -259,6 +268,34 @@ pub fn evaluate<W: Write + ?Sized>(
     Ok(counts)
 }
 
+fn invalid_sam_field(line: usize, name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("SAM line {line}: invalid or missing {name}"),
+    )
+}
+
+fn sam_field<'a>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    line: usize,
+    name: &str,
+) -> std::io::Result<&'a str> {
+    fields
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_sam_field(line, name))
+}
+
+fn sam_number<'a, T: std::str::FromStr>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    line: usize,
+    name: &str,
+) -> std::io::Result<T> {
+    sam_field(fields, line, name)?
+        .parse()
+        .map_err(|_| invalid_sam_field(line, name))
+}
+
 /// Render the human- and grep-readable summary report.
 pub fn render_report(counts: &EvalCounts) -> String {
     let mut out = String::new();
@@ -281,12 +318,13 @@ pub fn render_report(counts: &EvalCounts) -> String {
         pct(counts.unmapped, counts.truth_parsed)
     ));
     out.push_str(&format!(
-        "[EVAL] mapped={} correct={} ({:.2}%) wrong_locus={} ({:.2}%)\n",
+        "[EVAL] mapped={} correct={} ({:.2}%) wrong_locus={} ({:.2}%) unknown_mapq={}\n",
         mapped,
         counts.correct,
         pct(counts.correct, mapped),
         counts.wrong_locus,
         pct(counts.wrong_locus, mapped),
+        counts.unknown_mapq,
     ));
     out.push_str(&format!(
         "[EVAL] indel_bearing: correct={} wrong_locus={}\n",
