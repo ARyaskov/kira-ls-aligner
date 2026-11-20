@@ -79,6 +79,7 @@ pub struct AlignmentBatchStats {
     pub accept_len_p95: usize,
     pub fallback_len_p50: usize,
     pub fallback_len_p95: usize,
+    percentiles: Option<Box<PercentileCounts>>,
     pub bucket_counts: [usize; 3],
     pub sum_read_len: usize,
     /// Reads resolved by the Bit-Packed Spectral fast path (CPU).
@@ -99,16 +100,6 @@ pub struct AlignmentBatchStats {
 
 impl AlignmentBatchStats {
     pub fn add(&mut self, other: &AlignmentBatchStats) {
-        let old_prefilter = self
-            .prefilter_accept
-            .saturating_add(self.prefilter_reject)
-            .saturating_add(self.prefilter_fallback);
-        let new_prefilter = other
-            .prefilter_accept
-            .saturating_add(other.prefilter_reject)
-            .saturating_add(other.prefilter_fallback);
-        let old_accept = self.prefilter_accept;
-        let old_fallback = self.prefilter_fallback;
         self.reads += other.reads;
         self.chains_total += other.chains_total;
         self.chains_used += other.chains_used;
@@ -141,31 +132,18 @@ impl AlignmentBatchStats {
         self.lsh_rescue_resolved += other.lsh_rescue_resolved;
         self.gpu_spectral_resolved += other.gpu_spectral_resolved;
         self.unmapped += other.unmapped;
-        self.ungapped_score_p95 = self.ungapped_score_p95.max(other.ungapped_score_p95);
-        self.ungapped_span_p95 = self.ungapped_span_p95.max(other.ungapped_span_p95);
-        self.ungapped_mismatches_p95 = self
-            .ungapped_mismatches_p95
-            .max(other.ungapped_mismatches_p95);
-        self.ungapped_identity_p90 = weighted_f32(
-            self.ungapped_identity_p90,
-            old_prefilter,
-            other.ungapped_identity_p90,
-            new_prefilter,
-        );
-        self.accept_len_p50 = weighted_usize(
-            self.accept_len_p50,
-            old_accept,
-            other.accept_len_p50,
-            other.prefilter_accept,
-        );
-        self.accept_len_p95 = self.accept_len_p95.max(other.accept_len_p95);
-        self.fallback_len_p50 = weighted_usize(
-            self.fallback_len_p50,
-            old_fallback,
-            other.fallback_len_p50,
-            other.prefilter_fallback,
-        );
-        self.fallback_len_p95 = self.fallback_len_p95.max(other.fallback_len_p95);
+        if let Some(batch) = &other.percentiles {
+            let all = self.percentiles.get_or_insert_with(Default::default);
+            all.merge(batch);
+            self.ungapped_score_p95 = percentile_count(&all.scores, 95);
+            self.ungapped_span_p95 = percentile_count(&all.spans, 95) as usize;
+            self.ungapped_mismatches_p95 = percentile_count(&all.mismatches, 95) as usize;
+            self.ungapped_identity_p90 = f32::from(percentile_count(&all.identities, 90)) / 100.0;
+            self.accept_len_p50 = percentile_count(&all.accepted, 50) as usize;
+            self.accept_len_p95 = percentile_count(&all.accepted, 95) as usize;
+            self.fallback_len_p50 = percentile_count(&all.fallback, 50) as usize;
+            self.fallback_len_p95 = percentile_count(&all.fallback, 95) as usize;
+        }
     }
 
     pub fn avg_read_len(&self) -> f32 {
@@ -177,20 +155,54 @@ impl AlignmentBatchStats {
     }
 }
 
-fn weighted_usize(a: usize, a_weight: usize, b: usize, b_weight: usize) -> usize {
-    let total = a_weight.saturating_add(b_weight);
-    if total == 0 {
-        return 0;
-    }
-    ((a as u128 * a_weight as u128 + b as u128 * b_weight as u128) / total as u128) as usize
+#[derive(Clone, Debug, Default)]
+struct PercentileCounts {
+    scores: BTreeMap<i32, usize>,
+    spans: BTreeMap<u16, usize>,
+    mismatches: BTreeMap<u16, usize>,
+    identities: BTreeMap<u16, usize>,
+    accepted: BTreeMap<u16, usize>,
+    fallback: BTreeMap<u16, usize>,
 }
 
-fn weighted_f32(a: f32, a_weight: usize, b: f32, b_weight: usize) -> f32 {
-    let total = a_weight.saturating_add(b_weight);
-    if total == 0 {
-        return 0.0;
+impl PercentileCounts {
+    fn merge(&mut self, other: &Self) {
+        merge_counts(&mut self.scores, &other.scores);
+        for (dest, src) in [
+            (&mut self.spans, &other.spans),
+            (&mut self.mismatches, &other.mismatches),
+            (&mut self.identities, &other.identities),
+            (&mut self.accepted, &other.accepted),
+            (&mut self.fallback, &other.fallback),
+        ] {
+            merge_counts(dest, src);
+        }
     }
-    (a * a_weight as f32 + b * b_weight as f32) / total as f32
+}
+
+fn merge_counts<T: Copy + Ord>(dest: &mut BTreeMap<T, usize>, src: &BTreeMap<T, usize>) {
+    for (&value, &count) in src {
+        *dest.entry(value).or_default() += count;
+    }
+}
+
+fn count_sorted<T: Copy + Ord>(values: &[T]) -> BTreeMap<T, usize> {
+    values
+        .chunk_by(|a, b| a == b)
+        .map(|run| (run[0], run.len()))
+        .collect()
+}
+
+fn percentile_count<T: Copy + Default + Ord>(counts: &BTreeMap<T, usize>, pct: usize) -> T {
+    let length: usize = counts.values().sum();
+    let mut rank = length.saturating_sub(1) * pct / 100;
+    for (&value, &count) in counts {
+        if rank < count {
+            return value;
+        }
+        rank -= count;
+    }
+    T::default()
 }
 
 struct SimdJob<'read, 'index> {
@@ -1110,6 +1122,17 @@ pub fn run(input: ChainBatch, index: &Index, cfg: AlignmentStageConfig) -> Align
     stats.fallback_len_p50 = percentile_u16_sorted(&fallback_lens, 50) as usize;
     stats.fallback_len_p95 = percentile_u16_sorted(&fallback_lens, 95) as usize;
 
+    if std::env::var_os("KIRA_STATS").is_some() {
+        stats.percentiles = Some(Box::new(PercentileCounts {
+            scores: count_sorted(&scores),
+            spans: count_sorted(&lens),
+            mismatches: count_sorted(&mism),
+            identities: count_sorted(&ids),
+            accepted: count_sorted(&accept_lens),
+            fallback: count_sorted(&fallback_lens),
+        }));
+    }
+
     stats.dp_reads = dp_used.iter().filter(|v| **v).count();
     if short_read_batch {
         stats.dp_topk = stats.dp_topk.max(2);
@@ -1444,3 +1467,31 @@ mod mate_guide_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/pipeline_adaptive_candidates.rs"]
 mod adaptive_candidate_tests;
+
+#[cfg(test)]
+mod percentile_tests {
+    use super::*;
+
+    #[test]
+    fn summary_percentiles_are_invariant_to_batch_boundaries() {
+        let batch = |short, long| AlignmentBatchStats {
+            percentiles: Some(Box::new(PercentileCounts {
+                scores: BTreeMap::from([(-2, short), (100, long)]),
+                accepted: BTreeMap::from([(100, short), (1000, long)]),
+                fallback: BTreeMap::from([(125, short), (500, long)]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut split = AlignmentBatchStats::default();
+        split.add(&batch(100, 0));
+        split.add(&batch(0, 2));
+        let mut combined = AlignmentBatchStats::default();
+        combined.add(&batch(100, 2));
+        for stats in [split, combined] {
+            assert_eq!(stats.ungapped_score_p95, -2);
+            assert_eq!((stats.accept_len_p50, stats.accept_len_p95), (100, 100));
+            assert_eq!((stats.fallback_len_p50, stats.fallback_len_p95), (125, 125));
+        }
+    }
+}
