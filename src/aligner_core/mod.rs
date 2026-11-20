@@ -239,7 +239,7 @@ impl Aligner {
         R: AsRef<Path>,
     {
         let reference = read_reference(&reference_path).context("load reference")?;
-        let index = Index::build(reference, self.cfg.index);
+        let index = Index::try_build(reference, self.cfg.index)?;
         self.run_with_index(index, reads_paths, output_path)
     }
 
@@ -254,6 +254,15 @@ impl Aligner {
         R: AsRef<Path>,
     {
         let index = Index::load(index_path).context("load index")?;
+        self.run_loaded_index(index, reads_paths, output_path)
+    }
+
+    pub(crate) fn run_loaded_index<R: AsRef<Path>>(
+        &self,
+        index: Index,
+        reads_paths: &[std::path::PathBuf],
+        output_path: Option<R>,
+    ) -> Result<()> {
         let adopted;
         let this = match self.reconcile_sketch(&index)? {
             Some(a) => {
@@ -424,7 +433,7 @@ impl Aligner {
 
         let total_bytes = stream.total_bytes();
         let mut sys = if stats_enabled {
-            Some(System::new())
+            System::new().ok()
         } else {
             None
         };

@@ -86,15 +86,19 @@ fn gpu_results_consistent_with_cpu() {
         let pr = PackedDna::pack(read);
         let pt = PackedDna::pack(text);
         let shifted = pt.pre_shifted_window();
-        let cpu_hit = bitpacked::scan(&pr, &shifted, text.len(), *max_mism);
+        let oracle = bitpacked::scan_best_with_second(&pr, &shifted, text.len());
+        assert_eq!(
+            gpu_res.second_mismatches,
+            oracle.as_ref().and_then(|(_, second)| *second)
+        );
+        let cpu_hit = oracle
+            .map(|(best, _)| best)
+            .filter(|best| best.mismatches <= *max_mism);
 
         match (cpu_hit, gpu_res.shift >= 0) {
             (Some(cpu), true) => {
-                // Both accepted. Mismatches may differ if CPU and GPU pick
-                // different first-acceptable shifts among ties — but both
-                // should report ≤ max_mism, and the *actual* Hamming
-                // distance at the GPU's reported shift must equal what the
-                // GPU reported.
+                assert_eq!(gpu_res.shift as usize, cpu.shift, "case {i}");
+                assert_eq!(gpu_res.mismatches as usize, cpu.mismatches, "case {i}");
                 assert!(
                     gpu_res.mismatches as usize <= *max_mism,
                     "case {i}: GPU mismatches {} > max {}",

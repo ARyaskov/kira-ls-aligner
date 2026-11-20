@@ -58,11 +58,9 @@ pub fn run_fused(
                 for (template_idx, pair) in block.chunks(2).enumerate() {
                     for (mate, read) in pair.iter().enumerate() {
                         let s = &mut sketches[mate];
-                        (s.k, s.w) = if read.seq.len() >= sketch_cfg.long_read_threshold {
-                            (sketch_cfg.long_k, sketch_cfg.long_w)
-                        } else {
-                            (sketch_cfg.short_k, sketch_cfg.short_w)
-                        };
+                        let long = read.seq.len() >= sketch_cfg.long_read_threshold;
+                        let table = index.minimizer_table(long);
+                        (s.k, s.w) = (table.k, table.w);
                         s.minimizers.clear();
                         let idx = block_idx * 128 + template_idx * 2 + mate;
                         if !skip_mask.get(idx).copied().unwrap_or(false) {
@@ -298,6 +296,22 @@ fn seed_adaptive(
     ctx: &mut ThreadCtx,
     hints: Option<&MateHints>,
 ) -> (Vec<Anchor>, usize, u32, bool) {
+    let table = index.minimizer_table(read.seq.len() >= cfg.long_read_threshold);
+    let recomputed;
+    let sketch = if (sketch.k, sketch.w) == (table.k, table.w) {
+        sketch
+    } else {
+        let params = crate::sketch::MinimizerConfig {
+            k: table.k,
+            w: table.w,
+        };
+        recomputed = ReadSketch {
+            k: table.k,
+            w: table.w,
+            minimizers: crate::sketch::minimizers(&read.seq, &params),
+        };
+        &recomputed
+    };
     let (mut anchors, mut before, occ, discarded) = seed_one(read, sketch, index, cfg, ctx, hints);
     if !discarded || anchor_coverage(read.seq.len(), &anchors, ctx) * 2 >= read.seq.len() {
         return (anchors, before, occ, discarded);
@@ -305,7 +319,7 @@ fn seed_adaptive(
 
     let mut occ = occ;
     if read.seq.len() < cfg.long_read_threshold {
-        let table = &index.short;
+        let table = index.minimizer_table(false);
         let mut wider = cfg;
         wider.max_occ = cfg.max_occ.saturating_mul(4).min(table.max_occ);
         wider.max_hits_per_minimizer = cfg
@@ -371,11 +385,7 @@ fn seed_repeat_rescue(
 ) -> (Vec<Anchor>, usize) {
     const MAX_MINIMIZERS: usize = 64;
 
-    let table = if read.seq.len() >= cfg.long_read_threshold {
-        &index.long
-    } else {
-        &index.short
-    };
+    let table = index.minimizer_table(read.seq.len() >= cfg.long_read_threshold);
     let Some(extension) = index.repeat_rescue_extension(table) else {
         return (Vec::new(), 0);
     };
@@ -480,11 +490,7 @@ fn seed_one(
     hints: Option<&MateHints>,
 ) -> (Vec<Anchor>, usize, u32, bool) {
     let mut truncated_any = false;
-    let table = if read.seq.len() >= cfg.long_read_threshold {
-        &index.long
-    } else {
-        &index.short
-    };
+    let table = index.minimizer_table(read.seq.len() >= cfg.long_read_threshold);
 
     ctx.proto.clear();
     ctx.merged.clear();

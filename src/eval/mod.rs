@@ -88,6 +88,8 @@ pub struct ThresholdCounts {
 pub struct EvalCounts {
     /// Total SAM records seen (headers excluded).
     pub total: u64,
+    /// Primary SAM records, including unmapped reads.
+    pub primary: u64,
     /// Records with a parseable truth locus.
     pub truth_parsed: u64,
     /// Truth-carrying records with no alignment (flag 0x4).
@@ -145,7 +147,7 @@ fn contig_eq(a: &str, b: &str) -> bool {
     a == b || a.strip_prefix("chr") == Some(b) || b.strip_prefix("chr") == Some(a)
 }
 
-/// Score one SAM file. `dump`, when given, receives one TSV row per record:
+/// Score one SAM file. `dump`, when given, receives one TSV row per primary record:
 /// `qname  category  mapq  rname  pos  truth_contig  truth_start  truth_end  indel`.
 pub fn evaluate<W: Write + ?Sized>(
     mut reader: impl BufRead,
@@ -182,6 +184,10 @@ pub fn evaluate<W: Write + ?Sized>(
         let mut fields = text.split('\t');
         let qname = fields.next().unwrap_or("*");
         let flag: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0x4);
+        if flag & 0x900 != 0 {
+            continue;
+        }
+        counts.primary += 1;
         let rname = fields.next().unwrap_or("*");
         let pos: i64 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
         let mapq: u8 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
@@ -256,7 +262,7 @@ pub fn evaluate<W: Write + ?Sized>(
 /// Render the human- and grep-readable summary report.
 pub fn render_report(counts: &EvalCounts) -> String {
     let mut out = String::new();
-    let no_truth = counts.total - counts.truth_parsed;
+    let no_truth = counts.primary - counts.truth_parsed;
     let mapped = counts.mapped();
     let pct = |n: u64, d: u64| {
         if d == 0 {
@@ -266,8 +272,8 @@ pub fn render_report(counts: &EvalCounts) -> String {
         }
     };
     out.push_str(&format!(
-        "[EVAL] total_records={} truth_parsed={} no_truth={}\n",
-        counts.total, counts.truth_parsed, no_truth
+        "[EVAL] total_records={} truth_parsed={} no_truth={} primary_records={}\n",
+        counts.total, counts.truth_parsed, no_truth, counts.primary
     ));
     out.push_str(&format!(
         "[EVAL] unmapped={} ({:.2}% of truth-parsed)\n",
@@ -305,6 +311,25 @@ pub fn render_report(counts: &EvalCounts) -> String {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn nonprimary_records_do_not_change_accuracy() {
+        let sam = concat!(
+            "r:chr1:100-150\t0\tchr1\t101\t60\t50M\n",
+            "r:chr1:100-150\t256\tchr2\t101\t60\t50M\n",
+            "r:chr1:100-150\t2048\tchr2\t101\t60\t25M\n",
+        );
+        let counts = eval_sam(sam);
+        assert_eq!(
+            (
+                counts.total,
+                counts.primary,
+                counts.correct,
+                counts.wrong_locus
+            ),
+            (3, 1, 1, 0)
+        );
+    }
 
     #[test]
     fn parses_colon_form() {

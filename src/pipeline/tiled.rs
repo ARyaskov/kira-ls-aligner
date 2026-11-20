@@ -82,6 +82,12 @@ fn run_tiled_inner(
     tile_plan: TilePlan,
     pool: Arc<DualPool>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        reads_paths
+            .iter()
+            .all(|path| !crate::io::is_stdin_path(path)),
+        "--split-prefix requires reads that can be reopened; use a file instead of stdin"
+    );
     let mut cfg = cfg;
     if tile_plan.tiles.is_empty() {
         return Err(anyhow::anyhow!("tile plan is empty (no contigs?)"));
@@ -115,7 +121,7 @@ fn run_tiled_inner(
         );
 
         let sub_ref = tile.build_sub_reference(&reference);
-        let index = Index::build(sub_ref, cfg.index_cfg);
+        let index = Index::try_build(sub_ref, cfg.index_cfg)?;
 
         let chunk_path = chunk_path_for(&cfg.split_prefix, tile_idx);
         chunk_paths.push(chunk_path.clone());
@@ -128,8 +134,14 @@ fn run_tiled_inner(
             cfg.pipeline_cfg.paired.mode,
             cfg.keep_comment,
         )?;
+        let junctions = cfg.junctions.as_ref().map(|junctions| {
+            Arc::new(junctions.for_tile(
+                tile.global_ref_id_offset,
+                tile.contig_end - tile.contig_start,
+            ))
+        });
         let pipeline = Pipeline::with_pool(cfg.pipeline_cfg, Arc::clone(&pool))
-            .with_junctions(cfg.junctions.clone(), cfg.junc_bed_tolerance);
+            .with_junctions(junctions, cfg.junc_bed_tolerance);
 
         let mut global_read_idx: u64 = 0;
         let mut total_alignments_written: u64 = 0;
@@ -173,9 +185,11 @@ fn run_tiled_inner(
     let mut merge = MergeIter::new(readers);
 
     let mut writer = SamWriter::new(output_path.clone(), &reference)?;
-    match &cfg.header {
-        Some(hdr) => writer.write_header_with_ctx(hdr)?,
-        None => writer.write_header_with_rg(cfg.read_group.as_deref())?,
+    if cfg.pipeline_cfg.output.format != crate::io::EmitFormat::Paf {
+        match &cfg.header {
+            Some(hdr) => writer.write_header_with_ctx(hdr)?,
+            None => writer.write_header_with_rg(cfg.read_group.as_deref())?,
+        }
     }
     let formatter = writer.formatter_handle();
 

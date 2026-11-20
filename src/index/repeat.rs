@@ -1,4 +1,5 @@
 use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rustc_hash::FxHashSet;
@@ -7,7 +8,9 @@ use super::{
     FlatMin, OCC_DISK_SIZE, Occ, OccStorage, OffsetStorage, checked_advance, ensure_remaining,
     read_u32, read_u64, strand_to_u8, write_u8, write_u32, write_u64,
 };
-use crate::sketch::{MinimizerConfig, extended_minimizer_hash, minimizers};
+use crate::sketch::extended_minimizer_hash;
+#[cfg(test)]
+use crate::sketch::{MinimizerConfig, minimizers};
 use crate::types::Reference;
 
 pub(super) const EXTENSION: usize = 8;
@@ -45,6 +48,7 @@ impl RepeatRescueIndex {
         Self::from_flat(extended)
     }
 
+    #[cfg(test)]
     pub(super) fn build_from_reference(
         reference: &Reference,
         k: usize,
@@ -73,6 +77,70 @@ impl RepeatRescueIndex {
             extend_occurrences(reference, k, &selected, &mut extended);
         }
         Self::from_flat(extended)
+    }
+
+    pub(super) fn build_external(
+        reference: &Reference,
+        k: usize,
+        primary_paths: &[PathBuf],
+        overcap_hashes: &FxHashSet<u64>,
+        directory: &Path,
+        run_bytes: usize,
+    ) -> Result<Option<Self>> {
+        if overcap_hashes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut primary = super::SortedRuns::open(primary_paths)?;
+        let limit = (run_bytes / std::mem::size_of::<FlatMin>()).max(1);
+        let mut extended = Vec::with_capacity(limit);
+        let mut paths = Vec::new();
+        while let Some(item) = primary.next()? {
+            if overcap_hashes.contains(&item.hash) {
+                extend_occurrences(reference, k, std::slice::from_ref(&item), &mut extended);
+                if extended.len() == limit {
+                    let path = directory.join(format!("repeat-run-{}.bin", paths.len()));
+                    super::write_sorted_run(&path, &mut extended)?;
+                    paths.push(path);
+                    extended.clear();
+                }
+            }
+        }
+        drop(primary);
+        if !extended.is_empty() {
+            let path = directory.join(format!("repeat-run-{}.bin", paths.len()));
+            super::write_sorted_run(&path, &mut extended)?;
+            paths.push(path);
+        }
+        drop(extended);
+
+        let paths = super::bound_run_fan_in(directory, "repeat", paths, 32)?;
+        let mut stream = super::SortedRuns::open(&paths)?;
+        let mut hashes = Vec::new();
+        let mut offsets = vec![0u32];
+        let mut occs = Vec::new();
+        let mut bucket = Vec::with_capacity(MAX_OCC + 1);
+        while let Some(first) = stream.next()? {
+            let hash = first.hash;
+            bucket.clear();
+            bucket.push(first);
+            while stream.peek_hash() == Some(hash) {
+                let item = stream.next()?.expect("peeked occurrence");
+                if bucket.len() <= MAX_OCC {
+                    bucket.push(item);
+                }
+            }
+            if bucket.len() <= MAX_OCC {
+                hashes.push(hash);
+                occs.extend(bucket.iter().map(|item| item.to_occ()));
+                offsets.push(u32::try_from(occs.len())?);
+            }
+        }
+        Ok((!hashes.is_empty()).then_some(Self {
+            hashes,
+            bucket_offsets: OffsetStorage::Owned(offsets),
+            flat_occs: OccStorage::Owned(occs),
+        }))
     }
 
     fn from_flat(mut flat: Vec<FlatMin>) -> Option<Self> {

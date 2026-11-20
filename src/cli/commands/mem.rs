@@ -312,6 +312,7 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
         build_long: true,
     };
 
+    index_cfg.validate()?;
     let sketch_cfg = SketchConfig {
         short_k,
         short_w,
@@ -702,7 +703,13 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     let Some(kind) = fused_kind else {
         return if let Some(index_path) = resolved_index.as_ref() {
-            aligner.run_with_index_file(index_path, &args.reads, args.output.as_ref())
+            let index = Index::load(index_path).context("load index")?;
+            if args.index.is_none() {
+                index
+                    .verify_reference(&args.reference)
+                    .context("verify auto-detected index")?;
+            }
+            aligner.run_loaded_index(index, &args.reads, args.output.as_ref())
         } else {
             aligner.run(&args.reference, &args.reads, args.output.as_ref())
         };
@@ -731,10 +738,18 @@ pub fn cmd_mem(mut args: MemArgs) -> Result<()> {
 
     // The fused path drives the pipeline itself, so it needs the index in hand.
     let index = match resolved_index.as_ref() {
-        Some(p) => Index::load(p).with_context(|| format!("load index {}", p.display()))?,
+        Some(p) => {
+            let index = Index::load(p).with_context(|| format!("load index {}", p.display()))?;
+            if args.index.is_none() || kind.is_cram() {
+                index
+                    .verify_reference(&args.reference)
+                    .context("verify indexed reference")?;
+            }
+            index
+        }
         None => {
             let reference = read_reference(&args.reference).context("load reference")?;
-            Index::build(reference, index_cfg)
+            Index::try_build(reference, index_cfg)?
         }
     };
 
@@ -865,6 +880,12 @@ fn run_split_prefix(
     cfg: AlignerConfig,
     split_prefix: std::path::PathBuf,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.reads
+            .iter()
+            .all(|path| !crate::io::is_stdin_path(path)),
+        "--split-prefix requires reads that can be reopened; use a file instead of stdin"
+    );
     let reference = read_reference(&args.reference).context("load reference for split-prefix")?;
     let tile_plan = plan_tiles(&reference, args.tile_bytes);
     if tile_plan.tiles.is_empty() {

@@ -74,3 +74,67 @@ fn minimizer_params_are_taken_from_the_index_unless_pinned() {
     let err = String::from_utf8_lossy(&res.stderr);
     assert!(err.contains("mismatch"), "unexpected error text:\n{err}");
 }
+
+#[test]
+fn stale_sidecar_is_rejected_before_output() {
+    let ds = build_dataset("stale_sidecar", &SimParams::default());
+    run_bin(&["index".into(), ds.reference.clone().into()]);
+    let mut fasta = std::fs::read(&ds.reference).unwrap();
+    let base = fasta.iter().position(|&b| b == b'\n').unwrap() + 1;
+    fasta[base] = if fasta[base] == b'A' { b'C' } else { b'A' };
+    std::fs::write(&ds.reference, fasta).unwrap();
+
+    let out = ds.dir.join("stale.sam");
+    let result = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+        .args(mem_args(&ds.reference, &[&ds.single], &out, &[]))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("index does not match FASTA"));
+    assert!(!out.exists());
+}
+
+#[test]
+fn invalid_minimizer_parameters_fail_before_reading_reference() {
+    for args in [["-k", "32"], ["-w", "0"]] {
+        let result = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+            .args(["index", "missing.fa"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("invalid short minimizer"));
+    }
+}
+
+#[test]
+fn a_single_table_can_seed_reads_on_both_sides_of_the_length_cutoff() {
+    let ds = build_dataset("one_seed_table", &SimParams::default());
+    run_bin(&[
+        "index".into(),
+        ds.reference.clone().into(),
+        "--only".into(),
+        "short".into(),
+    ]);
+    let out = ds.dir.join("only.sam");
+    let sam = run_mem(
+        &ds.reference,
+        &[&ds.single],
+        &out,
+        &[
+            "-x",
+            "short",
+            "--long-threshold",
+            "1",
+            "--set",
+            "KIRA_AC_DISABLE=1",
+            "-t",
+            "2",
+        ],
+    );
+    assert!(
+        sam_body(&sam)
+            .iter()
+            .any(|line| !SamRecord::parse(line).is_unmapped())
+    );
+}

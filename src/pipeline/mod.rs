@@ -36,7 +36,7 @@ use crate::pipeline::stage1_sketch::{SketchBatchStats, SketchConfig};
 use crate::pipeline::stage2_seeding::{SeedBatchStats, run_fused as seed_run_fused};
 use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
-    AlignmentBatchStats, AlignmentStageConfig, run as align_run,
+    AlignBatch, AlignmentBatchStats, AlignmentStageConfig, run as align_run,
 };
 use crate::pipeline::stage6_output::serialize_into as output_serialize_into;
 use crate::seeding::SeedingConfig;
@@ -187,88 +187,22 @@ impl Pipeline {
         input: stage0_input::InputBatch,
         index: &Index,
     ) -> crate::pipeline::stage4_alignment::AlignBatch {
-        let ac = self.pool.install_compute(|| {
-            ac_batch::run(
-                &input.reads,
-                index,
-                self.config.alignment,
-                self.config.max_alignments,
-            )
-        });
-        let skip_mask = ac.resolved_mask();
-        let (seeds, _) = self.pool.install_compute(|| {
-            seed_run_fused(
-                input,
-                index,
-                self.config.sketch,
-                self.config.seeding,
-                &skip_mask,
-            )
-        });
-        let chains = self
-            .pool
-            .install_light(|| chain_run(seeds, self.config.chaining));
-        let mut align = self.pool.install_compute(|| {
-            if self.config.splice.enabled {
-                crate::alignment::splice::splice_align_batch(
-                    chains,
-                    index,
-                    self.config.alignment,
-                    self.config.splice,
-                    self.junctions.as_deref(),
-                    self.junc_bed_tolerance,
-                )
-            } else {
-                align_run(
-                    chains,
-                    index,
-                    AlignmentStageConfig {
-                        cfg: self.config.alignment,
-                        min_chain_ratio: self.config.min_chain_ratio,
-                        accept_enable: self.config.accept_enable,
-                        accept_only_top1: self.config.accept_only_top1,
-                        accept_span_slack: self.config.accept_span_slack,
-                        accept_min_identity: self.config.accept_min_identity,
-                        accept_max_mismatches: self.config.accept_max_mismatches,
-                        accept_require_score_margin: self.config.accept_require_score_margin,
-                        dp_topk: self.config.dp_topk,
-                        dp_abort_margin: self.config.dp_abort_margin,
-                        debug_prefilter: self.config.debug_prefilter,
-                        debug_prefilter_n: self.config.debug_prefilter_n,
-                        debug_force_accept: self.config.debug_force_accept,
-                        debug_force_accept_n: self.config.debug_force_accept_n,
-                        long_read_threshold: self.config.long_read_threshold,
-                        max_alignments: self.config.max_alignments,
-                        short_preset: self.config.short_preset,
-                        paired: self.config.paired,
-                    },
-                )
-            }
-        });
-        merge_ac_alignments(&mut align.alignments, ac);
-        align
+        self.align_candidates(input, index, self.config.paired).0
     }
 
-    /// Run stages 1-6 producing a ready-to-write SAM byte buffer.
-    pub fn process_batch_serialized(
+    #[allow(clippy::type_complexity)]
+    fn align_candidates(
         &self,
         input: stage0_input::InputBatch,
         index: &Index,
-        formatter: &SamFormatter,
-        read_group: Option<&str>,
-    ) -> Result<PipelineBatchOutput> {
-        let mut sam_buf = Vec::new();
-        let stats = self.process_batch_into(input, index, formatter, read_group, &mut sam_buf)?;
-        Ok(PipelineBatchOutput { stats, sam_buf })
-    }
-
-    /// Run stages 1-5 and hand back the scored batch unserialised, for in-process
-    /// consumers that want alignment records rather than SAM text.
-    pub fn process_batch_scored(
-        &self,
-        input: stage0_input::InputBatch,
-        index: &Index,
-    ) -> Result<(stage5_scoring::ScoredBatch, PipelineBatchStats)> {
+        paired_cfg: PairedConfig,
+    ) -> (
+        AlignBatch,
+        [Duration; 6],
+        SketchBatchStats,
+        SeedBatchStats,
+        ChainingBatchStats,
+    ) {
         let mut stages = [Duration::ZERO; 6];
 
         let t0 = Instant::now();
@@ -316,17 +250,6 @@ impl Pipeline {
         let chaining_stats = chains.stats.clone();
         stages[2] = t2.elapsed();
 
-        // Read the current insert-size estimate before stage 4: the mate-guided
-        // candidate search needs the concordance window to judge (R1 chain, R2
-        // chain) combinations. The estimator is only *updated* after pairing, so
-        // reading it here observes the same value stage 4 would have seen.
-        let paired_cfg = self
-            .insert_estimator
-            .read()
-            .map(|e| e.current())
-            .unwrap_or(self.config.paired);
-
-        let t3 = Instant::now();
         let ts4 = Instant::now();
         // Stage 4 alignment — banded SW / spectral / WFA, the hottest
         // SIMD path in the whole pipeline → P-pool.
@@ -384,6 +307,45 @@ impl Pipeline {
             );
         }
 
+        stages[3] = t_stage4;
+        (align, stages, sketch_stats, seed_stats, chaining_stats)
+    }
+
+    /// Run stages 1-6 producing a ready-to-write SAM byte buffer.
+    pub fn process_batch_serialized(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+        formatter: &SamFormatter,
+        read_group: Option<&str>,
+    ) -> Result<PipelineBatchOutput> {
+        let mut sam_buf = Vec::new();
+        let stats = self.process_batch_into(input, index, formatter, read_group, &mut sam_buf)?;
+        Ok(PipelineBatchOutput { stats, sam_buf })
+    }
+
+    /// Run stages 1-5 and hand back the scored batch unserialised, for in-process
+    /// consumers that want alignment records rather than SAM text.
+    pub fn process_batch_scored(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+    ) -> Result<(stage5_scoring::ScoredBatch, PipelineBatchStats)> {
+        // Read the current insert-size estimate before stage 4: the mate-guided
+        // candidate search needs the concordance window to judge (R1 chain, R2
+        // chain) combinations. The estimator is only *updated* after pairing, so
+        // reading it here observes the same value stage 4 would have seen.
+        let paired_cfg = self
+            .insert_estimator
+            .read()
+            .map(|e| e.current())
+            .unwrap_or(self.config.paired);
+
+        let (mut align, mut stages, sketch_stats, seed_stats, chaining_stats) =
+            self.align_candidates(input, index, paired_cfg);
+        let t_stage4 = stages[3];
+        let post_start = Instant::now();
+
         let policy = PostAlignPolicy {
             reference: &index.reference,
             mmap: index.mmap.as_deref().map(|m| &m[..]),
@@ -403,7 +365,7 @@ impl Pipeline {
         let t_apply_pairing = post.apply_pairing;
         let paired_cfg_final = post.paired_cfg;
 
-        stages[3] = t3.elapsed();
+        stages[3] = t_stage4 + post_start.elapsed();
         if std::env::var_os("KIRA_STATS").is_some() {
             crate::kira_info!(
                 "[KIRA_STAGE3_BREAKDOWN] stage4_align={:.3}ms rescue_unmapped={:.3}ms pair_rerank={:.3}ms rescue_discordant={:.3}ms apply_pairing={:.3}ms total_s3={:.3}ms",

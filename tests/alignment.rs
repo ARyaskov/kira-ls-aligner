@@ -120,3 +120,52 @@ fn end_of_read_insertion_softclips_without_penalty() {
         "with clip_penalty=0 the local-SW soft-clip should still win"
     );
 }
+
+#[test]
+fn public_simd_api_preserves_batch_cardinality_and_order() {
+    use kira_ls_aligner::alignment::{BatchInput, align_batch_simd};
+    use kira_ls_aligner::simd::SimdMode;
+
+    let bases = b"ACGTTGCTAATCGTGCATGACCTG";
+    let inputs: Vec<_> = (0..33)
+        .map(|id| BatchInput {
+            read_seq: bases,
+            ref_window: bases,
+            win_start: 100 * id,
+            chain: AnchorSpan {
+                ref_id: id,
+                ref_start: 100 * id,
+                ref_end: 100 * id + bases.len() as u32,
+                read_start: 0,
+                read_end: bases.len() as u32,
+                strand: Strand::Forward,
+            },
+            is_rev: false,
+            abort_score: 0,
+        })
+        .collect();
+
+    let cfg = AlignmentConfig {
+        match_score: 2,
+        mismatch: 4,
+        gap_open: 6,
+        gap_extend: 1,
+        bandwidth: 50,
+        xdrop: 40,
+        clip_penalty: 5,
+    };
+    for mode in [SimdMode::Avx2, SimdMode::Neon, SimdMode::AvxVnni] {
+        for count in [0, 1, 4, 5, 16, 17, 33] {
+            let results = align_batch_simd(&inputs[..count], cfg, mode);
+            assert_eq!(results.len(), count);
+            for (input, (aln, _)) in inputs.iter().zip(results) {
+                assert_eq!(aln.ref_id, input.chain.ref_id);
+                assert_eq!(
+                    (aln.ref_start, aln.ref_end),
+                    (input.win_start, input.chain.ref_end)
+                );
+                assert_eq!(aln.nm, 0);
+            }
+        }
+    }
+}

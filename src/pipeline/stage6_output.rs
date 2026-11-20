@@ -238,8 +238,8 @@ pub(crate) fn binary_records(
                 };
                 if alns.is_empty() {
                     let mut record = binary::unmapped(read, input.unmapped_mate_info[i].as_ref())?;
-                    if let Some(mate) = mate {
-                        binary::mate_tags(&mut record, mate);
+                    if let Some((mate, score)) = mate {
+                        binary::mate_tags(&mut record, mate, score);
                     }
                     if let Some(comment) = &comment {
                         binary::append_comment(&mut record, comment)?;
@@ -270,8 +270,8 @@ pub(crate) fn binary_records(
                                 binary::string_tag(&mut record, *b"SA", sa);
                             }
                         }
-                        if let Some(mate) = mate {
-                            binary::mate_tags(&mut record, mate);
+                        if let Some((mate, score)) = mate {
+                            binary::mate_tags(&mut record, mate, score);
                         }
                     }
                     if let Some(comment) = &comment {
@@ -297,14 +297,14 @@ fn mate_tag_bytes(
     alignments: &[Vec<Alignment>],
     i: usize,
 ) -> Option<Vec<u8>> {
-    let primary = mate_primary(reads, alignments, i)?;
+    let (primary, score) = mate_primary(reads, alignments, i)?;
     let mut out = Vec::with_capacity(48);
     out.extend_from_slice(b"\tMC:Z:");
     append_cigar_ops(&mut out, &primary.cigar);
     out.extend_from_slice(b"\tMQ:i:");
     out.extend_from_slice(primary.mapq.to_string().as_bytes());
     out.extend_from_slice(b"\tms:i:");
-    out.extend_from_slice(primary.as_score.to_string().as_bytes());
+    out.extend_from_slice(score.to_string().as_bytes());
     Some(out)
 }
 
@@ -312,7 +312,7 @@ fn mate_primary<'a>(
     reads: &[ReadRecord],
     alignments: &'a [Vec<Alignment>],
     i: usize,
-) -> Option<&'a Alignment> {
+) -> Option<(&'a Alignment, u32)> {
     let mate_idx = match reads[i].pair_role {
         PairRole::R1 => i + 1,
         PairRole::R2 => i.checked_sub(1)?,
@@ -326,7 +326,17 @@ fn mate_primary<'a>(
     if mate.pair_role != expected {
         return None;
     }
-    alignments[mate_idx].first()
+    let primary = alignments[mate_idx].first()?;
+    let score = mate
+        .qual
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|q| q.checked_sub(b'!'))
+        .filter(|&q| q >= 15)
+        .map(u32::from)
+        .sum();
+    Some((primary, score))
 }
 
 fn retain_reported_alignments(
@@ -387,15 +397,16 @@ mod tests {
         let mut r1 = ReadRecord::new_unpaired("t".into(), vec![b'A'; 10], None);
         r1.pair_role = PairRole::R1;
         let mut r2 = r1.clone();
+        r2.qual = Some(b"IIIIIOOO!!".to_vec());
         r2.pair_role = PairRole::R2;
         let reads = vec![r1, r2];
         let mut mate_primary = alignment(97, false);
         mate_primary.mapq = 37;
         let alns = vec![vec![alignment(100, false)], vec![mate_primary]];
         let tags = mate_tag_bytes(&reads, &alns, 0).expect("R1 gets its mate's tags");
-        assert_eq!(tags, b"\tMC:Z:10M\tMQ:i:37\tms:i:97");
+        assert_eq!(tags, b"\tMC:Z:10M\tMQ:i:37\tms:i:338");
         let tags = mate_tag_bytes(&reads, &alns, 1).expect("R2 too");
-        assert_eq!(tags, b"\tMC:Z:10M\tMQ:i:0\tms:i:100");
+        assert_eq!(tags, b"\tMC:Z:10M\tMQ:i:0\tms:i:0");
         // An unmapped mate yields nothing; unpaired reads never do.
         let alns = vec![vec![alignment(100, false)], vec![]];
         assert!(mate_tag_bytes(&reads, &alns, 0).is_none());
@@ -435,6 +446,7 @@ mod tests {
         r1.pair_role = PairRole::R1;
         r1.comment = Some("BC:Z:ACGT\tFI:i:1\tXY:B:c,-2,3".into());
         let mut r2 = r1.clone();
+        r2.qual = Some(b"IIIIIOOO!!".to_vec());
         r2.pair_role = PairRole::R2;
         r2.comment = Some("BC:Z:ACGT\tFI:i:2".into());
         let fasta = ReadRecord::new_unpaired("fasta".into(), b"ACGTAACCTG".to_vec(), None);

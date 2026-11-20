@@ -32,19 +32,19 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 tempfile = "3"
 memmap2 = "0.9"
-needletail = "0.6"
+needletail = "0.7.4"
 rayon = "1.10"
 rustc-hash = "2"
-sysinfo = "0.38"
+sysinfo = "0.40.4"
 thiserror = "2"
 kira-fastq = "0.4.0"
 kira-simd = { version = "0.1.0", features = ["runtime-dispatch", "avx2", "sse42", "neon", "scalar"] }
-kira_kv_engine = { version = "0.9.0", default-features = true }
+kira_kv_engine = { version = "0.12.0", default-features = true }
 
-kira-bam = "0.5.0"
-# Same noodles-sam line kira-bam 0.5.0 builds on, so the `RecordBuf` the fused
+kira-bam = "0.6.0"
+# Same noodles-sam line kira-bam 0.6.0 builds on, so the `RecordBuf` the fused
 # `--emit bam` path builds is the type kira-bam's sort/markdup/writer take.
-noodles-sam = "0.85"
+noodles-sam = "0.93"
 # gzip/BGZF sniffing on `-` (stdin) reads; file inputs go through kira-fastq.
 flate2 = "1"
 
@@ -56,7 +56,7 @@ core_affinity = "0.8"
 # version that supports loading PTX at runtime — required for shipping a
 # single binary that targets multiple GPU generations including Pascal
 # (compute_61, GTX 1060+).
-cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "cuda-12060", "dynamic-loading"], optional = true }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12060", "dynamic-loading"], optional = true }
 
 # Restore the default SIGPIPE disposition in the binary so `kira mem ... |
 # head` ends quietly like bwa/samtools instead of exiting 1 with an EPIPE
@@ -67,7 +67,7 @@ libc = "0.2"
 # Topology detection on Windows: GetLogicalProcessorInformationEx
 # exposes EfficiencyClass per physical core (0 = E, > 0 = P).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemInformation",
     "Win32_Foundation",
 ] }
@@ -87,7 +87,7 @@ default = []
 cuda = ["dep:cudarc", "dep:find_cuda_helper"]
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "sw_bench"

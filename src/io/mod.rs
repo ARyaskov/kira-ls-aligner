@@ -15,8 +15,19 @@ pub(crate) mod binary;
 
 /// Load reference sequences from FASTA using mmap.
 pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
-    let mut reader = open_fastx_reader(path)?.reader;
     let mut sequences = Vec::new();
+    visit_reference(path, |seq| {
+        sequences.push(seq);
+        Ok(())
+    })?;
+    Ok(Reference { sequences })
+}
+
+pub(crate) fn visit_reference(
+    path: impl AsRef<Path>,
+    mut visit: impl FnMut(RefSeq) -> Result<()>,
+) -> Result<()> {
+    let mut reader = open_fastx_reader(path)?.reader;
     while let Some(record) = reader.next() {
         let record = record.context("read reference record")?;
         let raw = record.id();
@@ -28,12 +39,12 @@ pub fn read_reference<P: AsRef<Path>>(path: P) -> Result<Reference> {
         let name = String::from_utf8_lossy(trimmed).to_string();
         let mut seq = record.seq().to_vec();
         normalize_bases(&mut seq);
-        sequences.push(RefSeq {
+        visit(RefSeq {
             name,
             bases: RefBases::Owned(seq),
-        });
+        })?;
     }
-    Ok(Reference { sequences })
+    Ok(())
 }
 
 /// Pairing strategy for `ReadStream`.

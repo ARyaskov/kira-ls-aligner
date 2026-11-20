@@ -613,11 +613,22 @@ fn try_packed_spectral_alignment(
     cfg: AlignmentConfig,
     is_rev: bool,
 ) -> Option<Alignment> {
+    let evidence = packed_scan_scratch(read_seq, text)?;
+    build_certified_spectral_alignment(read_seq, text, win_start, chain, cfg, is_rev, evidence)
+}
+
+pub(crate) fn build_certified_spectral_alignment(
+    read_seq: &[u8],
+    text: &[u8],
+    win_start: usize,
+    chain: &AnchorSpan,
+    cfg: AlignmentConfig,
+    is_rev: bool,
+    (hit, second_mismatches): (bitpacked::PackedHit, Option<usize>),
+) -> Option<Alignment> {
     let read_len = read_seq.len();
     let max_mism = router::spectral_max_mismatches(read_len);
-
-    let (hit, second_mismatches) = packed_scan_scratch(read_seq, text)?;
-    let ref_aligned = &text[hit.shift..hit.shift + read_len];
+    let ref_aligned = text.get(hit.shift..hit.shift.checked_add(read_len)?)?;
     if !spectral_hit_is_certified(read_seq, ref_aligned, &hit, second_mismatches, max_mism) {
         return None;
     }
@@ -1131,13 +1142,23 @@ pub fn align_batch_simd(
             .collect();
     }
 
-    let sw_results: Vec<SwResult> = match mode {
+    let sw_results: Vec<SwResult> = match (mode, crate::simd::detect_cached()) {
         #[cfg(target_arch = "x86_64")]
-        SimdMode::AvxVnni => unsafe { sw_dispatch_avx_vnni(inputs, cfg, read_len) },
+        (SimdMode::AvxVnni, SimdMode::AvxVnni) => unsafe {
+            sw_dispatch_avx_vnni(inputs, cfg, read_len)
+        },
         #[cfg(target_arch = "x86_64")]
-        SimdMode::Avx2 => unsafe { sw_batch_avx2(inputs, cfg) },
+        (SimdMode::Avx2, SimdMode::Avx2 | SimdMode::AvxVnni) => unsafe {
+            inputs
+                .chunks(16)
+                .flat_map(|chunk| sw_batch_avx2(chunk, cfg))
+                .collect()
+        },
         #[cfg(target_arch = "aarch64")]
-        SimdMode::Neon => unsafe { sw_batch_neon(inputs, cfg) },
+        (SimdMode::Neon, SimdMode::Neon) => inputs
+            .chunks(4)
+            .flat_map(|chunk| unsafe { sw_batch_neon(chunk, cfg) })
+            .collect(),
         _ => inputs
             .iter()
             .map(|i| banded_sw(i.read_seq, i.ref_window, 0, cfg, i.abort_score))

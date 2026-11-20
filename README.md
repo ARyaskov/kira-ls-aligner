@@ -192,7 +192,7 @@ stays at 500, and the default hit cap is 16 rather than bwa's 500.
 - `--config FILE` / `--set KIRA_KNOB=value` : Tuning knobs (below) from a file or the command line, recorded in the header.
 
 Every record of a paired run carries `MC:Z` / `MQ:i` / `ms:i` (the mate's
-CIGAR, MAPQ and score — what `samtools fixmate -m` adds), so
+CIGAR, MAPQ and sum of base qualities at Phred 15 or above — what `samtools fixmate -m` adds), so
 `samtools markdup` runs directly on the output.
 
 ### Output formats

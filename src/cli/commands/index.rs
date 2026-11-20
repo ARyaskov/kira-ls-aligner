@@ -41,6 +41,7 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
         build_long,
     };
 
+    cfg.validate()?;
     let wall_start = Instant::now();
     crate::kira_info!(
         "[KIRA_INDEX] reading reference {}...",
@@ -58,7 +59,7 @@ pub fn cmd_index(args: IndexArgs) -> Result<()> {
     );
 
     let t = Instant::now();
-    let index = Index::build(reference, cfg);
+    let index = Index::try_build(reference, cfg)?;
     crate::kira_info!(
         "[KIRA_INDEX] Index::build done in {:.2}s",
         t.elapsed().as_secs_f64()

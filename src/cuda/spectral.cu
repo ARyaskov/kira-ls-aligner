@@ -13,11 +13,8 @@
 //   * Thread `lane` in iteration `iter` evaluates shift `iter*32 + lane`.
 //   * Each thread computes the full Hamming distance for its shift
 //     (read_bytes ≤ 64 → 8 u64 SWAR ops max).
-//   * After each tile, a __ballot_sync finds threads whose Hamming distance
-//     is within the accept threshold; the lowest such thread index becomes
-//     the chosen shift.
-//   * The kernel exits as soon as one shift accepts (first-acceptable),
-//     mirroring the CPU `bitpacked::scan` semantics.
+//   * Each lane tracks its two best shifts. Warp reduction then selects the
+//     two best distinct shifts across the window, breaking ties by position.
 //
 // This gives us ~ (n_reads × warp_size) parallel SIMD lanes, which fills a
 // GTX 1060 (10 SMs × 4 warps/SM = 40 concurrent reads) hundreds of times over
@@ -36,17 +33,15 @@
 //                                       sharing a single ref this is simply
 //                                       the read's allocated tile offset)
 // ref_lens:           n_reads × i32   (effective ref-window length in nucs)
-// max_mismatches:     i32              (accept threshold)
+// max_mismatches:     i32[n_reads]     (accept threshold per read)
 // out_shifts:         n_reads × i32   (chosen shift; -1 if no accept)
-// out_mismatches:     n_reads × i32   (Hamming distance at chosen shift;
-//                                       INT_MAX if no accept)
+// out_mismatches:     2 × n_reads i32 (best and runner-up Hamming distances)
 //
 // =============================================================================
 // Pascal-specific notes
 // =============================================================================
 // * No FP16/INT8 tensor ops — everything in INT32 / INT64.
 // * Warp shuffles (__shfl_sync) are available since Kepler — fine.
-// * __ballot_sync needs CUDA 9+ headers but compiles to BALLOT for SM_61.
 // * No cooperative groups in pre-Volta — we stick to warp-level primitives.
 
 #include <cstdint>
@@ -146,7 +141,7 @@ extern "C" __global__ void spectral_scan_kernel(
     const int32_t* __restrict__ ref_offsets,      // per-read byte offset in each phase
     const int32_t* __restrict__ ref_lens,
     int32_t read_bytes_max,
-    int32_t max_mismatches,
+    const int32_t* __restrict__ max_mismatches,
     int32_t n_reads,
     int32_t* __restrict__ out_shifts,
     int32_t* __restrict__ out_mismatches)
@@ -162,59 +157,57 @@ extern "C" __global__ void spectral_scan_kernel(
         if (lane == 0) {
             out_shifts[read_id] = -1;
             out_mismatches[read_id] = INT32_MAX;
+            out_mismatches[n_reads + read_id] = INT32_MAX;
         }
         return;
     }
     int n_shifts = ref_len - read_len + 1;
-    int need_matches = read_len > max_mismatches ? (read_len - max_mismatches) : 0;
-    int max_mism_allowed = read_len - need_matches;
+    int max_mism_allowed = max_mismatches[read_id];
 
     int read_bytes = (read_len + 3) / 4;
     int ref_byte_off_base = ref_offsets[read_id];
 
     const uint8_t* my_read = reads_packed + (size_t)read_id * read_bytes_max;
 
-    // Shared state for the winning shift (lowest shift index that accepts).
-    __shared__ int32_t s_best_shift;
-    __shared__ int32_t s_best_mism;
-    if (lane == 0) {
-        s_best_shift = -1;
-        s_best_mism = INT32_MAX;
-    }
-    __syncthreads();
-
-    // Tile-sweep shifts in chunks of 32.
-    for (int tile_base = 0; tile_base < n_shifts; tile_base += 32) {
-        int my_shift = tile_base + lane;
-        int my_mism = INT32_MAX;
-
-        if (my_shift < n_shifts) {
-            int phase = my_shift & 3;             // my_shift % 4
-            int byte_off = my_shift >> 2;          // my_shift / 4
-            const uint8_t* phase_base =
-                ref_shifted_flat + (size_t)phase * ref_bytes_per_phase;
-            const uint8_t* ref = phase_base + ref_byte_off_base + byte_off;
-            my_mism = hamming_2bit(my_read, ref, read_bytes, read_len);
+    // Order by mismatch count, then by shift. Every lane visits disjoint shifts.
+    const uint64_t missing = UINT64_MAX;
+    uint64_t best = missing;
+    uint64_t second = missing;
+    for (int shift = lane; shift < n_shifts; shift += 32) {
+        int phase = shift & 3;
+        int byte_off = shift >> 2;
+        const uint8_t* phase_base =
+            ref_shifted_flat + (size_t)phase * ref_bytes_per_phase;
+        const uint8_t* ref = phase_base + ref_byte_off_base + byte_off;
+        uint64_t mismatches = hamming_2bit(my_read, ref, read_bytes, read_len);
+        uint64_t rank = (mismatches << 32) | static_cast<uint32_t>(shift);
+        if (rank < best) {
+            second = best;
+            best = rank;
+        } else if (rank < second) {
+            second = rank;
         }
+    }
 
-        // Did anyone in this warp accept?
-        unsigned accept_mask = __ballot_sync(0xFFFFFFFFu, my_mism <= max_mism_allowed);
-        if (accept_mask != 0) {
-            int winner_lane = __ffs(accept_mask) - 1; // 0..31
-            int winner_shift = tile_base + winner_lane;
-            // Broadcast the winner's mism to lane 0.
-            int winner_mism = __shfl_sync(0xFFFFFFFFu, my_mism, winner_lane);
-            if (lane == 0) {
-                s_best_shift = winner_shift;
-                s_best_mism = winner_mism;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        uint64_t peer_best = __shfl_down_sync(0xFFFFFFFFu, best, offset);
+        uint64_t peer_second = __shfl_down_sync(0xFFFFFFFFu, second, offset);
+        if (lane < offset) {
+            if (peer_best < best) {
+                second = best < peer_second ? best : peer_second;
+                best = peer_best;
+            } else if (peer_best < second) {
+                second = peer_best;
             }
-            __syncthreads();
-            break; // first-acceptable: exit the tile loop
         }
     }
 
     if (lane == 0) {
-        out_shifts[read_id] = s_best_shift;
-        out_mismatches[read_id] = s_best_mism;
+        int mismatches = static_cast<int>(best >> 32);
+        bool accepted = mismatches <= max_mism_allowed;
+        out_shifts[read_id] = accepted ? static_cast<int>(static_cast<uint32_t>(best)) : -1;
+        out_mismatches[read_id] = accepted ? mismatches : INT32_MAX;
+        out_mismatches[n_reads + read_id] =
+            second == missing ? INT32_MAX : static_cast<int>(second >> 32);
     }
 }

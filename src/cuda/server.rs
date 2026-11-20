@@ -155,31 +155,10 @@ impl Session {
             .context("`ref <path>` is required before submission")?;
         anyhow::ensure!(!self.reads.is_empty(), "`reads <path>` is required");
 
-        let resolved_index = self
-            .index
-            .clone()
-            .or_else(|| auto_detect_sidecar_index(&reference));
-        if self.index.is_none() {
-            if let Some(idx) = resolved_index.as_ref() {
-                crate::kira_info!(
-                    "[KIRA_GPU] auto-detected sidecar index {} for {}",
-                    idx.display(),
-                    reference.display()
-                );
-            } else {
-                crate::kira_info!(
-                    "[KIRA_GPU] no sidecar index found for {}; building in-memory \
-                     (this may take ~15 min for hg38-sized references). Run \
-                     `kira_ls_aligner index <ref>` once to skip this on future jobs.",
-                    reference.display()
-                );
-            }
-        }
-
         let args = MemArgs::server_invocation(
             reference,
             self.reads.clone(),
-            resolved_index,
+            self.index.clone(),
             self.output.clone(),
             self.threads.unwrap_or(default_threads),
             self.batch_bases.unwrap_or(default_batch_bases),
@@ -188,16 +167,6 @@ impl Session {
 
         crate::cli::commands::cmd_mem(args)?;
         Ok(())
-    }
-}
-
-/// Look for `<ref>.kiraidx` next to the reference FASTA.
-fn auto_detect_sidecar_index(reference: &std::path::Path) -> Option<PathBuf> {
-    let candidate = reference.with_extension("kiraidx");
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
-        None
     }
 }
 

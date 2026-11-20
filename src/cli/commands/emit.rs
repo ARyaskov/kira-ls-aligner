@@ -90,8 +90,20 @@ pub fn run_fused(
     aligner: &Aligner,
     index: Index,
     reads: &[PathBuf],
-    opts: EmitOptions,
+    mut opts: EmitOptions,
 ) -> Result<()> {
+    let destination = opts.output.clone();
+    let directory = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output = tempfile::Builder::new()
+        .prefix(".kira-emit-")
+        .suffix(if opts.kind.is_cram() { ".cram" } else { ".bam" })
+        .tempfile_in(directory)
+        .context("create temporary alignment output")?
+        .into_temp_path();
+    opts.output = output.to_path_buf();
     let cfg = aligner.config();
     if opts.kind.is_cram() {
         ensure_fai(&opts.reference)?;
@@ -121,7 +133,9 @@ pub fn run_fused(
     // Record construction and encoding run on rayon's global pool; the aligner
     // keeps its own pools. Ignoring the error keeps a pool an embedding
     // program already installed.
-    kira_bam::io::install_thread_pool(opts.threads);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(opts.threads)
+        .build_global();
 
     let formatter =
         SamFormatter::from_catalog(Arc::new(ContigCatalog::from_reference(&index.reference)));
@@ -166,10 +180,11 @@ pub fn run_fused(
     let final_path = conv_result?;
     drive?;
 
-    if final_path.bai {
+    let index_output = if final_path.bai {
+        let index = tempfile::NamedTempFile::new_in(directory)?.into_temp_path();
         kira_bam::index::run(kira_bam::cli::IndexArgs {
             input: final_path.path.clone(),
-            output: None,
+            output: Some(index.to_path_buf()),
             bai: true,
             csi: false,
             min_shift: 14,
@@ -177,11 +192,22 @@ pub fn run_fused(
             threads: final_path.threads,
         })
         .context("build BAI")?;
+        Some(index)
+    } else {
+        None
+    };
+    output
+        .persist(&destination)
+        .context("publish alignment output")?;
+    if let Some(index) = index_output {
+        index
+            .persist(kira_bam::io::default_index_path(&destination, false))
+            .context("publish BAI")?;
     }
     crate::kira_info!(
         "[KIRA] {} pipeline complete → {}",
         final_path.kind_name,
-        final_path.path.display()
+        destination.display()
     );
     Ok(())
 }
@@ -469,27 +495,30 @@ fn write_records(w: &mut BamWriter, recs: &[RecordBuf], fmt: OutputFormat) -> Re
         return Ok(());
     }
     if matches!(fmt, OutputFormat::Bam | OutputFormat::UncompressedBam) {
-        let n_chunks = rayon::current_num_threads().max(1);
-        let chunk_len = recs.len().div_ceil(n_chunks).max(1);
-        let encoded: Vec<(Vec<u8>, u64)> = {
-            let hdr = w.header();
-            recs.par_chunks(chunk_len)
-                .map(|c| encode_records_into(hdr, c))
-                .collect()
-        };
-        let skipped: u64 = encoded.iter().map(|(_, n)| n).sum();
-        for (buf, _) in &encoded {
-            w.write_preencoded(buf)?;
-        }
-        if skipped > 0 {
-            crate::kira_warn!("[KIRA] warning: {skipped} records rejected by the BAM encoder");
+        // Keep encoded scratch bounded even when draining an entire in-memory sort.
+        for block in recs.chunks(4096) {
+            let recs = block;
+            let n_chunks = rayon::current_num_threads().max(1);
+            let chunk_len = recs.len().div_ceil(n_chunks).max(1);
+            let encoded: Vec<(Vec<u8>, u64)> = {
+                let hdr = w.header();
+                recs.par_chunks(chunk_len)
+                    .map(|c| encode_records_into(hdr, c))
+                    .collect()
+            };
+            let skipped: u64 = encoded.iter().map(|(_, n)| n).sum();
+            anyhow::ensure!(
+                skipped == 0,
+                "{skipped} records rejected by the BAM encoder"
+            );
+            for (buf, _) in &encoded {
+                w.write_preencoded(buf)?;
+            }
         }
     } else {
-        let mut skipped = 0u64;
         for r in recs {
-            kira_bam::io::write_record_tolerant(w, r, "kira-ls-aligner", &mut skipped)?;
+            w.write_record_buf(r).context("encode CRAM record")?;
         }
-        kira_bam::io::report_skipped("kira-ls-aligner", skipped);
     }
     Ok(())
 }

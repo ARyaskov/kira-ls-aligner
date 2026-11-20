@@ -8,8 +8,6 @@ use crate::alignment::prefilter::{
     PrefilterOutcome, PrefilterReason, PrefilterResult, UngappedStats, min_len_required,
     prefilter_chain,
 };
-#[cfg(feature = "cuda")]
-use crate::alignment::push_u32_decimal;
 use crate::alignment::{
     AlignmentConfig, AnchorSpan, BatchInput, FastPathKind, align_batch_simd, align_chain_with_meta,
     exact_match_alignment, try_fast_dp_alignment,
@@ -17,8 +15,6 @@ use crate::alignment::{
 use crate::index::Index;
 use crate::seq::reverse_complement;
 use crate::simd::{self, SimdMode};
-#[cfg(feature = "cuda")]
-use crate::types::AlignmentKind;
 use crate::types::{Alignment, Chain, CigarKind, CigarOp, MateInfo, ReadRecord, Strand};
 
 use super::stage3_chaining::ChainBatch;
@@ -1258,183 +1254,84 @@ fn gpu_dispatch_spectral(
     use crate::alignment::bitpacked::PackedDna;
     use crate::cuda::{CudaJob, dispatcher};
 
-    let cuda_jobs: Vec<CudaJob> = simd_jobs
+    let jobs: Vec<_> = simd_jobs
         .par_iter()
-        .map(|job| {
+        .enumerate()
+        .filter_map(|(i, job)| {
             let pr = PackedDna::pack(&job.read_seq);
             let pt = PackedDna::pack(job.ref_window);
+            if !pr.valid || !pt.valid {
+                return None;
+            }
             let shifted = pt.pre_shifted_window();
             let read_len = job.read_seq.len();
             let max_mism = crate::alignment::router::spectral_max_mismatches(read_len);
-            CudaJob {
-                read_packed: pr.bits,
-                read_nucs: read_len as u32,
-                ref_shifted: shifted,
-                ref_nucs: job.ref_window.len() as u32,
-                max_mismatches: max_mism as u32,
-            }
+            Some((
+                i,
+                CudaJob {
+                    read_packed: pr.bits,
+                    read_nucs: read_len as u32,
+                    ref_shifted: shifted,
+                    ref_nucs: job.ref_window.len() as u32,
+                    max_mismatches: max_mism as u32,
+                },
+            ))
         })
         .collect();
+    let (indices, cuda_jobs): (Vec<usize>, Vec<CudaJob>) = jobs.into_iter().unzip();
 
     let Some(results) = dispatcher::dispatch(cuda_jobs) else {
         return vec![false; simd_jobs.len()];
     };
-    debug_assert_eq!(results.len(), simd_jobs.len());
-
-    if std::env::var_os("KIRA_GPU_DIAG").is_some() {
-        let diag_n = std::env::var("KIRA_GPU_DIAG_N")
+    let diag_limit = if std::env::var_os("KIRA_GPU_DIAG").is_some() {
+        std::env::var("KIRA_GPU_DIAG_N")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5usize);
-        diagnose_gpu_vs_cpu(simd_jobs, &results, diag_n);
-    }
-
+            .unwrap_or(5)
+    } else {
+        0
+    };
     let mut accepted = vec![false; simd_jobs.len()];
-    for (i, result) in results.iter().enumerate() {
-        if result.shift < 0 {
-            continue; // GPU rejected — fall through to CPU SW
-        }
+    for (ordinal, (i, result)) in indices.into_iter().zip(results).enumerate() {
         let job = &simd_jobs[i];
-        let aln = build_alignment_from_gpu(job, result, cfg);
-        alignments[job.read_idx].push(aln);
-        accepted[i] = true;
-    }
-    accepted
-}
-
-/// Compare GPU dispatch results against a fresh CPU `bitpacked::scan` call for the first `n` jobs.
-#[cfg(feature = "cuda")]
-fn diagnose_gpu_vs_cpu(
-    simd_jobs: &[SimdJob<'_, '_>],
-    gpu_results: &[crate::cuda::CudaResult],
-    n: usize,
-) {
-    use crate::alignment::bitpacked::{self, PackedDna};
-    let limit = simd_jobs.len().min(n);
-    let mut disagreements = 0usize;
-    for (i, (job, gpu)) in simd_jobs
-        .iter()
-        .zip(gpu_results.iter())
-        .take(limit)
-        .enumerate()
-    {
-        let read_len = job.read_seq.len();
-        let max_mism = crate::alignment::router::spectral_max_mismatches(read_len);
-        let pr = PackedDna::pack(&job.read_seq);
-        let pt = PackedDna::pack(job.ref_window);
-        let shifted = pt.pre_shifted_window();
-        let cpu_hit = bitpacked::scan(&pr, &shifted, job.ref_window.len(), max_mism);
-
-        let (cpu_str, cpu_accepts) = match cpu_hit {
-            Some(h) => (format!("shift={}, mism={}", h.shift, h.mismatches), true),
-            None => ("NONE".to_string(), false),
-        };
-        let gpu_accepts = gpu.shift >= 0;
-        let gpu_str = if gpu_accepts {
-            format!("shift={}, mism={}", gpu.shift, gpu.mismatches)
-        } else {
-            "NONE".to_string()
-        };
-
-        let mut min_mism = usize::MAX;
-        let mut min_at = 0usize;
-        let n_shifts = job.ref_window.len() - read_len + 1;
-        for t in 0..n_shifts {
-            let mism = job
-                .read_seq
-                .iter()
-                .zip(job.ref_window[t..t + read_len].iter())
-                .filter(|(a, b)| a != b)
-                .count();
-            if mism < min_mism {
-                min_mism = mism;
-                min_at = t;
-            }
-        }
-        let oracle_accepts = min_mism <= max_mism;
-
-        if cpu_accepts != gpu_accepts {
-            disagreements += 1;
-            crate::kira_info!(
-                "[KIRA_GPU_DIAG] job#{i}: GPU={} | CPU={} | naive: min_mism={} at shift={} (threshold={}, oracle should {})  read_len={} ref_len={}",
-                gpu_str,
-                cpu_str,
-                min_mism,
-                min_at,
-                max_mism,
-                if oracle_accepts { "ACCEPT" } else { "REJECT" },
-                read_len,
+        if ordinal < diag_limit {
+            let read = PackedDna::pack(&job.read_seq);
+            let reference = PackedDna::pack(job.ref_window).pre_shifted_window();
+            let cpu = crate::alignment::bitpacked::scan_best_with_second(
+                &read,
+                &reference,
                 job.ref_window.len(),
             );
+            crate::kira_info!("[KIRA_GPU_DIAG] job {i}: gpu={result:?} cpu={cpu:?}");
+        }
+        let (Ok(shift), Ok(mismatches)) = (
+            usize::try_from(result.shift),
+            usize::try_from(result.mismatches),
+        ) else {
+            continue;
+        };
+        let Some(matches) = job.read_seq.len().checked_sub(mismatches) else {
+            continue;
+        };
+        let hit = crate::alignment::bitpacked::PackedHit {
+            shift,
+            mismatches,
+            matches,
+        };
+        if let Some(alignment) = crate::alignment::build_certified_spectral_alignment(
+            &job.read_seq,
+            job.ref_window,
+            job.win_start as usize,
+            &job.chain,
+            cfg,
+            job.is_rev,
+            (hit, result.second_mismatches),
+        ) {
+            alignments[job.read_idx].push(alignment);
+            accepted[i] = true;
         }
     }
-    crate::kira_info!(
-        "[KIRA_GPU_DIAG] sampled {} jobs, {} GPU≠CPU disagreements",
-        limit,
-        disagreements
-    );
-}
-
-/// Build a SAM-compatible `Alignment` from a single GPU spectral result.
-#[cfg(feature = "cuda")]
-fn build_alignment_from_gpu(
-    job: &SimdJob<'_, '_>,
-    result: &crate::cuda::CudaResult,
-    cfg: AlignmentConfig,
-) -> Alignment {
-    let read_len = job.read_seq.len();
-    let shift = result.shift as usize;
-    let ref_aligned = &job.ref_window[shift..shift + read_len];
-
-    let cigar = vec![CigarOp {
-        len: read_len as u32,
-        op: CigarKind::Match,
-    }];
-
-    let mut nm: u32 = 0;
-    let mut md_bytes: Vec<u8> = Vec::with_capacity(16);
-    let mut match_run: u32 = 0;
-    for (qb, rb) in job.read_seq.iter().zip(ref_aligned.iter()) {
-        if qb == rb {
-            match_run += 1;
-        } else {
-            nm += 1;
-            push_u32_decimal(&mut md_bytes, match_run);
-            md_bytes.push(*rb);
-            match_run = 0;
-        }
-    }
-    push_u32_decimal(&mut md_bytes, match_run);
-    // SAFETY: only ASCII digits and ACGTN bytes were pushed.
-    let md = unsafe { String::from_utf8_unchecked(md_bytes) };
-
-    let matches = (read_len - result.mismatches as usize) as i32;
-    let mismatches = result.mismatches;
-    let sw_score = matches * cfg.match_score - mismatches * cfg.mismatch;
-
-    let ref_start_global = job.win_start + shift as u32;
-    let ref_end_global = ref_start_global + read_len as u32;
-
-    Alignment {
-        kind: AlignmentKind::DpAligned,
-        ref_id: job.chain.ref_id,
-        ref_start: ref_start_global,
-        ref_end: ref_end_global,
-        read_start: 0,
-        read_end: read_len as u32,
-        cigar,
-        score: sw_score,
-        mapq: 0,
-        is_rev: job.is_rev,
-        is_secondary: false,
-        is_supplementary: false,
-        nm,
-        md,
-        as_score: sw_score,
-        xs_score: None,
-        xs_strand: None,
-        mate: MateInfo::default(),
-    }
+    accepted
 }
 
 fn build_forced_accept(

@@ -512,3 +512,128 @@ fn index_and_mem_through_the_binary() {
         );
     }
 }
+
+#[test]
+fn binary_emit_keeps_previous_output_on_rejected_record() {
+    let ds = build_dataset("reject_long_name", &SimParams::default());
+    let reads = ds.dir.join("long-name.fq");
+    std::fs::write(
+        &reads,
+        format!(
+            "@{}\n{}\n+\n{}\n",
+            "x".repeat(255),
+            "A".repeat(80),
+            "I".repeat(80)
+        ),
+    )
+    .unwrap();
+    let out = ds.dir.join("preserve.bam");
+    std::fs::write(&out, b"previous output").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+        .args(mem_args(
+            &ds.reference,
+            &[&reads],
+            &out,
+            &["--emit", "bam", "-t", "2"],
+        ))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("read name exceeds 254 bytes"));
+    assert_eq!(std::fs::read(out).unwrap(), b"previous output");
+}
+
+#[test]
+fn split_prefix_rejects_stdin_and_paf_has_no_sam_header() {
+    let ds = build_dataset("tiled_cli_contract", &SimParams::default());
+    let prefix = ds.dir.join("split");
+    let out = ds.dir.join("reads.paf");
+    let result = Command::new(env!("CARGO_BIN_EXE_kira_ls_aligner"))
+        .args(mem_args(
+            &ds.reference,
+            &[std::path::Path::new("-")],
+            &out,
+            &["--split-prefix", prefix.to_str().unwrap(), "-t", "2"],
+        ))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("can be reopened"));
+    assert!(!out.exists());
+
+    let paf = run_mem(
+        &ds.reference,
+        &[&ds.single],
+        &out,
+        &[
+            "--split-prefix",
+            prefix.to_str().unwrap(),
+            "--emit",
+            "paf",
+            "-x",
+            "short",
+            "-t",
+            "2",
+        ],
+    );
+    assert!(!paf.is_empty());
+    assert!(
+        paf.lines()
+            .all(|line| !line.starts_with('@') && line.split('\t').count() >= 12)
+    );
+}
+
+#[test]
+fn sorted_bam_markdup_keeps_pair_with_best_combined_quality() -> anyhow::Result<()> {
+    use kira_bam::io::BamReader;
+    use noodles_sam::alignment::RecordBuf;
+
+    let ds = build_dataset("markdup_quality", &SimParams::default());
+    let r1 = ds.dir.join("dup_r1.fq");
+    let r2 = ds.dir.join("dup_r2.fq");
+    for (source, destination, weaker, stronger) in
+        [(&ds.r1, &r1, 'I', '?'), (&ds.r2, &r2, '0', 'I')]
+    {
+        let fq = std::fs::read_to_string(source)?;
+        let bases = fq.lines().nth(5).expect("second simulated read");
+        let quality = |q: char| q.to_string().repeat(bases.len());
+        std::fs::write(
+            destination,
+            format!(
+                "@weaker\n{bases}\n+\n{}\n@stronger\n{bases}\n+\n{}\n",
+                quality(weaker),
+                quality(stronger)
+            ),
+        )?;
+    }
+    let output = ds.dir.join("marked.bam");
+    run_bin(&mem_args(
+        &ds.reference,
+        &[&r1, &r2],
+        &output,
+        &[
+            "-x",
+            "short",
+            "-t",
+            "2",
+            "--emit",
+            "sorted-bam",
+            "--markdup",
+            "--bai",
+        ],
+    ));
+    assert!(kira_bam::io::default_index_path(&output, false).is_file());
+    let mut reader = BamReader::open_with_reference(&output, Some(&ds.reference))?;
+    let mut record = RecordBuf::default();
+    let mut n = 0;
+    while reader.read_record_buf(&mut record)? {
+        let name: &[u8] = record.name().expect("named record").as_ref();
+        assert!(name == b"weaker" || name == b"stronger");
+        assert!(!record.flags().is_unmapped());
+        assert_eq!(record.flags().is_duplicate(), name == b"weaker");
+        n += 1;
+    }
+    assert_eq!(n, 4);
+    Ok(())
+}

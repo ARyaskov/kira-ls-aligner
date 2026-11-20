@@ -109,6 +109,7 @@ fn read_fields(
 ) -> Result<RecordBuf> {
     let mut record = RecordBuf::default();
     ensure!(!read.id.is_empty(), "empty SAM record name");
+    ensure!(read.id.len() <= 254, "read name exceeds 254 bytes");
     if read.id != "*" {
         *record.name_mut() = Some(read.id.as_bytes().into());
     }
@@ -160,7 +161,7 @@ pub(crate) fn string_tag(record: &mut RecordBuf, tag: [u8; 2], value: Vec<u8>) {
         .insert(Tag::from(tag), Value::String(value.into()));
 }
 
-pub(crate) fn mate_tags(record: &mut RecordBuf, mate: &Alignment) {
+pub(crate) fn mate_tags(record: &mut RecordBuf, mate: &Alignment, score: u32) {
     let mut cigar = Vec::new();
     append_cigar_ops(&mut cigar, &mate.cigar);
     string_tag(record, *b"MC", cigar);
@@ -169,7 +170,7 @@ pub(crate) fn mate_tags(record: &mut RecordBuf, mate: &Alignment) {
         .insert(Tag::from(*b"MQ"), Value::from(mate.mapq));
     record
         .data_mut()
-        .insert(Tag::from(*b"ms"), Value::from(mate.as_score));
+        .insert(Tag::from(*b"ms"), Value::from(score));
 }
 
 pub(crate) fn parse_comment(comment: &str) -> Result<Data> {

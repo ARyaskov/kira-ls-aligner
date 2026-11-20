@@ -30,6 +30,25 @@ pub struct JunctionIndex {
 }
 
 impl JunctionIndex {
+    pub(crate) fn for_tile(&self, first: u32, count: usize) -> Self {
+        let mut result = Self::default();
+        for (&global, junctions) in &self.per_ref {
+            if let Some(local) = global
+                .checked_sub(first)
+                .filter(|&id| (id as usize) < count)
+            {
+                for &junction in junctions {
+                    result.insert(
+                        local,
+                        junction,
+                        self.strands.get(&(global, junction)).copied(),
+                    );
+                }
+            }
+        }
+        result
+    }
+
     /// Load a BED file from disk.
     pub fn from_bed_path<P: AsRef<Path>>(path: P, reference: &Reference) -> Result<Self> {
         let f = File::open(path.as_ref())

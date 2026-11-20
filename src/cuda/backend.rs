@@ -30,6 +30,8 @@ pub struct CudaJob {
 pub struct CudaResult {
     pub shift: i32,
     pub mismatches: i32,
+    /// Minimum mismatch count at a distinct shift, if the window has one.
+    pub second_mismatches: Option<usize>,
 }
 
 /// Probe whether a CUDA-capable device is reachable from this process.
@@ -47,6 +49,7 @@ pub struct CudaBackend {
     /// Reusable device buffer for packed reads; grows as needed.
     reads_buf: Option<cudarc::driver::CudaSlice<u8>>,
     read_lens_buf: Option<cudarc::driver::CudaSlice<i32>>,
+    max_mismatches_buf: Option<cudarc::driver::CudaSlice<i32>>,
     /// Reusable device buffer for the 4 ref phases, flattened.
     ref_buf: Option<cudarc::driver::CudaSlice<u8>>,
     ref_lens_buf: Option<cudarc::driver::CudaSlice<i32>>,
@@ -80,6 +83,7 @@ impl CudaBackend {
             module,
             reads_buf: None,
             read_lens_buf: None,
+            max_mismatches_buf: None,
             ref_buf: None,
             ref_lens_buf: None,
             ref_offsets_buf: None,
@@ -150,7 +154,7 @@ impl CudaBackend {
         ensure_capacity_i32(stream, &mut self.ref_lens_buf, host_ref_lens.len())?;
         ensure_capacity_i32(stream, &mut self.ref_offsets_buf, host_ref_offsets.len())?;
         ensure_capacity_i32(stream, &mut self.out_shifts_buf, n_reads)?;
-        ensure_capacity_i32(stream, &mut self.out_mism_buf, n_reads)?;
+        ensure_capacity_i32(stream, &mut self.out_mism_buf, n_reads * 2)?;
 
         // Copy fresh inputs into the (possibly resized) buffers.
         stream
@@ -170,7 +174,7 @@ impl CudaBackend {
             .map_err(|e| CudaError::Runtime(e.to_string()))?;
         // Initialise output buffers to sentinel values for this batch.
         let host_out_shifts: Vec<i32> = vec![-1i32; n_reads];
-        let host_out_mism: Vec<i32> = vec![i32::MAX; n_reads];
+        let host_out_mism: Vec<i32> = vec![i32::MAX; n_reads * 2];
         stream
             .memcpy_htod(&host_out_shifts, self.out_shifts_buf.as_mut().unwrap())
             .map_err(|e| CudaError::Runtime(e.to_string()))?;
@@ -178,7 +182,14 @@ impl CudaBackend {
             .memcpy_htod(&host_out_mism, self.out_mism_buf.as_mut().unwrap())
             .map_err(|e| CudaError::Runtime(e.to_string()))?;
 
-        let max_mism_first = jobs[0].max_mismatches as i32;
+        let limits: Vec<i32> = jobs
+            .iter()
+            .map(|job| job.max_mismatches.min(job.read_nucs).min(i32::MAX as u32) as i32)
+            .collect();
+        ensure_capacity_i32(stream, &mut self.max_mismatches_buf, n_reads)?;
+        stream
+            .memcpy_htod(&limits, self.max_mismatches_buf.as_mut().unwrap())
+            .map_err(|e| CudaError::Runtime(e.to_string()))?;
 
         let cfg = LaunchConfig {
             grid_dim: (n_reads as u32, 1, 1),
@@ -201,7 +212,7 @@ impl CudaBackend {
                 .arg(self.ref_offsets_buf.as_ref().unwrap())
                 .arg(self.ref_lens_buf.as_ref().unwrap())
                 .arg(&(read_bytes_max as i32))
-                .arg(&max_mism_first)
+                .arg(self.max_mismatches_buf.as_ref().unwrap())
                 .arg(&(n_reads as i32))
                 .arg(self.out_shifts_buf.as_mut().unwrap())
                 .arg(self.out_mism_buf.as_mut().unwrap())
@@ -210,9 +221,9 @@ impl CudaBackend {
         }
 
         let mut out_shifts: Vec<i32> = vec![0; n_reads];
-        let mut out_mism: Vec<i32> = vec![0; n_reads];
+        let mut out_mism: Vec<i32> = vec![0; n_reads * 2];
         let shifts_view = self.out_shifts_buf.as_ref().unwrap().slice(0..n_reads);
-        let mism_view = self.out_mism_buf.as_ref().unwrap().slice(0..n_reads);
+        let mism_view = self.out_mism_buf.as_ref().unwrap().slice(0..n_reads * 2);
         stream
             .memcpy_dtoh(&shifts_view, &mut out_shifts)
             .map_err(|e| CudaError::Runtime(e.to_string()))?;
@@ -227,10 +238,12 @@ impl CudaBackend {
 
         Ok(out_shifts
             .into_iter()
-            .zip(out_mism)
-            .map(|(s, m)| CudaResult {
-                shift: s,
-                mismatches: m,
+            .enumerate()
+            .map(|(i, shift)| CudaResult {
+                shift,
+                mismatches: out_mism[i],
+                second_mismatches: (out_mism[n_reads + i] != i32::MAX)
+                    .then_some(out_mism[n_reads + i] as usize),
             })
             .collect())
     }
@@ -239,6 +252,7 @@ impl CudaBackend {
     pub fn release_buffers(&mut self) {
         self.reads_buf = None;
         self.read_lens_buf = None;
+        self.max_mismatches_buf = None;
         self.ref_buf = None;
         self.ref_lens_buf = None;
         self.ref_offsets_buf = None;
