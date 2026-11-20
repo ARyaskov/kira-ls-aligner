@@ -39,7 +39,13 @@ pub(crate) fn visit_reference(
             .unwrap_or(raw);
         let name = String::from_utf8_lossy(trimmed).to_string();
         let mut seq = record.seq().to_vec();
-        normalize_bases(&mut seq);
+        for base in &mut seq {
+            *base = match base.to_ascii_uppercase() {
+                b'A' | b'C' | b'G' | b'T' | b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B'
+                | b'D' | b'H' | b'V' | b'N' => base.to_ascii_uppercase(),
+                _ => b'N',
+            };
+        }
         visit(RefSeq {
             name,
             bases: RefBases::Owned(seq),
