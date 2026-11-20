@@ -21,6 +21,7 @@
 //! `<name>:<contig>:<start>-<end>` and `<name>_<contig>_<start>_<end>`,
 //! with 0-based half-open coordinates.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 
 /// Evaluation configuration.
@@ -44,6 +45,15 @@ pub struct TruthLocus {
 /// Parse the truth locus out of a SAM QNAME. See the module docs for the
 /// accepted encodings. Returns `None` for names without a parseable locus.
 pub fn parse_truth(qname: &str) -> Option<TruthLocus> {
+    parse_truth_with_contigs(qname, &HashSet::new())
+        .ok()
+        .flatten()
+}
+
+fn parse_truth_with_contigs(
+    qname: &str,
+    contigs: &HashSet<String>,
+) -> Result<Option<TruthLocus>, &'static str> {
     let core = qname
         .strip_suffix("/1")
         .or_else(|| qname.strip_suffix("/2"))
@@ -55,25 +65,44 @@ pub fn parse_truth(qname: &str) -> Option<TruthLocus> {
         && let Some((s, e)) = range.rsplit_once('-')
         && let (Ok(start), Ok(end)) = (s.parse::<i64>(), e.parse::<i64>())
     {
-        return Some(TruthLocus {
+        return Ok(Some(TruthLocus {
             contig: contig.to_string(),
             start,
             end,
-        });
+        }));
     }
 
-    // Underscore form: <name>_<contig>_<start>_<end>
-    let parts: Vec<&str> = core.rsplitn(4, '_').collect();
-    if parts.len() == 4
-        && let (Ok(end), Ok(start)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
-    {
-        return Some(TruthLocus {
-            contig: parts[2].to_string(),
-            start,
-            end,
-        });
-    }
-    None
+    let mut parts = core.rsplitn(3, '_');
+    let (Some(end), Some(start), Some(prefix)) = (parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) else {
+        return Ok(None);
+    };
+    let contig = if contigs.is_empty() {
+        prefix.rsplit_once('_').map(|(_, contig)| contig)
+    } else {
+        let mut matches = prefix
+            .match_indices('_')
+            .map(|(separator, _)| &prefix[separator + 1..])
+            .filter(|candidate| {
+                contigs.contains(*candidate)
+                    || candidate
+                        .strip_prefix("chr")
+                        .is_some_and(|name| contigs.contains(name))
+                    || contigs.contains(&format!("chr{candidate}"))
+            });
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err("ambiguous truth contig in QNAME");
+        }
+        found
+    };
+    Ok(contig.map(|contig| TruthLocus {
+        contig: contig.to_owned(),
+        start,
+        end,
+    }))
 }
 
 /// Per-MAPQ-threshold stratified counts.
@@ -173,6 +202,7 @@ pub fn evaluate<W: Write + ?Sized>(
 
     let mut line = String::new();
     let mut line_number = 0;
+    let mut contigs = HashSet::new();
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -180,6 +210,11 @@ pub fn evaluate<W: Write + ?Sized>(
         }
         line_number += 1;
         let text = line.trim_end_matches(['\r', '\n']);
+        if let Some(sq) = text.strip_prefix("@SQ\t")
+            && let Some(name) = sq.split('\t').find_map(|field| field.strip_prefix("SN:"))
+        {
+            contigs.insert(name.to_owned());
+        }
         if text.is_empty() || text.starts_with('@') {
             continue;
         }
@@ -200,7 +235,12 @@ pub fn evaluate<W: Write + ?Sized>(
             continue;
         }
         counts.primary += 1;
-        let truth = parse_truth(qname);
+        let truth = parse_truth_with_contigs(qname, &contigs).map_err(|message| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("SAM line {line_number}: {message} ({qname})"),
+            )
+        })?;
         let has_indel = cigar.bytes().any(|b| b == b'I' || b == b'D');
 
         let (category, truth_ref) = match &truth {
@@ -349,6 +389,42 @@ pub fn render_report(counts: &EvalCounts) -> String {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn underscore_truth_resolves_contig_through_sam_dictionary() {
+        let sam = concat!(
+            "@SQ\tSN:chrUn_KI270442v1\tLN:10000\n",
+            "read_tag_chrUn_KI270442v1_100_200\t0\tchrUn_KI270442v1\t101\t42\t100M\n",
+        );
+        let counts = evaluate(
+            sam.as_bytes(),
+            &EvalConfig {
+                tolerance: 0,
+                mapq_thresholds: vec![],
+            },
+            None::<&mut Vec<u8>>,
+        )
+        .unwrap();
+        assert_eq!(
+            (counts.correct, counts.wrong_locus, counts.truth_parsed),
+            (1, 0, 1)
+        );
+        let ambiguous = format!("@SQ\tSN:KI270442v1\tLN:10000\n{sam}");
+        let error = evaluate(
+            ambiguous.as_bytes(),
+            &EvalConfig {
+                tolerance: 0,
+                mapq_thresholds: vec![],
+            },
+            None::<&mut Vec<u8>>,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("SAM line 3: ambiguous truth contig")
+        );
+    }
 
     #[test]
     fn nonprimary_records_do_not_change_accuracy() {
