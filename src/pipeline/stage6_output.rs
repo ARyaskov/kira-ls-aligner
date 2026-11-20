@@ -127,6 +127,7 @@ pub fn serialize_into(
         .collect();
 
     let chunk_size: usize = 64;
+    let read_group_id = output_cfg.read_group_id(read_group);
 
     let chunks: Vec<Vec<u8>> = quads
         .par_chunks(chunk_size)
@@ -145,11 +146,19 @@ pub fn serialize_into(
                 match output_cfg.format {
                     EmitFormat::Sam => {
                         if alns.is_empty() {
+                            extra_tags.clear();
+                            if let Some(id) = read_group_id {
+                                extra_tags.extend_from_slice(b"\tRG:Z:");
+                                extra_tags.extend_from_slice(id.as_bytes());
+                            }
+                            if let Some(tags) = mtags {
+                                extra_tags.extend_from_slice(tags);
+                            }
                             formatter.append_unmapped_full(
                                 &mut buf,
                                 read,
                                 mate.as_ref(),
-                                mtags,
+                                Some(&extra_tags),
                                 output_cfg.append_comment,
                             );
                         } else {
@@ -214,6 +223,7 @@ pub(crate) fn binary_records(
     max_alignments: usize,
 ) -> Result<Vec<RecordBuf>> {
     const CHUNK_SIZE: usize = 128;
+    let read_group_id = cfg.read_group_id(read_group);
     let chunks: Result<Vec<Vec<RecordBuf>>> = input
         .reads
         .par_chunks(CHUNK_SIZE)
@@ -238,6 +248,9 @@ pub(crate) fn binary_records(
                 };
                 if alns.is_empty() {
                     let mut record = binary::unmapped(read, input.unmapped_mate_info[i].as_ref())?;
+                    if let Some(id) = read_group_id {
+                        binary::string_tag(&mut record, *b"RG", id.as_bytes().to_vec());
+                    }
                     if let Some((mate, score)) = mate {
                         binary::mate_tags(&mut record, mate, score);
                     }
@@ -546,6 +559,16 @@ mod tests {
                 .record_bufs(&header)
                 .collect::<std::io::Result<Vec<_>>>()?;
             let actual = binary_records(input.clone(), &formatter, rg, cfg, max_alignments)?;
+            assert!(actual.iter().any(|r| r.flags().is_unmapped()));
+            let group = sam::alignment::record_buf::data::field::Value::String("group".into());
+            for record in &actual {
+                assert_eq!(
+                    record
+                        .data()
+                        .get(&sam::alignment::record::data::field::Tag::READ_GROUP),
+                    Some(&group)
+                );
+            }
             assert_eq!(actual, expected);
         }
         Ok(())

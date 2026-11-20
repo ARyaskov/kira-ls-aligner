@@ -814,6 +814,10 @@ pub struct OutputConfig {
 }
 
 impl OutputConfig {
+    pub(crate) fn read_group_id(self, read_group: Option<&str>) -> Option<&str> {
+        read_group.filter(|_| self.write_rg).map(extract_rg_id)
+    }
+
     pub fn full() -> Self {
         Self {
             format: EmitFormat::Sam,
@@ -1407,10 +1411,8 @@ fn alignment_tags(
     {
         tag(*b"XS", AlignmentTag::Signed(xs));
     }
-    if cfg.write_rg
-        && let Some(rg) = read_group
-    {
-        tag(*b"RG", AlignmentTag::Text(extract_rg_id(rg).as_bytes()));
+    if let Some(id) = cfg.read_group_id(read_group) {
+        tag(*b"RG", AlignmentTag::Text(id.as_bytes()));
     }
 }
 
