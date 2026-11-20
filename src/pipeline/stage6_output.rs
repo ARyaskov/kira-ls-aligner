@@ -26,14 +26,14 @@ pub fn run(
     output_cfg: OutputConfig,
     max_alignments: usize,
 ) -> Result<()> {
-    let buf = serialize(
+    let chunks = serialize_chunks(
         input,
         writer.formatter(),
         read_group,
         output_cfg,
         max_alignments,
     )?;
-    writer.write_batch(&buf)
+    writer.write_chunks(&chunks)
 }
 
 /// Serialize a `ScoredBatch` to a `Vec<u8>` ready to feed to `SamWriter::write_batch`.
@@ -66,6 +66,22 @@ pub fn serialize_into(
     max_alignments: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let chunks = serialize_chunks(input, formatter, read_group, output_cfg, max_alignments)?;
+    out.clear();
+    out.reserve(chunks.iter().map(Vec::len).sum());
+    for chunk in chunks {
+        out.extend_from_slice(&chunk);
+    }
+    Ok(())
+}
+
+pub(crate) fn serialize_chunks(
+    input: ScoredBatch,
+    formatter: &SamFormatter,
+    read_group: Option<&str>,
+    output_cfg: OutputConfig,
+    max_alignments: usize,
+) -> Result<Vec<Vec<u8>>> {
     let reads: Vec<ReadRecord> = input.reads;
     let mut alignments = input.alignments;
     let xa_has_alt = input.xa_has_alt;
@@ -129,7 +145,7 @@ pub fn serialize_into(
     let chunk_size: usize = 64;
     let read_group_id = output_cfg.read_group_id(read_group);
 
-    let chunks: Result<Vec<Vec<u8>>> = quads
+    quads
         .par_chunks(chunk_size)
         .map(|chunk| {
             let mut estimate = 0usize;
@@ -204,16 +220,7 @@ pub fn serialize_into(
             }
             Ok(buf)
         })
-        .collect();
-
-    let chunks = chunks?;
-    let total: usize = chunks.iter().map(|c| c.len()).sum();
-    out.clear();
-    out.reserve(total);
-    for c in chunks {
-        out.extend_from_slice(&c);
-    }
-    Ok(())
+        .collect()
 }
 
 /// Build writer records in input order without serializing the batch to SAM.

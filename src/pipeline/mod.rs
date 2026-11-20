@@ -38,7 +38,7 @@ use crate::pipeline::stage3_chaining::{ChainingBatchStats, run as chain_run};
 use crate::pipeline::stage4_alignment::{
     AlignBatch, AlignmentBatchStats, AlignmentStageConfig, run as align_run,
 };
-use crate::pipeline::stage6_output::serialize_into as output_serialize_into;
+use crate::pipeline::stage6_output::{serialize_chunks, serialize_into as output_serialize_into};
 use crate::seeding::SeedingConfig;
 use crate::types::{Alignment, MateInfo, ReadRecord, Reference};
 
@@ -438,6 +438,27 @@ impl Pipeline {
                 chaining: chaining_stats,
             },
         ))
+    }
+
+    /// Run stages 1-6 with ordered SAM/PAF chunks for a streaming writer.
+    pub(crate) fn process_batch_chunks(
+        &self,
+        input: stage0_input::InputBatch,
+        index: &Index,
+        formatter: &SamFormatter,
+        read_group: Option<&str>,
+    ) -> Result<(PipelineBatchStats, Vec<Vec<u8>>)> {
+        let (scored, mut stats) = self.process_batch_scored(input, index)?;
+        let t5 = Instant::now();
+        let chunks = serialize_chunks(
+            scored,
+            formatter,
+            read_group,
+            self.config.output,
+            self.config.max_alignments,
+        )?;
+        stats.times.stages[5] = t5.elapsed();
+        Ok((stats, chunks))
     }
 
     /// [`Self::process_batch_serialized`] writing into a caller-owned SAM buffer,

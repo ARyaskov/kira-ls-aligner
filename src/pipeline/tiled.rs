@@ -24,7 +24,7 @@ use crate::pipeline::stage0_input;
 use crate::pipeline::stage4_alignment::AlignBatch;
 use crate::pipeline::stage4_alignment::AlignmentBatchStats;
 use crate::pipeline::stage5_scoring;
-use crate::pipeline::stage6_output::serialize as output_serialize;
+use crate::pipeline::stage6_output::serialize_chunks;
 use crate::pipeline::{Pipeline, PipelineConfig};
 use crate::types::{Alignment, MateInfo, Reference};
 use std::sync::RwLock;
@@ -278,14 +278,14 @@ fn run_tiled_inner(
             pair_ctx,
             preserve_primary,
         );
-        let sam_buf = output_serialize(
+        let chunks = serialize_chunks(
             scored,
             &formatter,
             cfg.read_group.as_deref(),
             cfg.pipeline_cfg.output,
             cfg.pipeline_cfg.max_alignments,
         )?;
-        writer.write_batch(&sam_buf)?;
+        writer.write_chunks(&chunks)?;
     }
 
     repeats.finish()?;

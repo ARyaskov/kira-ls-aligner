@@ -395,17 +395,10 @@ impl Aligner {
         let formatter = writer.formatter_handle();
 
         // Emit on a dedicated thread so writing batch N overlaps aligning N+1.
-        // Buffers are recycled over `free_rx` so each is allocated and freed on
-        // the same thread.
-        let (sam_tx, sam_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
-        let (free_tx, free_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (sam_tx, sam_rx) = std::sync::mpsc::sync_channel::<Vec<Vec<u8>>>(2);
         let writer_handle = std::thread::spawn(move || -> Result<()> {
-            while let Ok(buf) = sam_rx.recv() {
-                writer.write_batch(&buf)?;
-                let mut buf = buf;
-                buf.clear();
-                // A closed channel just means the driver finished; drop the buffer.
-                let _ = free_tx.send(buf);
+            while let Ok(chunks) = sam_rx.recv() {
+                writer.write_chunks(&chunks)?;
             }
             writer.flush()?;
             Ok(())
@@ -535,16 +528,13 @@ impl Aligner {
                 let input = stage0_input::run(reads);
                 let stage0_time = fetch_time + stage0_start.elapsed();
 
-                // Reuse a buffer the writer already drained.
-                let mut sam_buf = free_rx.try_recv().unwrap_or_default();
-                let batch_stats = pipeline.process_batch_into(
+                let (batch_stats, chunks) = pipeline.process_batch_chunks(
                     input,
                     &index,
                     &formatter,
                     self.cfg.read_group.as_deref(),
-                    &mut sam_buf,
                 )?;
-                if sam_tx.send(sam_buf).is_err() {
+                if sam_tx.send(chunks).is_err() {
                     // Writer thread died — surface its error via the join below.
                     break;
                 }
@@ -871,16 +861,16 @@ impl Aligner {
                 decide_auto_mode(profiles, &reads, &mut pipeline, alt_mask.clone());
             }
             let input = stage0_input::run(reads);
-            let bo = pipeline.process_batch_serialized(
+            let (stats, chunks) = pipeline.process_batch_chunks(
                 input,
                 &index,
                 &formatter,
                 self.cfg.read_group.as_deref(),
             )?;
             if auto_profiles.as_ref().is_some_and(|p| p.decided.is_some()) {
-                adjust_auto_params(&mut pipeline.config, &bo.stats.align, &bo.stats.sketch);
+                adjust_auto_params(&mut pipeline.config, &stats.align, &stats.sketch);
             }
-            writer.write_batch(&bo.sam_buf)?;
+            writer.write_chunks(&chunks)?;
         }
         writer.flush()?;
         drop(writer);

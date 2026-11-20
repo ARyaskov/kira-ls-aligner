@@ -1620,6 +1620,14 @@ impl SamWriter {
         Ok(())
     }
 
+    /// Write ordered chunks without assembling a second copy of the batch.
+    pub(crate) fn write_chunks(&mut self, chunks: &[Vec<u8>]) -> Result<()> {
+        for chunk in chunks {
+            self.write_batch(chunk)?;
+        }
+        Ok(())
+    }
+
     pub fn append_unmapped(&self, buf: &mut Vec<u8>, read: &ReadRecord) {
         self.formatter.append_unmapped(buf, read);
     }
