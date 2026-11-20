@@ -19,6 +19,47 @@ fn overlapping_runs_own_and_clean_their_chunks_independently() {
 }
 
 #[test]
+fn counts_are_summed_by_seed_before_taking_the_minimum() {
+    use crate::types::{ReadRecord, RefBases, RefSeq};
+    let scratch = tempfile::tempdir().unwrap();
+    let cfg = IndexConfig {
+        short_k: 2,
+        short_w: 1,
+        long_k: 2,
+        long_w: 1,
+        build_short: true,
+        build_long: false,
+        max_occ: 1,
+    };
+    let mut reads = vec![
+        ReadRecord::new_unpaired("query".into(), b"ACNAGNGG".to_vec(), None),
+        ReadRecord::new_unpaired("absent".into(), b"GG".to_vec(), None),
+    ];
+    // AC occurs 1 + 6 times, AG occurs 4 + 1 times, GG is absent.
+    // Both tile minima are 1, but the minimum positive global count is 5.
+    for (tile, bases) in [b"ACNAGNAGNAGNAG".as_slice(), b"ACNACNACNACNACNACNAG"]
+        .iter()
+        .enumerate()
+    {
+        let reference = Reference {
+            sequences: vec![RefSeq {
+                name: format!("tile{tile}"),
+                bases: RefBases::Owned(bases.to_vec()),
+            }],
+        };
+        let index = Index::try_build(reference, cfg).unwrap();
+        let mut pass = repeat_counts::RepeatPass::open(scratch.path(), tile, 2).unwrap();
+        pass.record(&reads, &index, cfg, 500).unwrap();
+        pass.finish().unwrap();
+    }
+    let mut summary = repeat_counts::RepeatSummary::open(scratch.path()).unwrap();
+    summary.restore(&mut reads).unwrap();
+    summary.finish().unwrap();
+    assert_eq!(reads[0].repeat_min_occ, 5);
+    assert_eq!(reads[1].repeat_min_occ, 0);
+}
+
+#[test]
 fn remap_zero_offset_is_noop() {
     use crate::index::tiling::Tile;
     let tile = Tile {

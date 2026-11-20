@@ -338,6 +338,97 @@ fn tiled_single_tile_is_trivial_and_still_works() {
     let _ = std::fs::remove_file(out_path);
 }
 
+#[test]
+fn tiled_mapq_counts_seed_copies_on_tiles_without_a_competing_alignment() {
+    use kira_ls_aligner::index::Index;
+    use kira_ls_aligner::pipeline::{Pipeline, stage0_input};
+    use kira_ls_aligner::types::ReadRecord;
+
+    let root = tempfile::tempdir().unwrap();
+    let query = synth_dna(6731, 120);
+    // The decoy contains eight isolated copies of every query seed, in
+    // reverse window order. It contains no full-length copy of the read.
+    let mut fragments = Vec::new();
+    for window in query.windows(19).rev() {
+        for _ in 0..8 {
+            fragments.extend_from_slice(window);
+            fragments.extend_from_slice(&[b'N'; 32]);
+        }
+    }
+    let reference = Reference {
+        sequences: vec![
+            RefSeq {
+                name: "target".into(),
+                bases: RefBases::Owned(query.clone()),
+            },
+            RefSeq {
+                name: "fragments".into(),
+                bases: RefBases::Owned(fragments),
+            },
+        ],
+    };
+    let mut pipe = full_pipeline_cfg();
+    pipe.sketch.short_w = 1;
+    pipe.sketch.long_w = 1;
+    pipe.paired.mode = IngestMode::Unpaired;
+    pipe.min_output_score = 100;
+    let cfg = IndexConfig {
+        short_k: 19,
+        long_k: 19,
+        short_w: 1,
+        long_w: 1,
+        build_short: true,
+        build_long: false,
+        max_occ: 500,
+    };
+    let index = Index::try_build(reference.clone(), cfg).unwrap();
+    let read =
+        ReadRecord::new_unpaired("read".into(), query.clone(), Some(vec![b'I'; query.len()]));
+    let (normal, _) = Pipeline::new(pipe.clone())
+        .process_batch_scored(stage0_input::run(vec![read]), &index)
+        .unwrap();
+    assert_eq!(normal.reads[0].repeat_min_occ, 9);
+    let expected = normal.alignments[0][0].mapq;
+    assert_eq!(
+        expected, 40,
+        "the ordinary result must exercise the repeat cap"
+    );
+
+    let reads = write_fastq("copy-count", &[("read", &query)]);
+    for (tile_bytes, tiles) in [(u64::MAX, 1), (300, 2)] {
+        let output = root.path().join(format!("{tiles}.sam"));
+        let plan = plan_tiles(&reference, tile_bytes);
+        assert_eq!(plan.n_tiles(), tiles);
+        run_tiled(
+            reference.clone(),
+            std::slice::from_ref(&reads),
+            Some(output.clone()),
+            TiledRunConfig {
+                threads: 2,
+                num_p_threads: None,
+                num_e_threads: None,
+                batch_bases: 4096,
+                index_cfg: cfg,
+                pipeline_cfg: pipe.clone(),
+                read_group: None,
+                header: None,
+                split_prefix: root.path().join("job"),
+                junctions: None,
+                junc_bed_tolerance: 0,
+                keep_comment: false,
+                alt_contigs: None,
+            },
+            plan,
+        )
+        .unwrap();
+        let sam = std::fs::read_to_string(output).unwrap();
+        let fields = parse_sam_record(sam.lines().find(|l| !l.starts_with('@')).unwrap());
+        assert_eq!(fields[2], "target");
+        assert_eq!(fields[4].parse::<u8>().unwrap(), expected);
+    }
+    std::fs::remove_file(reads).unwrap();
+}
+
 /// Regression: the tiled merge concatenates per-tile hit lists in tile
 /// order, and the paired-end MAPQ path preserves slot 0, so a weaker hit
 /// from tile 1 used to stay primary even when tile 2 held the true locus.

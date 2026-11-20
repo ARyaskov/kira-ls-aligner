@@ -1,5 +1,7 @@
 //! Split-prefix tiled aligner.
 
+mod repeat_counts;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -129,6 +131,8 @@ fn run_tiled_inner(
         chunk_paths.push(chunk_path.clone());
         let mut writer = ChunkWriter::create(&chunk_path)
             .with_context(|| format!("create chunk file {}", chunk_path.display()))?;
+        let mut repeats =
+            repeat_counts::RepeatPass::open(scratch.path(), tile_idx, tile_plan.n_tiles())?;
 
         let mut stream = ReadStream::new_multi_with_opts(
             reads_paths,
@@ -151,6 +155,12 @@ fn run_tiled_inner(
             let n = reads.len();
             let input = stage0_input::run(reads);
             let mut align = pipeline.process_to_align_batch(input, &index);
+            repeats.record(
+                &align.reads,
+                &index,
+                cfg.index_cfg,
+                cfg.pipeline_cfg.seeding.long_read_threshold,
+            )?;
             remap_alignments_to_global(&mut align.alignments, tile);
 
             for (i, alns) in align.alignments.iter().enumerate() {
@@ -160,6 +170,7 @@ fn run_tiled_inner(
             global_read_idx += n as u64;
         }
         writer.finish()?;
+        repeats.finish()?;
 
         crate::kira_info!(
             "[KIRA_TILE] tile {}/{} done in {:.1}s: {} reads, {} alignments written",
@@ -210,7 +221,9 @@ fn run_tiled_inner(
     let mut global_read_idx: u64 = 0;
     let mut next_merged: Option<(u64, Vec<Alignment>)> = merge.next_merged()?;
 
-    while let Some(reads) = stream.next_batch()? {
+    let mut repeats = repeat_counts::RepeatSummary::open(scratch.path())?;
+    while let Some(mut reads) = stream.next_batch()? {
+        repeats.restore(&mut reads)?;
         let n = reads.len();
         let mut alignments: Vec<Vec<Alignment>> = vec![Vec::new(); n];
         for (i, slot) in alignments.iter_mut().enumerate() {
@@ -276,6 +289,7 @@ fn run_tiled_inner(
         writer.write_batch(&sam_buf)?;
     }
 
+    repeats.finish()?;
     writer.flush()?;
     drop(writer);
     publication.publish()?;
