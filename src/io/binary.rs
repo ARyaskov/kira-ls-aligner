@@ -175,6 +175,10 @@ pub(crate) fn mate_tags(record: &mut RecordBuf, mate: &Alignment, score: u32) {
 }
 
 pub(crate) fn parse_comment(comment: &str) -> Result<Data> {
+    ensure!(
+        !comment.is_empty() && !comment.contains(['\n', '\r']),
+        "FASTQ comment must contain a single list of SAM tags"
+    );
     // The user-supplied -C payload is already SAM tag text. Parse just that
     // payload with noodles, preserving all SAM tag types and validation.
     let input = (&b"*\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\t"[..])
@@ -185,6 +189,10 @@ pub(crate) fn parse_comment(comment: &str) -> Result<Data> {
     reader
         .read_record_buf(&sam::Header::default(), &mut record)
         .context("parse FASTQ comment tags")?;
+    ensure!(
+        record.data().len() == comment.split('\t').count(),
+        "duplicate FASTQ comment tags"
+    );
     Ok(std::mem::take(record.data_mut()))
 }
 

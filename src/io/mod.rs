@@ -979,7 +979,8 @@ impl SamFormatter {
         read: &ReadRecord,
         mate: Option<&MateInfo>,
     ) {
-        self.append_unmapped_full(buf, read, mate, None, false);
+        self.append_unmapped_full(buf, read, mate, None, false)
+            .expect("unmapped output without a comment is infallible");
     }
 
     /// Append an unmapped SAM record with optional trailing tags (mate tags
@@ -991,7 +992,8 @@ impl SamFormatter {
         mate: Option<&MateInfo>,
         extra_tags: Option<&[u8]>,
         append_comment: bool,
-    ) {
+    ) -> Result<()> {
+        let record_start = buf.len();
         let (flag, placement) = unmapped_fields(mate);
 
         buf.extend_from_slice(read.id.as_bytes());
@@ -1025,9 +1027,10 @@ impl SamFormatter {
             buf.extend_from_slice(extra);
         }
         if append_comment {
-            append_fastq_comment(buf, read);
+            append_fastq_comment(buf, record_start, read)?;
         }
         buf.push(b'\n');
+        Ok(())
     }
 
     pub fn append_alignment(
@@ -1040,6 +1043,7 @@ impl SamFormatter {
         cfg: OutputConfig,
     ) -> Result<()> {
         checked_cigar(read, aln)?;
+        let record_start = buf.len();
         let rname = &self.contigs.names[aln.ref_id as usize];
         let pos = aln.ref_start + 1; // SAM is 1-based
         let flag = sam_flag_with(aln, cfg.split_as_secondary);
@@ -1128,7 +1132,7 @@ impl SamFormatter {
             buf.extend_from_slice(extra);
         }
         if cfg.append_comment {
-            append_fastq_comment(buf, read);
+            append_fastq_comment(buf, record_start, read)?;
         }
         buf.push(b'\n');
         Ok(())
@@ -1450,13 +1454,33 @@ fn append_qual_or_star(buf: &mut Vec<u8>, qual: Option<&[u8]>) {
     }
 }
 
-/// Append the `-C` comment, if the read carries one, as trailing tag text.
-#[inline]
-fn append_fastq_comment(buf: &mut Vec<u8>, read: &ReadRecord) {
-    if let Some(c) = read.comment.as_deref() {
-        buf.push(b'\t');
-        buf.extend_from_slice(c.as_bytes());
+/// Validate comment tags against the same parser used for binary records.
+fn append_fastq_comment(buf: &mut Vec<u8>, record_start: usize, read: &ReadRecord) -> Result<()> {
+    let Some(comment) = read.comment.as_deref() else {
+        return Ok(());
+    };
+    let result = (|| -> Result<()> {
+        let parsed = binary::parse_comment(comment)?;
+        for field in buf[record_start..].split(|&b| b == b'\t').skip(11) {
+            let Some(tag) = field.get(..2) else { continue };
+            let tag = [tag[0], tag[1]];
+            anyhow::ensure!(
+                parsed
+                    .get(&noodles_sam::alignment::record::data::field::Tag::from(tag))
+                    .is_none(),
+                "duplicate FASTQ comment tag: {}",
+                String::from_utf8_lossy(&tag),
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        buf.truncate(record_start);
+        return Err(error).with_context(|| format!("read {}", read.id));
     }
+    buf.push(b'\t');
+    buf.extend_from_slice(comment.as_bytes());
+    Ok(())
 }
 
 /// Lengths of the leading and trailing soft clips of a CIGAR.
@@ -2009,11 +2033,13 @@ mod format_tests {
         let mut cfg = OutputConfig::full();
         cfg.append_comment = true;
         let mut buf = Vec::new();
-        fmt.append_unmapped_full(&mut buf, &read, None, None, true);
+        fmt.append_unmapped_full(&mut buf, &read, None, None, true)
+            .unwrap();
         let f = fields(&buf);
         assert_eq!(&f[f.len() - 2..], ["BC:Z:ACGT", "RX:Z:TTGA"]);
         buf.clear();
-        fmt.append_unmapped_full(&mut buf, &read, None, None, false);
+        fmt.append_unmapped_full(&mut buf, &read, None, None, false)
+            .unwrap();
         assert!(!String::from_utf8_lossy(&buf).contains("BC:Z"));
         let _ = cfg;
     }

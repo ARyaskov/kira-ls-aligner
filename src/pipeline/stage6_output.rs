@@ -160,7 +160,7 @@ pub fn serialize_into(
                                 mate.as_ref(),
                                 Some(&extra_tags),
                                 output_cfg.append_comment,
-                            );
+                            )?;
                         } else {
                             let has_supplementary = alns.iter().any(|a| a.is_supplementary);
                             for (idx, aln) in alns.iter().enumerate() {
@@ -257,7 +257,8 @@ pub(crate) fn binary_records(
                         binary::mate_tags(&mut record, mate, score);
                     }
                     if let Some(comment) = &comment {
-                        binary::append_comment(&mut record, comment)?;
+                        binary::append_comment(&mut record, comment)
+                            .with_context(|| format!("read {}", read.id))?;
                     }
                     records.push(record);
                     continue;
@@ -290,7 +291,8 @@ pub(crate) fn binary_records(
                         }
                     }
                     if let Some(comment) = &comment {
-                        binary::append_comment(&mut record, comment)?;
+                        binary::append_comment(&mut record, comment)
+                            .with_context(|| format!("read {}", read.id))?;
                     }
                     records.push(record);
                 }
@@ -574,6 +576,28 @@ mod tests {
             assert_eq!(actual, expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn comment_validation_is_consistent_in_sam_and_binary_output() {
+        let formatter = SamFormatter::from_catalog(std::sync::Arc::new(crate::io::ContigCatalog {
+            names: vec!["chr1".into(), "ALT".into()],
+            lens: vec![1000, 1000],
+        }));
+        let mut cfg = OutputConfig::full();
+        cfg.append_comment = true;
+        for comment in ["NM:i:0", "unexpected free text", "BC:Z:A\tBC:Z:T"] {
+            let mut batch = witness_batch(70);
+            batch.reads[0].comment = Some(comment.into());
+            assert!(
+                serialize(batch.clone(), &formatter, None, cfg, 1).is_err(),
+                "{comment}"
+            );
+            assert!(
+                binary_records(batch, &formatter, None, cfg, 1).is_err(),
+                "{comment}"
+            );
+        }
     }
 
     #[test]
